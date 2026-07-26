@@ -22,7 +22,7 @@ use anyhow::{bail, Result};
 use spec_wave_agent::config::{load_config, Config};
 use spec_wave_agent::lease::{Lease, LeaseRepo, RenewError};
 use spec_wave_agent::queue;
-use spec_wave_agent::runner::{checkpoint, ensure_workspace, run_feature_executor, RunEnd};
+use spec_wave_agent::runner::{checkpoint, ensure_workspace, run_feature, RunEnd};
 use spec_wave_agent::shell::run;
 use std::collections::HashMap;
 use std::path::Path;
@@ -119,7 +119,7 @@ async fn process_issue(
 
     let outcome = async {
         let ws = ensure_workspace(cfg, issue).await?;
-        let end = run_feature_executor(cfg, &ws, issue, lost_rx.clone(), shutdown).await?;
+        let end = run_feature(cfg, &ws, issue, lost_rx.clone(), shutdown).await?;
         Ok::<_, anyhow::Error>((ws, end))
     }.await;
     hb.abort();

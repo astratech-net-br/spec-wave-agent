@@ -2,7 +2,7 @@
 //! no lugar do Claude Code — sem rede, sem gh, sem npm.
 
 use spec_wave_agent::config::Config;
-use spec_wave_agent::runner::{ensure_workspace, run_feature_executor, RunEnd};
+use spec_wave_agent::runner::{ensure_workspace, run_feature, RunEnd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
@@ -69,7 +69,7 @@ async fn sucesso_recebe_prompt_e_pusha_trabalho() {
     let (_lt, lr, _st, sr) = channels();
 
     let ws = ensure_workspace(&cfg, 7).await.unwrap();
-    let end = run_feature_executor(&cfg, &ws, 7, lr, sr).await.unwrap();
+    let end = run_feature(&cfg, &ws, 7, lr, sr).await.unwrap();
     assert!(matches!(end, RunEnd::Success), "esperava Success");
 
     // Prompt chegou pelo stdin com o placeholder renderizado.
@@ -91,16 +91,52 @@ async fn sucesso_recebe_prompt_e_pusha_trabalho() {
 #[tokio::test]
 async fn exit_zero_sem_marker_nao_e_sucesso() {
     let tmp = TempDir::new().unwrap();
-    // Simula o orquestrador que "termina" cedo demais: exit 0, sem marker.
-    let cfg = setup(&tmp, "cat > /dev/null\nexit 0", 60);
+    // Simula o orquestrador que "termina" cedo demais TODA rodada: exit 0,
+    // sem marker e sem commits => 2 rodadas sem progresso => falha.
+    let cfg = setup(&tmp, "cat > /dev/null\necho rodada >> rodadas.txt\nexit 0", 60);
     let (_lt, lr, _st, sr) = channels();
 
     let ws = ensure_workspace(&cfg, 10).await.unwrap();
-    let end = run_feature_executor(&cfg, &ws, 10, lr, sr).await.unwrap();
+    let end = run_feature(&cfg, &ws, 10, lr, sr).await.unwrap();
     match end {
-        RunEnd::Failed(r) => assert!(r.contains("marker"), "motivo: {r}"),
-        _ => panic!("exit 0 sem marker deveria ser Failed"),
+        RunEnd::Failed(r) => assert!(r.contains("sem progresso"), "motivo: {r}"),
+        _ => panic!("exit 0 sem marker e sem progresso deveria ser Failed"),
     }
+    // Foram exatamente 2 rodadas (estagnação detectada na 2ª).
+    let rodadas = std::fs::read_to_string(ws.join("rodadas.txt")).unwrap();
+    assert_eq!(rodadas.lines().count(), 2);
+}
+
+#[tokio::test]
+async fn rodada_incompleta_com_progresso_e_relancada_ate_o_marker() {
+    let tmp = TempDir::new().unwrap();
+    // Rodada 1: commita uma story e sai SEM marker (turno encerrado cedo).
+    // Rodada 2: percebe o estado, conclui e escreve o marker ok.
+    let cfg = setup(&tmp, r#"
+        cat > /dev/null
+        git config user.name t; git config user.email t@t
+        if [ ! -f fase2 ]; then
+            touch fase2 story-a.txt
+            git add story-a.txt && git commit -qm "feat: story #1 [spec-wave-agent]"
+            git push -q
+            exit 0
+        fi
+        touch story-b.txt
+        git add -A && git commit -qm "feat: story #2 [spec-wave-agent]" && git push -q
+        printf '{"status": "ok"}' > .spec-wave-agent-result.json
+    "#, 60);
+    let (_lt, lr, _st, sr) = channels();
+
+    let ws = ensure_workspace(&cfg, 12).await.unwrap();
+    let end = run_feature(&cfg, &ws, 12, lr, sr).await.unwrap();
+    assert!(matches!(end, RunEnd::Success), "esperava Success após 2 rodadas");
+
+    let out = std::process::Command::new("git")
+        .args(["log", "--format=%s", "agent/issue-12"])
+        .current_dir(tmp.path().join("origin.git"))
+        .output().unwrap();
+    let log = String::from_utf8_lossy(&out.stdout);
+    assert!(log.contains("story #1") && log.contains("story #2"), "log: {log}");
 }
 
 #[tokio::test]
@@ -114,7 +150,7 @@ async fn marker_partial_vira_falha_com_detalhe() {
     let (_lt, lr, _st, sr) = channels();
 
     let ws = ensure_workspace(&cfg, 11).await.unwrap();
-    let end = run_feature_executor(&cfg, &ws, 11, lr, sr).await.unwrap();
+    let end = run_feature(&cfg, &ws, 11, lr, sr).await.unwrap();
     match end {
         RunEnd::Failed(r) => {
             assert!(r.contains("partial") && r.contains("story #215"), "motivo: {r}");
@@ -136,7 +172,7 @@ async fn timeout_mata_a_arvore_de_processos_inteira() {
     let (_lt, lr, _st, sr) = channels();
 
     let ws = ensure_workspace(&cfg, 8).await.unwrap();
-    let end = run_feature_executor(&cfg, &ws, 8, lr, sr).await.unwrap();
+    let end = run_feature(&cfg, &ws, 8, lr, sr).await.unwrap();
     match end {
         RunEnd::Failed(r) => assert!(r.contains("timeout"), "motivo: {r}"),
         _ => panic!("esperava Failed(timeout)"),
@@ -157,6 +193,6 @@ async fn executor_com_exit_1_falha() {
     let (_lt, lr, _st, sr) = channels();
 
     let ws = ensure_workspace(&cfg, 9).await.unwrap();
-    let end = run_feature_executor(&cfg, &ws, 9, lr, sr).await.unwrap();
+    let end = run_feature(&cfg, &ws, 9, lr, sr).await.unwrap();
     assert!(matches!(end, RunEnd::Failed(_)), "esperava Failed");
 }

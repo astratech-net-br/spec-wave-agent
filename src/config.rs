@@ -33,6 +33,10 @@ pub struct Config {
     /// do índice de busca do GitHub e loop de retry em falha.
     #[serde(default = "d_cooldown")]
     pub cooldown_secs: u64,
+    /// Máximo de rodadas do executor por feature: exit 0 sem marker relança
+    /// o executor para continuar (ele retoma pelo estado do git/spec-wave).
+    #[serde(default = "d_max_rounds")]
+    pub max_executor_rounds: u32,
     /// Diretório de trabalho do agente
     #[serde(default = "d_workdir")]
     pub workdir: String,
@@ -56,6 +60,7 @@ fn d_feature_command() -> String {
         .into()
 }
 fn d_cooldown() -> u64 { 900 }
+fn d_max_rounds() -> u32 { 8 }
 fn d_feature_prompt() -> String {
     "Você está no clone do repositório, no branch de trabalho da Feature #{issue}.\n\
      Implemente a feature completa usando o spec-wave:\n\
@@ -72,17 +77,27 @@ fn d_feature_prompt() -> String {
      independentes; ao final, relate o que falhou.\n\
      \n\
      Regras OBRIGATÓRIAS:\n\
-     - Execute cada `npx spec-wave implement` em FOREGROUND e aguarde \
-     terminar. É PROIBIDO encerrar deixando processos em background; para \
-     paralelizar, use somente sub-agentes que bloqueiam até concluir.\n\
-     - Só encerre quando TODAS as stories estiverem commitadas e pushadas \
-     (ou declaradas como falha).\n\
-     - Ao final, escreva o arquivo ./.spec-wave-agent-result.json (NÃO \
-     commite este arquivo) com exatamente:\n\
+     - Você roda em RODADAS: se o seu turno terminar sem o marker de \
+     conclusão (abaixo), você será REINVOCADO para continuar. Ao iniciar, \
+     verifique o que já foi feito (`git log --oneline -20` e \
+     `npx spec-wave order {issue}`) e continue de onde parou — não refaça \
+     stories já commitadas.\n\
+     - Processos em background que você deixar ao encerrar o turno são \
+     MORTOS. Prefira executar cada implement em foreground e aguardar; se \
+     usar background, aguarde a conclusão AINDA NESTE turno antes de \
+     encerrar.\n\
+     - Commite e pushe cada story assim que concluída (mensagem \
+     \"feat: story #<número> [spec-wave-agent]\").\n\
+     - SOMENTE quando TODAS as stories estiverem commitadas e pushadas (ou \
+     declaradas como falha), escreva o arquivo \
+     ./.spec-wave-agent-result.json (NÃO commite este arquivo) com \
+     exatamente:\n\
      {\"status\": \"ok\"} se todas as stories foram implementadas, \
      commitadas e pushadas; ou\n\
-     {\"status\": \"partial\", \"detalhe\": \"<o que falhou>\"} caso \
-     contrário.\n"
+     {\"status\": \"partial\", \"detalhe\": \"<o que falhou>\"} se alguma \
+     story falhou definitivamente.\n\
+     - NÃO escreva o marker se ainda houver stories pendentes que você \
+     pretende continuar na próxima rodada.\n"
         .into()
 }
 
@@ -169,6 +184,9 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("config: feature_command inválido: {e}"))?;
         if self.feature_prompt.trim().is_empty() {
             bail!("config: feature_prompt vazio");
+        }
+        if self.max_executor_rounds == 0 {
+            bail!("config: max_executor_rounds deve ser >= 1");
         }
         Ok(())
     }

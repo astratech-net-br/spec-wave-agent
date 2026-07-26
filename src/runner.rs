@@ -179,13 +179,19 @@ async fn kill_tree(child: &mut tokio::process::Child) {
     let _ = child.kill().await; // reap (e fallback não-unix)
 }
 
-/// Roda o executor da feature (Claude Code orquestrador): o comando vem de
-/// `cfg.feature_command` e o prompt de orquestração entra via STDIN.
-pub async fn run_feature_executor(
+/// Desfecho bruto do processo do executor (antes da checagem do marker).
+enum RoundRaw { Success, Failed(String), LeaseLost, Interrupted }
+
+/// Desfecho de UMA rodada do executor, já com o marker aplicado.
+enum RoundEnd { Success, Incomplete, Failed(String), LeaseLost, Interrupted }
+
+/// Roda UMA rodada do executor da feature (Claude Code orquestrador): o
+/// comando vem de `cfg.feature_command` e o prompt entra via STDIN.
+async fn executor_round(
     cfg: &Config, ws: &Path, issue: u64,
     mut lease_lost: watch::Receiver<bool>,
     mut shutdown: watch::Receiver<bool>,
-) -> Result<RunEnd> {
+) -> Result<RoundEnd> {
     let argv = crate::config::split_command(
         &crate::config::render_template(&cfg.feature_command, issue))?;
     let prompt = crate::config::render_template(&cfg.feature_prompt, issue);
@@ -222,21 +228,21 @@ pub async fn run_feature_executor(
         status = timeout(cap, child.wait()) => match status {
             Err(_) => {
                 kill_tree(&mut child).await;
-                RunEnd::Failed(format!("timeout de {}s", cap.as_secs()))
+                RoundRaw::Failed(format!("timeout de {}s", cap.as_secs()))
             }
-            Ok(Ok(st)) if st.success() => RunEnd::Success,
-            Ok(Ok(st)) => RunEnd::Failed(format!("exit code {st}")),
-            Ok(Err(e)) => RunEnd::Failed(e.to_string()),
+            Ok(Ok(st)) if st.success() => RoundRaw::Success,
+            Ok(Ok(st)) => RoundRaw::Failed(format!("exit code {st}")),
+            Ok(Err(e)) => RoundRaw::Failed(e.to_string()),
         },
         _ = lease_lost.changed() => {
             // Fencing: perdemos o lease => outro agente pode estar ativo.
             // Matar imediatamente, SEM push (o novo dono manda no branch).
             kill_tree(&mut child).await;
-            RunEnd::LeaseLost
+            RoundRaw::LeaseLost
         }
         _ = shutdown.changed() => {
             kill_tree(&mut child).await;
-            RunEnd::Interrupted
+            RoundRaw::Interrupted
         }
     };
 
@@ -253,25 +259,77 @@ pub async fn run_feature_executor(
         let _ = timeout(TokioDuration::from_secs(2), t).await;
     }
 
-    // Exit 0 só vale como sucesso com o marker "ok" do executor.
+    // Exit 0 só vale como sucesso com o marker "ok" do executor; sem
+    // marker é "rodada incompleta" (o run_feature relança para continuar).
     let end = match end {
-        RunEnd::Success => match take_result_marker(ws) {
-            Some(r) if r.status == "ok" => RunEnd::Success,
-            Some(r) => RunEnd::Failed(format!(
+        RoundRaw::Success => match take_result_marker(ws) {
+            Some(r) if r.status == "ok" => RoundEnd::Success,
+            Some(r) => RoundEnd::Failed(format!(
                 "executor terminou sem concluir tudo (status {:?}{})",
                 r.status,
                 r.detalhe.map(|d| format!(": {d}")).unwrap_or_default())),
-            None => RunEnd::Failed(
-                "executor saiu com exit 0 mas sem escrever o marker \
-                 .spec-wave-agent-result.json (término prematuro? trabalho \
-                 deixado em background?)".into()),
+            None => RoundEnd::Incomplete,
         },
-        other => {
+        RoundRaw::Failed(r) => {
             let _ = take_result_marker(ws); // não deixar sujar o checkpoint
-            other
+            RoundEnd::Failed(r)
+        }
+        RoundRaw::LeaseLost => RoundEnd::LeaseLost,
+        RoundRaw::Interrupted => {
+            let _ = take_result_marker(ws);
+            RoundEnd::Interrupted
         }
     };
     Ok(end)
+}
+
+async fn head_sha(ws: &Path) -> String {
+    run(ws, "git", &["rev-parse", "HEAD"]).await
+        .map(|o| o.stdout.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Executa a feature em RODADAS do executor: exit 0 sem marker = o
+/// orquestrador encerrou o turno com trabalho pendente (ex: aguardando
+/// implements longos) => relança para continuar do estado do git/spec-wave.
+/// Estagnação (2 rodadas seguidas sem commit novo) ou estouro de
+/// max_executor_rounds => falha.
+pub async fn run_feature(
+    cfg: &Config, ws: &Path, issue: u64,
+    lease_lost: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
+) -> Result<RunEnd> {
+    let mut no_progress = 0u32;
+    for round in 1..=cfg.max_executor_rounds {
+        let head_before = head_sha(ws).await;
+        let end = executor_round(cfg, ws, issue,
+                                 lease_lost.clone(), shutdown.clone()).await?;
+        match end {
+            RoundEnd::Success => return Ok(RunEnd::Success),
+            RoundEnd::Failed(r) => return Ok(RunEnd::Failed(r)),
+            RoundEnd::LeaseLost => return Ok(RunEnd::LeaseLost),
+            RoundEnd::Interrupted => return Ok(RunEnd::Interrupted),
+            RoundEnd::Incomplete => {
+                let progressed = head_sha(ws).await != head_before;
+                if progressed {
+                    no_progress = 0;
+                } else {
+                    no_progress += 1;
+                    if no_progress >= 2 {
+                        return Ok(RunEnd::Failed(format!(
+                            "{no_progress} rodadas seguidas sem progresso \
+                             (sem commits novos) e sem marker de conclusão")));
+                    }
+                }
+                info!(target: "agent",
+                      "feature #{issue}: rodada {round} terminou sem marker; \
+                       relançando executor para continuar (progresso: {progressed})");
+            }
+        }
+    }
+    Ok(RunEnd::Failed(format!(
+        "max_executor_rounds ({}) atingido sem marker de conclusão",
+        cfg.max_executor_rounds)))
 }
 
 #[cfg(test)]
