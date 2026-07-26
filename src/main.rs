@@ -16,17 +16,12 @@
 //!
 //! Autenticação: usa o `git`/`gh` já configurados na máquina do dev.
 
-mod config;
-mod lease;
-mod queue;
-mod runner;
-mod shell;
-
 use anyhow::{bail, Result};
-use config::{load_config, Config};
-use lease::{Lease, LeaseRepo, RenewError};
-use runner::{checkpoint, ensure_workspace, implement, RunEnd};
-use shell::run;
+use spec_wave_agent::config::{load_config, Config};
+use spec_wave_agent::lease::{Lease, LeaseRepo, RenewError};
+use spec_wave_agent::queue;
+use spec_wave_agent::runner::{checkpoint, ensure_workspace, implement, RunEnd};
+use spec_wave_agent::shell::run;
 use std::path::Path;
 use std::time::Instant;
 use tokio::sync::watch;
