@@ -48,7 +48,10 @@ fn d_heartbeat() -> u64 { 120 }
 fn d_ttl() -> i64 { 600 }
 fn d_impl_timeout() -> u64 { 14400 }
 fn d_feature_command() -> String {
-    "claude -p --permission-mode acceptEdits \
+    // stream-json: cada evento (texto, tool calls, resultado) vira uma linha
+    // JSON no stdout, que o runner formata para o console (ver runner.rs).
+    "claude -p --output-format stream-json --verbose \
+     --permission-mode acceptEdits \
      --allowedTools \"Bash(npx:*),Bash(git:*),Edit,Write,Read,Glob,Grep,Task\""
         .into()
 }

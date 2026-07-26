@@ -86,6 +86,70 @@ fn take_result_marker(ws: &Path) -> Option<ExecResult> {
     serde_json::from_str(raw.trim()).ok()
 }
 
+/// Truncagem segura em fronteira de char, com reticências.
+fn trunc(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max).collect();
+    format!("{cut}…")
+}
+
+/// Resume um evento do stream-json do Claude Code (`--output-format
+/// stream-json`) em uma linha legível. None = evento sem interesse (ex:
+/// tool_result), que é suprimido do console.
+fn format_stream_event(v: &serde_json::Value) -> Option<String> {
+    match v.get("type").and_then(|t| t.as_str())? {
+        "system" => {
+            let model = v.get("model").and_then(|m| m.as_str()).unwrap_or("?");
+            Some(format!("sessão iniciada (modelo {model})"))
+        }
+        "assistant" => {
+            let content = v.pointer("/message/content")?.as_array()?;
+            let mut parts = Vec::new();
+            for c in content {
+                match c.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => {
+                        let t = c.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                        if !t.trim().is_empty() {
+                            parts.push(trunc(t.trim(), 400));
+                        }
+                    }
+                    Some("tool_use") => {
+                        let name = c.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                        let detail = c.get("input").and_then(|i| {
+                            ["command", "file_path", "description", "prompt", "pattern"]
+                                .iter()
+                                .find_map(|k| i.get(k).and_then(|s| s.as_str()))
+                        }).unwrap_or("");
+                        parts.push(format!("⏵ {name}: {}", trunc(detail, 160)));
+                    }
+                    _ => {}
+                }
+            }
+            (!parts.is_empty()).then(|| parts.join(" | "))
+        }
+        "result" => {
+            let sub = v.get("subtype").and_then(|s| s.as_str()).unwrap_or("?");
+            let cost = v.get("total_cost_usd").and_then(|c| c.as_f64())
+                .map(|c| format!(", custo US${c:.2}")).unwrap_or_default();
+            let turns = v.get("num_turns").and_then(|t| t.as_u64())
+                .map(|t| format!(", {t} turnos")).unwrap_or_default();
+            Some(format!("fim: {sub}{cost}{turns}"))
+        }
+        _ => None, // "user" (tool results) e afins: ruído
+    }
+}
+
+/// Linha do stdout do executor: stream-json vira resumo legível; linha que
+/// não é stream-json passa crua (executor sem --output-format stream-json).
+fn render_out_line(line: &str) -> Option<String> {
+    match serde_json::from_str::<serde_json::Value>(line) {
+        Ok(v) if v.get("type").is_some() => format_stream_event(&v),
+        _ => Some(line.to_string()),
+    }
+}
+
 async fn stream_lines<R>(reader: R, issue: u64, stream: &'static str)
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -93,7 +157,13 @@ where
     use tokio::io::{AsyncBufReadExt, BufReader};
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        info!(target: "spec-wave", "[#{issue}][{stream}] {line}");
+        if stream == "out" {
+            if let Some(msg) = render_out_line(&line) {
+                info!(target: "spec-wave", "[#{issue}] {msg}");
+            }
+        } else {
+            info!(target: "spec-wave", "[#{issue}][{stream}] {line}");
+        }
     }
 }
 
@@ -202,4 +272,58 @@ pub async fn run_feature_executor(
         }
     };
     Ok(end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render(line: &str) -> Option<String> {
+        render_out_line(line)
+    }
+
+    #[test]
+    fn assistant_texto_e_tool_use() {
+        let line = r#"{"type":"assistant","message":{"content":[
+            {"type":"text","text":"Vou rodar o order."},
+            {"type":"tool_use","name":"Bash","input":{"command":"npx spec-wave order 7"}}
+        ]}}"#.replace('\n', "");
+        let msg = render(&line).unwrap();
+        assert!(msg.contains("Vou rodar o order."));
+        assert!(msg.contains("⏵ Bash: npx spec-wave order 7"));
+    }
+
+    #[test]
+    fn tool_use_edit_mostra_arquivo() {
+        let line = r#"{"type":"assistant","message":{"content":[
+            {"type":"tool_use","name":"Edit","input":{"file_path":"src/auth.ts","old_string":"x"}}
+        ]}}"#.replace('\n', "");
+        assert_eq!(render(&line).unwrap(), "⏵ Edit: src/auth.ts");
+    }
+
+    #[test]
+    fn resultado_com_custo() {
+        let line = r#"{"type":"result","subtype":"success","total_cost_usd":1.234,"num_turns":42}"#;
+        assert_eq!(render(line).unwrap(), "fim: success, custo US$1.23, 42 turnos");
+    }
+
+    #[test]
+    fn tool_result_e_suprimido() {
+        let line = r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"saida gigante"}]}}"#;
+        assert!(render(line).is_none());
+    }
+
+    #[test]
+    fn linha_nao_json_passa_crua() {
+        assert_eq!(render("progresso 42%").unwrap(), "progresso 42%");
+        // JSON sem "type" (ex: log de outra ferramenta) também passa cru
+        assert_eq!(render(r#"{"foo": 1}"#).unwrap(), r#"{"foo": 1}"#);
+    }
+
+    #[test]
+    fn truncagem_segura_com_utf8() {
+        let s = "ação".repeat(100);
+        let t = trunc(&s, 10);
+        assert_eq!(t.chars().count(), 11); // 10 + reticências
+    }
 }
