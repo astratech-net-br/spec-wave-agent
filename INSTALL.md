@@ -3,26 +3,29 @@
 ## 1. Compilar e instalar
 
 ```bash
-cargo build --release
-cp target/release/spec-wave-agent /usr/local/bin/
+make install            # cargo build --release + copia p/ /usr/local/bin
+make install-config     # cria ~/.config/spec-wave-agent/config.toml se não existir
 ```
+
+(ou manualmente: `cargo build --release && cp target/release/spec-wave-agent /usr/local/bin/`)
 
 ## 2. Configuração (`~/.config/spec-wave-agent/config.toml`)
 
+Veja `packaging/config.example.toml` (schema completo comentado). Mínimo:
+
 ```toml
 repo = "sua-org/seu-repo"
-queue_label = "agent:queued"
-poll_interval_secs = 60
-heartbeat_secs = 120       # renovação do lease
-lease_ttl_secs = 600       # sem heartbeat por 10min => outro agente rouba
-implement_timeout_secs = 3600
-# agent_id = "moacir@macbook"   # default: usuario@hostname
+queue_label = "spec-wave:dev-agent"   # default
 ```
 
-Invariante importante: `lease_ttl_secs` deve ser >= 4x `heartbeat_secs`,
-para tolerar lentidão de rede sem roubo indevido.
+Invariantes validadas no boot (o agente recusa config inválida):
 
-## 3. Pré-requisitos na máquina
+- `repo` no formato `owner/repo`
+- `lease_ttl_secs >= 4 * heartbeat_secs` (tolera lentidão de rede sem
+  roubo indevido de lease)
+- intervalos > 0
+
+## 3. Pré-requisitos na máquina (checados no boot — fail fast)
 
 - `git` e `gh` autenticados (o agente usa as credenciais do dev)
 - Node 18+ (`npx spec-wave`)
@@ -30,57 +33,59 @@ para tolerar lentidão de rede sem roubo indevido.
 - Repositório com `.spec-wave.json` contendo `specKit.command`
   apontando para o Claude Code (a máquina do dev É o executor)
 
-## 4. Rodar como serviço
+## 4. Rodar
 
-### macOS (launchd) — `~/Library/LaunchAgents/dev.specwave.agent.plist`
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
- "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>dev.specwave.agent</string>
-  <key>ProgramArguments</key>
-    <array><string>/usr/local/bin/spec-wave-agent</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/tmp/spec-wave-agent.log</string>
-  <key>StandardErrorPath</key><string>/tmp/spec-wave-agent.log</string>
-</dict></plist>
-```
+### Foreground (console mostra os logs ao vivo)
 
 ```bash
-launchctl load ~/Library/LaunchAgents/dev.specwave.agent.plist
+spec-wave-agent                    # logs info no console
+RUST_LOG=debug spec-wave-agent     # mais verboso
 ```
 
-### Linux (systemd user unit) — `~/.config/systemd/user/spec-wave-agent.service`
+Os logs do agente saem com timestamp/nível; o output do
+`npx spec-wave implement` (Claude Code) aparece intercalado como
+`[#<issue>][out] ...` / `[#<issue>][err] ...`.
 
-```ini
-[Unit]
-Description=spec-wave dev agent
-
-[Service]
-ExecStart=/usr/local/bin/spec-wave-agent
-Restart=on-failure
-# SIGTERM no desligamento => checkpoint + release do lease (takeover imediato)
-KillSignal=SIGTERM
-TimeoutStopSec=30
-
-[Install]
-WantedBy=default.target
-```
+### Linux (systemd user unit)
 
 ```bash
-systemctl --user enable --now spec-wave-agent
+make install-systemd
+journalctl --user -u spec-wave-agent -f    # acompanhar logs
 ```
+
+Unit em `packaging/spec-wave-agent.service`. Se o Node vem de nvm/volta,
+descomente/ajuste a linha `Environment=PATH=...` da unit.
+
+### macOS (launchd)
+
+```bash
+make install-launchd
+tail -f ~/Library/Logs/spec-wave-agent.log
+```
+
+Plist em `packaging/dev.specwave.agent.plist` (o Makefile substitui o
+home automaticamente).
 
 ## 5. Como funciona a coordenação
 
-- Fila: issues abertas com label `agent:queued` + tipo `[STORY]`/`[TASK]`
+- Fila: issues abertas com label `spec-wave:dev-agent` + tipo
+  `[STORY]`/`[TASK]`; FIFO por número.
+- **Uma tarefa por vez**: o agente pega a primeira issue que conseguir
+  claimar; só depois de terminar (sucesso, falha ou interrupção) volta à
+  fila — com re-poll fresco — para tentar obter a próxima.
 - Lock: ref `refs/heads/spec-wave-agent/claims/<n>` com `lease.json`
-  (aquisição = push não-forçado; renovação/roubo = `--force-with-lease`)
+  (aquisição = push não-forçado; renovação/roubo = `--force-with-lease`).
 - Desligou a máquina educadamente => SIGTERM => checkpoint (commit+push
-  do WIP) + release do lease => outro agente retoma no próximo poll
+  do WIP) + release do lease => outro agente retoma no próximo poll.
 - Desligou na força (bateria, kernel panic) => sem heartbeat por
   `lease_ttl_secs` => outro agente ROUBA o lease e retoma do último
-  commit pushado no branch `agent/issue-<n>`
+  commit pushado no branch `agent/issue-<n>`.
+- Rede instável: renovações com erro transiente são re-tentadas por até
+  `lease_ttl_secs − 2×heartbeat_secs`; estourou => o agente se auto-cerca
+  (mata o processo filho) antes de qualquer roubo ser possível.
+
+## 6. Testes
+
+```bash
+make test    # unitários + integração do lease (origin git local, sem rede)
+```

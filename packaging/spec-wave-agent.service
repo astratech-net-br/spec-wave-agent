@@ -1,0 +1,19 @@
+[Unit]
+Description=spec-wave dev agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/spec-wave-agent
+Restart=on-failure
+RestartSec=10
+Environment=RUST_LOG=info
+# Usuários de nvm/volta: descomente e ajuste para o npx entrar no PATH
+#Environment=PATH=%h/.nvm/versions/node/v20.11.0/bin:/usr/local/bin:/usr/bin:/bin
+# SIGTERM no desligamento => checkpoint + release do lease (takeover imediato)
+KillSignal=SIGTERM
+# Deve ser maior que o tempo do checkpoint (commit + push do WIP)
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
