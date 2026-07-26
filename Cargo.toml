@@ -1,0 +1,17 @@
+[package]
+name = "spec-wave-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Distributed dev-machine agent for the spec-wave workflow (RFC-001)"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "signal", "sync"] }
+
+[profile.release]
+lto = true
+strip = true
