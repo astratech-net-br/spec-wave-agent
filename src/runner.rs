@@ -66,6 +66,26 @@ pub async fn checkpoint(ws: &Path, issue: u64, label: &str) {
 
 pub enum RunEnd { Success, Failed(String), LeaseLost, Interrupted }
 
+/// Marker que o executor escreve ao final (ver feature_prompt): exit 0 sem
+/// marker "ok" NÃO é sucesso — pega orquestrador que encerrou prematuramente
+/// (ex: deixou implements em background).
+const RESULT_MARKER: &str = ".spec-wave-agent-result.json";
+
+#[derive(serde::Deserialize)]
+struct ExecResult {
+    status: String,
+    #[serde(default)]
+    detalhe: Option<String>,
+}
+
+/// Lê e REMOVE o marker (não pode sobrar para o checkpoint commitar).
+fn take_result_marker(ws: &Path) -> Option<ExecResult> {
+    let path = ws.join(RESULT_MARKER);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    serde_json::from_str(raw.trim()).ok()
+}
+
 async fn stream_lines<R>(reader: R, issue: u64, stream: &'static str)
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -125,6 +145,7 @@ pub async fn run_feature_executor(
         .map(|s| tokio::spawn(stream_lines(s, issue, "out")));
     let err_task = child.stderr.take()
         .map(|s| tokio::spawn(stream_lines(s, issue, "err")));
+    let group_pid = child.id(); // antes do wait (depois vira None)
 
     let cap = TokioDuration::from_secs(cfg.implement_timeout_secs);
     let end = tokio::select! {
@@ -149,9 +170,36 @@ pub async fn run_feature_executor(
         }
     };
 
+    // Mesmo em saída natural do executor, mata retardatários do grupo:
+    // um orquestrador que "termina" deixando implements em background não
+    // pode deixar claudes órfãos trabalhando.
+    #[cfg(unix)]
+    if let Some(pid) = group_pid {
+        unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
+    }
+
     // Drena o resto do output (após kill/exit os pipes fecham em EOF).
     for t in [out_task, err_task].into_iter().flatten() {
         let _ = timeout(TokioDuration::from_secs(2), t).await;
     }
+
+    // Exit 0 só vale como sucesso com o marker "ok" do executor.
+    let end = match end {
+        RunEnd::Success => match take_result_marker(ws) {
+            Some(r) if r.status == "ok" => RunEnd::Success,
+            Some(r) => RunEnd::Failed(format!(
+                "executor terminou sem concluir tudo (status {:?}{})",
+                r.status,
+                r.detalhe.map(|d| format!(": {d}")).unwrap_or_default())),
+            None => RunEnd::Failed(
+                "executor saiu com exit 0 mas sem escrever o marker \
+                 .spec-wave-agent-result.json (término prematuro? trabalho \
+                 deixado em background?)".into()),
+        },
+        other => {
+            let _ = take_result_marker(ws); // não deixar sujar o checkpoint
+            other
+        }
+    };
     Ok(end)
 }

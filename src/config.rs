@@ -28,6 +28,11 @@ pub struct Config {
     /// Prompt de orquestração enviado ao executor via stdin. Placeholder: {issue}
     #[serde(default = "d_feature_prompt")]
     pub feature_prompt: String,
+    /// Depois de processar uma issue (qualquer desfecho), ela fica fora da
+    /// fila deste agente por este tempo — evita re-claim imediato por atraso
+    /// do índice de busca do GitHub e loop de retry em falha.
+    #[serde(default = "d_cooldown")]
+    pub cooldown_secs: u64,
     /// Diretório de trabalho do agente
     #[serde(default = "d_workdir")]
     pub workdir: String,
@@ -47,6 +52,7 @@ fn d_feature_command() -> String {
      --allowedTools \"Bash(npx:*),Bash(git:*),Edit,Write,Read,Glob,Grep,Task\""
         .into()
 }
+fn d_cooldown() -> u64 { 900 }
 fn d_feature_prompt() -> String {
     "Você está no clone do repositório, no branch de trabalho da Feature #{issue}.\n\
      Implemente a feature completa usando o spec-wave:\n\
@@ -60,7 +66,20 @@ fn d_feature_prompt() -> String {
      4. Ao concluir cada story: rode os testes relevantes, commite neste \
      branch com mensagem \"feat: story #<número> [spec-wave-agent]\" e faça push.\n\
      5. Se uma story falhar, pule as que dependem dela e continue as \
-     independentes; ao final, relate o que falhou.\n"
+     independentes; ao final, relate o que falhou.\n\
+     \n\
+     Regras OBRIGATÓRIAS:\n\
+     - Execute cada `npx spec-wave implement` em FOREGROUND e aguarde \
+     terminar. É PROIBIDO encerrar deixando processos em background; para \
+     paralelizar, use somente sub-agentes que bloqueiam até concluir.\n\
+     - Só encerre quando TODAS as stories estiverem commitadas e pushadas \
+     (ou declaradas como falha).\n\
+     - Ao final, escreva o arquivo ./.spec-wave-agent-result.json (NÃO \
+     commite este arquivo) com exatamente:\n\
+     {\"status\": \"ok\"} se todas as stories foram implementadas, \
+     commitadas e pushadas; ou\n\
+     {\"status\": \"partial\", \"detalhe\": \"<o que falhou>\"} caso \
+     contrário.\n"
         .into()
 }
 

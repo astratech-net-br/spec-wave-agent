@@ -64,6 +64,7 @@ async fn sucesso_recebe_prompt_e_pusha_trabalho() {
         git add -A && git config user.name t && git config user.email t@t
         git commit -qm "feat: story #999 [spec-wave-agent]"
         git push -q
+        printf '{"status": "ok"}' > .spec-wave-agent-result.json
     "#, 60);
     let (_lt, lr, _st, sr) = channels();
 
@@ -82,6 +83,45 @@ async fn sucesso_recebe_prompt_e_pusha_trabalho() {
         .output().unwrap();
     let log = String::from_utf8_lossy(&out.stdout);
     assert!(log.contains("feat: story #999 [spec-wave-agent]"), "log: {log}");
+
+    // O agente consome o marker (não pode sobrar para o checkpoint).
+    assert!(!ws.join(".spec-wave-agent-result.json").exists());
+}
+
+#[tokio::test]
+async fn exit_zero_sem_marker_nao_e_sucesso() {
+    let tmp = TempDir::new().unwrap();
+    // Simula o orquestrador que "termina" cedo demais: exit 0, sem marker.
+    let cfg = setup(&tmp, "cat > /dev/null\nexit 0", 60);
+    let (_lt, lr, _st, sr) = channels();
+
+    let ws = ensure_workspace(&cfg, 10).await.unwrap();
+    let end = run_feature_executor(&cfg, &ws, 10, lr, sr).await.unwrap();
+    match end {
+        RunEnd::Failed(r) => assert!(r.contains("marker"), "motivo: {r}"),
+        _ => panic!("exit 0 sem marker deveria ser Failed"),
+    }
+}
+
+#[tokio::test]
+async fn marker_partial_vira_falha_com_detalhe() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = setup(&tmp, r#"
+        cat > /dev/null
+        printf '{"status": "partial", "detalhe": "story #215 falhou nos testes"}' \
+            > .spec-wave-agent-result.json
+    "#, 60);
+    let (_lt, lr, _st, sr) = channels();
+
+    let ws = ensure_workspace(&cfg, 11).await.unwrap();
+    let end = run_feature_executor(&cfg, &ws, 11, lr, sr).await.unwrap();
+    match end {
+        RunEnd::Failed(r) => {
+            assert!(r.contains("partial") && r.contains("story #215"), "motivo: {r}");
+        }
+        _ => panic!("status partial deveria ser Failed"),
+    }
+    assert!(!ws.join(".spec-wave-agent-result.json").exists());
 }
 
 #[tokio::test]

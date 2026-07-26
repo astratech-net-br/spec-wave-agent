@@ -24,6 +24,7 @@ use spec_wave_agent::lease::{Lease, LeaseRepo, RenewError};
 use spec_wave_agent::queue;
 use spec_wave_agent::runner::{checkpoint, ensure_workspace, run_feature_executor, RunEnd};
 use spec_wave_agent::shell::run;
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 use tokio::sync::watch;
@@ -196,6 +197,11 @@ async fn main() -> Result<()> {
         let _ = sd_tx.send(true);
     });
 
+    // Issues processadas recentemente (qualquer desfecho) ficam em cooldown:
+    // evita re-claim imediato por atraso do índice de busca do GitHub após
+    // remover a label, e loop quente de retry quando uma feature falha.
+    let mut cooldown: HashMap<u64, Instant> = HashMap::new();
+
     loop {
         if *sd_rx.borrow() {
             break;
@@ -203,16 +209,26 @@ async fn main() -> Result<()> {
         let mut claimed = false;
         match queue::poll_queue(&cfg, &workdir).await {
             Ok(queue) => {
-                // Uma issue por vez: pega a PRIMEIRA que conseguir claimar;
+                // Uma feature por vez: pega a PRIMEIRA que conseguir claimar;
                 // ao terminar, volta direto ao poll (fila fresca).
                 for issue in queue {
                     if *sd_rx.borrow() { break; }
+                    if let Some(t) = cooldown.get(&issue) {
+                        if t.elapsed().as_secs() < cfg.cooldown_secs {
+                            continue;
+                        }
+                    }
                     match process_issue(&cfg, &leases, &me, issue,
                                         sd_rx.clone()).await {
-                        Ok(true) => { claimed = true; break; }
+                        Ok(true) => {
+                            cooldown.insert(issue, Instant::now());
+                            claimed = true;
+                            break;
+                        }
                         Ok(false) => {} // outro agente: tenta a próxima
                         Err(e) => {
                             error!(target: "agent", "erro na issue #{issue}: {e:#}");
+                            cooldown.insert(issue, Instant::now());
                             claimed = true; // pode ter claimado: re-poll fresco
                             break;
                         }
