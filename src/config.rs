@@ -88,6 +88,8 @@ fn d_feature_prompt() -> String {
      encerrar.\n\
      - Commite e pushe cada story assim que concluída (mensagem \
      \"feat: story #<número> [spec-wave-agent]\").\n\
+     - Os cards do board (Etapas) são movidos AUTOMATICAMENTE pelo \
+     `spec-wave implement` — não gerencie o board manualmente.\n\
      - SOMENTE quando TODAS as stories estiverem commitadas e pushadas (ou \
      declaradas como falha), escreva o arquivo \
      ./.spec-wave-agent-result.json (NÃO commite este arquivo) com \
