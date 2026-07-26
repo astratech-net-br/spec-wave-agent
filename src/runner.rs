@@ -77,22 +77,49 @@ where
     }
 }
 
-pub async fn implement(
+/// Mata o executor e TODA a sua árvore de processos (o executor spawna
+/// `npx spec-wave` que spawna o claude interno; matar só o filho direto
+/// deixaria netos órfãos trabalhando — buraco de fencing).
+async fn kill_tree(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // O filho é líder do grupo (process_group(0)); -pid = grupo inteiro.
+        unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
+    }
+    let _ = child.kill().await; // reap (e fallback não-unix)
+}
+
+/// Roda o executor da feature (Claude Code orquestrador): o comando vem de
+/// `cfg.feature_command` e o prompt de orquestração entra via STDIN.
+pub async fn run_feature_executor(
     cfg: &Config, ws: &Path, issue: u64,
     mut lease_lost: watch::Receiver<bool>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<RunEnd> {
-    let mut child = Command::new("npx")
-        .args(["spec-wave", "implement", &issue.to_string()])
+    let argv = crate::config::split_command(
+        &crate::config::render_template(&cfg.feature_command, issue))?;
+    let prompt = crate::config::render_template(&cfg.feature_prompt, issue);
+
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..])
         .current_dir(ws)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .context("falha ao iniciar npx spec-wave implement")?;
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0); // líder de grupo => kill_tree pega a árvore toda
+    let mut child = cmd.spawn()
+        .with_context(|| format!("falha ao iniciar executor {:?}", argv[0]))?;
 
-    // Os handles saem do child via take(), então child.kill() nos braços
+    // Prompt via stdin (fechado em seguida — o executor lê até EOF).
+    if let Some(mut si) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        si.write_all(prompt.as_bytes()).await
+            .context("falha ao escrever o prompt no stdin do executor")?;
+    }
+
+    // Os handles saem do child via take(), então kill_tree nos braços
     // abaixo continua imediato — fencing não espera os readers.
     let out_task = child.stdout.take()
         .map(|s| tokio::spawn(stream_lines(s, issue, "out")));
@@ -103,7 +130,7 @@ pub async fn implement(
     let end = tokio::select! {
         status = timeout(cap, child.wait()) => match status {
             Err(_) => {
-                let _ = child.kill().await;
+                kill_tree(&mut child).await;
                 RunEnd::Failed(format!("timeout de {}s", cap.as_secs()))
             }
             Ok(Ok(st)) if st.success() => RunEnd::Success,
@@ -113,11 +140,11 @@ pub async fn implement(
         _ = lease_lost.changed() => {
             // Fencing: perdemos o lease => outro agente pode estar ativo.
             // Matar imediatamente, SEM push (o novo dono manda no branch).
-            let _ = child.kill().await;
+            kill_tree(&mut child).await;
             RunEnd::LeaseLost
         }
         _ = shutdown.changed() => {
-            let _ = child.kill().await;
+            kill_tree(&mut child).await;
             RunEnd::Interrupted
         }
     };

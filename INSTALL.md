@@ -68,9 +68,12 @@ home automaticamente).
 
 ## 5. Como funciona a coordenação
 
-- Fila: issues abertas com label `spec-wave:dev-agent` + tipo
-  `[STORY]`/`[TASK]`; FIFO por número.
-- **Uma tarefa por vez**: o agente pega a primeira issue que conseguir
+- Fila: issues abertas com label `spec-wave:dev-agent` + tipo `[FEATURE]`;
+  FIFO por número. A label vai na FEATURE: o executor (Claude Code, via
+  `feature_prompt`) usa `npx spec-wave order`/`implement` para implementar
+  todas as user stories da feature na ordem de dependência, paralelizando
+  as independentes com sub-agentes.
+- **Uma feature por vez**: o agente pega a primeira que conseguir
   claimar; só depois de terminar (sucesso, falha ou interrupção) volta à
   fila — com re-poll fresco — para tentar obter a próxima.
 - Lock: ref `refs/heads/spec-wave-agent/claims/<n>` com `lease.json`

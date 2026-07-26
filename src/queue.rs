@@ -12,13 +12,13 @@ struct GhLabel { name: String }
 #[derive(Deserialize)]
 struct GhIssue { number: u64, labels: Vec<GhLabel> }
 
-/// Filtra o JSON do `gh issue list`: só issues tipadas [STORY]/[TASK],
-/// FIFO por número.
+/// Filtra o JSON do `gh issue list`: só issues tipadas [FEATURE],
+/// FIFO por número. A label da fila vai em Features; o executor
+/// (Claude Code) implementa as stories filhas na ordem de dependência.
 pub fn parse_queue(json: &str) -> Result<Vec<u64>> {
     let issues: Vec<GhIssue> = serde_json::from_str(json)?;
     let mut nums: Vec<u64> = issues.into_iter()
-        .filter(|i| i.labels.iter()
-            .any(|l| l.name == "[STORY]" || l.name == "[TASK]"))
+        .filter(|i| i.labels.iter().any(|l| l.name == "[FEATURE]"))
         .map(|i| i.number)
         .collect();
     nums.sort_unstable();
@@ -45,14 +45,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn filtra_tipos_e_ordena() {
+    fn filtra_features_e_ordena() {
         let json = r#"[
-            {"number": 30, "labels": [{"name": "spec-wave:dev-agent"}, {"name": "[TASK]"}]},
+            {"number": 30, "labels": [{"name": "spec-wave:dev-agent"}, {"name": "[FEATURE]"}]},
             {"number": 5,  "labels": [{"name": "spec-wave:dev-agent"}, {"name": "[STORY]"}]},
-            {"number": 12, "labels": [{"name": "spec-wave:dev-agent"}, {"name": "bug"}]},
-            {"number": 8,  "labels": [{"name": "[TASK]"}, {"name": "extra"}]}
+            {"number": 12, "labels": [{"name": "spec-wave:dev-agent"}, {"name": "[TASK]"}]},
+            {"number": 8,  "labels": [{"name": "[FEATURE]"}, {"name": "extra"}]}
         ]"#;
-        assert_eq!(parse_queue(json).unwrap(), vec![5, 8, 30]);
+        // [STORY]/[TASK] avulsas NÃO entram mais na fila
+        assert_eq!(parse_queue(json).unwrap(), vec![8, 30]);
     }
 
     #[test]

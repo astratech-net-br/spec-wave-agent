@@ -1,7 +1,9 @@
-//! spec-wave-agent — daemon para máquina de dev que puxa Stories/Tasks da
-//! fila (label `spec-wave:dev-agent`), garante exclusão mútua entre múltiplos
-//! agentes via lease em git refs (CAS real), e delega a implementação ao
-//! `npx spec-wave implement` (que invoca o Claude Code do próprio dev).
+//! spec-wave-agent — daemon para máquina de dev que puxa FEATURES da
+//! fila (label `spec-wave:dev-agent` em issues [FEATURE]), garante exclusão
+//! mútua entre múltiplos agentes via lease em git refs (CAS real), e delega
+//! a orquestração ao Claude Code: o prompt (config `feature_prompt`) instrui
+//! usar `npx spec-wave order`/`implement` para implementar todas as user
+//! stories da feature na ordem de dependência, paralelizando com sub-agentes.
 //!
 //! Propriedades:
 //!   - Claim atômico: criar a ref de lease é CAS (push não-forçado falha se
@@ -20,7 +22,7 @@ use anyhow::{bail, Result};
 use spec_wave_agent::config::{load_config, Config};
 use spec_wave_agent::lease::{Lease, LeaseRepo, RenewError};
 use spec_wave_agent::queue;
-use spec_wave_agent::runner::{checkpoint, ensure_workspace, implement, RunEnd};
+use spec_wave_agent::runner::{checkpoint, ensure_workspace, run_feature_executor, RunEnd};
 use spec_wave_agent::shell::run;
 use std::path::Path;
 use std::time::Instant;
@@ -116,7 +118,7 @@ async fn process_issue(
 
     let outcome = async {
         let ws = ensure_workspace(cfg, issue).await?;
-        let end = implement(cfg, &ws, issue, lost_rx.clone(), shutdown).await?;
+        let end = run_feature_executor(cfg, &ws, issue, lost_rx.clone(), shutdown).await?;
         Ok::<_, anyhow::Error>((ws, end))
     }.await;
     hb.abort();
@@ -135,12 +137,14 @@ async fn process_issue(
 
     match end {
         RunEnd::Success => {
-            // Sai da fila (label = UX) e libera o lease.
+            // Cinto de segurança: garante push de qualquer resto que o
+            // executor não tenha commitado, antes de sair da fila.
+            checkpoint(&ws, issue, "success").await;
             let _ = run(&ws, "gh",
                 &["issue", "edit", &issue.to_string(), "--repo", &cfg.repo,
                   "--remove-label", &cfg.queue_label]).await;
             leases.release(issue).await?;
-            info!(target: "agent", "issue #{issue} concluída");
+            info!(target: "agent", "feature #{issue} concluída");
         }
         RunEnd::Failed(reason) => {
             checkpoint(&ws, issue, "failed").await;
@@ -149,9 +153,11 @@ async fn process_issue(
                   "--body",
                   &format!("⚠️ Agente `{me}` falhou: {reason}. Checkpoint \
                             pushado no branch — outro agente (ou humano) \
-                            pode retomar. Item permanece na fila.")]).await;
+                            pode retomar; rode `npx spec-wave order {issue}` \
+                            para ver o estado das stories. Item permanece \
+                            na fila.")]).await;
             leases.release(issue).await?; // devolve p/ fila: label continua
-            warn!(target: "agent", "issue #{issue} falhou: {reason}");
+            warn!(target: "agent", "feature #{issue} falhou: {reason}");
         }
         RunEnd::Interrupted => {
             // Dev desligando a máquina: checkpoint + release imediato para

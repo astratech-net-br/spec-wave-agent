@@ -4,8 +4,9 @@
 # Repositório alvo (obrigatório), formato "owner/repo"
 repo = "sua-org/seu-repo"
 
-# Label que marca itens na fila. A issue também precisa da label de tipo
-# [STORY] ou [TASK] para entrar na fila.
+# Label que marca itens na fila. Aplicada em issues [FEATURE]: o agente
+# claima a feature e o executor (Claude Code) implementa todas as user
+# stories dela na ordem de dependência (via `spec-wave order`/`implement`).
 queue_label = "spec-wave:dev-agent"
 
 # Intervalo entre consultas à fila quando ocioso (segundos)
@@ -19,8 +20,21 @@ heartbeat_secs = 120
 # para tolerar lentidão de rede sem roubo indevido.
 lease_ttl_secs = 600
 
-# Tempo máximo de uma execução do `npx spec-wave implement` (segundos)
-implement_timeout_secs = 3600
+# Tempo máximo de UMA FEATURE inteira (todas as stories), em segundos
+implement_timeout_secs = 14400
+
+# Comando do executor da feature. Argv separado por espaço (aspas simples/
+# duplas agrupam; SEM shell — sem pipes/expansões). Placeholder: {issue}
+#feature_command = "claude -p --permission-mode acceptEdits --allowedTools \"Bash(npx:*),Bash(git:*),Edit,Write,Read,Glob,Grep,Task\""
+
+# Prompt de orquestração enviado ao executor via stdin. Placeholder: {issue}.
+# O default instrui: `npx spec-wave order {issue}` para obter a ordem de
+# dependência das stories, `npx spec-wave implement <n>` por story na ordem,
+# paralelizar independentes com sub-agentes, commit+push por story.
+# IMPORTANTE: o specKit.command / SPEC_WAVE_IMPLEMENT_CMD (executor interno
+# de cada story) deve APENAS implementar — commit/push ficam com o
+# orquestrador e com o checkpoint do agente.
+#feature_prompt = ""
 
 # Diretório de trabalho do agente (clones por issue + lease-repo).
 # Use caminho ABSOLUTO ("~" não é expandido). Default: $HOME/.spec-wave-agent

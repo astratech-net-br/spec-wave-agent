@@ -18,8 +18,16 @@ pub struct Config {
     /// Sem heartbeat por este tempo => lease considerado morto (pode roubar)
     #[serde(default = "d_ttl")]
     pub lease_ttl_secs: i64,
+    /// Tempo máximo de UMA FEATURE inteira (todas as stories)
     #[serde(default = "d_impl_timeout")]
     pub implement_timeout_secs: u64,
+    /// Comando do executor da feature — argv separado por espaço (aspas
+    /// simples/duplas suportadas; SEM shell). Placeholder: {issue}
+    #[serde(default = "d_feature_command")]
+    pub feature_command: String,
+    /// Prompt de orquestração enviado ao executor via stdin. Placeholder: {issue}
+    #[serde(default = "d_feature_prompt")]
+    pub feature_prompt: String,
     /// Diretório de trabalho do agente
     #[serde(default = "d_workdir")]
     pub workdir: String,
@@ -33,7 +41,61 @@ fn d_queue_label() -> String { "spec-wave:dev-agent".into() }
 fn d_poll() -> u64 { 60 }
 fn d_heartbeat() -> u64 { 120 }
 fn d_ttl() -> i64 { 600 }
-fn d_impl_timeout() -> u64 { 3600 }
+fn d_impl_timeout() -> u64 { 14400 }
+fn d_feature_command() -> String {
+    "claude -p --permission-mode acceptEdits \
+     --allowedTools \"Bash(npx:*),Bash(git:*),Edit,Write,Read,Glob,Grep,Task\""
+        .into()
+}
+fn d_feature_prompt() -> String {
+    "Você está no clone do repositório, no branch de trabalho da Feature #{issue}.\n\
+     Implemente a feature completa usando o spec-wave:\n\
+     1. Rode `npx spec-wave order {issue}` para obter as user stories e a \
+     ordem de dependência.\n\
+     2. Implemente cada story rodando `npx spec-wave implement <número>`, \
+     respeitando a ordem: uma story só pode começar depois que TODAS as suas \
+     dependências estiverem concluídas.\n\
+     3. Stories independentes entre si podem ser implementadas em paralelo \
+     com sub-agentes.\n\
+     4. Ao concluir cada story: rode os testes relevantes, commite neste \
+     branch com mensagem \"feat: story #<número> [spec-wave-agent]\" e faça push.\n\
+     5. Se uma story falhar, pule as que dependem dela e continue as \
+     independentes; ao final, relate o que falhou.\n"
+        .into()
+}
+
+/// Split de linha de comando em argv: espaços separam, aspas simples/duplas
+/// agrupam (sem escapes; SEM shell — sem pipes/expansões).
+pub fn split_command(s: &str) -> Result<Vec<String>> {
+    let mut argv = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut has_token = false;
+    for c in s.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => cur.push(c),
+            None if c == '\'' || c == '"' => { quote = Some(c); has_token = true; }
+            None if c.is_whitespace() => {
+                if has_token { argv.push(std::mem::take(&mut cur)); has_token = false; }
+            }
+            None => { cur.push(c); has_token = true; }
+        }
+    }
+    if quote.is_some() {
+        bail!("aspas não fechadas em: {s:?}");
+    }
+    if has_token { argv.push(cur); }
+    if argv.is_empty() {
+        bail!("comando vazio");
+    }
+    Ok(argv)
+}
+
+/// Substitui o placeholder {issue}.
+pub fn render_template(t: &str, issue: u64) -> String {
+    t.replace("{issue}", &issue.to_string())
+}
 fn d_workdir() -> String {
     dirs_home().join(".spec-wave-agent").to_string_lossy().into_owned()
 }
@@ -81,6 +143,11 @@ impl Config {
         if self.workdir.trim().is_empty() {
             bail!("config: workdir vazio");
         }
+        split_command(&self.feature_command)
+            .map_err(|e| anyhow::anyhow!("config: feature_command inválido: {e}"))?;
+        if self.feature_prompt.trim().is_empty() {
+            bail!("config: feature_prompt vazio");
+        }
         Ok(())
     }
 
@@ -124,7 +191,7 @@ mod tests {
         assert_eq!(cfg.poll_interval_secs, 60);
         assert_eq!(cfg.heartbeat_secs, 120);
         assert_eq!(cfg.lease_ttl_secs, 600);
-        assert_eq!(cfg.implement_timeout_secs, 3600);
+        assert_eq!(cfg.implement_timeout_secs, 14400);
         assert!(cfg.agent_id.is_none());
         assert!(cfg.validate().is_ok());
     }
@@ -151,6 +218,45 @@ mod tests {
         assert!(cfg.validate().is_err());
         let cfg = parse("repo = \"a/b\"\nheartbeat_secs = 120\nlease_ttl_secs = 480");
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn defaults_do_executor_de_feature() {
+        let cfg = parse(r#"repo = "org/repo""#);
+        assert_eq!(cfg.implement_timeout_secs, 14400);
+        let argv = split_command(&cfg.feature_command).unwrap();
+        assert_eq!(argv[0], "claude");
+        assert!(argv.contains(&"acceptEdits".to_string()));
+        // allowedTools com vírgulas fica em UM token (estava entre aspas)
+        assert!(argv.iter().any(|a| a.starts_with("Bash(npx:*),")));
+        assert!(cfg.feature_prompt.contains("{issue}"));
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn split_command_com_aspas() {
+        assert_eq!(split_command("a b c").unwrap(), vec!["a", "b", "c"]);
+        assert_eq!(split_command("claude --allowedTools \"Bash(npx spec-wave:*)\"").unwrap(),
+                   vec!["claude", "--allowedTools", "Bash(npx spec-wave:*)"]);
+        assert_eq!(split_command("x 'com espaço' z").unwrap(),
+                   vec!["x", "com espaço", "z"]);
+        assert_eq!(split_command("x ''").unwrap(), vec!["x", ""]);
+        assert!(split_command("  ").is_err());
+        assert!(split_command("a 'aberto").is_err());
+    }
+
+    #[test]
+    fn render_do_placeholder() {
+        assert_eq!(render_template("spec-wave order {issue} #{issue}", 7),
+                   "spec-wave order 7 #7");
+    }
+
+    #[test]
+    fn valida_executor() {
+        let cfg = parse("repo = \"a/b\"\nfeature_command = \"\"");
+        assert!(cfg.validate().is_err());
+        let cfg = parse("repo = \"a/b\"\nfeature_prompt = \" \"");
+        assert!(cfg.validate().is_err());
     }
 
     #[test]
