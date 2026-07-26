@@ -101,6 +101,10 @@ fn trunc(s: &str, max: usize) -> String {
 fn format_stream_event(v: &serde_json::Value) -> Option<String> {
     match v.get("type").and_then(|t| t.as_str())? {
         "system" => {
+            // Só o init interessa; outros subtypes (status etc.) são ruído.
+            if v.get("subtype").and_then(|s| s.as_str()) != Some("init") {
+                return None;
+            }
             let model = v.get("model").and_then(|m| m.as_str()).unwrap_or("?");
             Some(format!("sessão iniciada (modelo {model})"))
         }
@@ -357,6 +361,13 @@ mod tests {
             {"type":"tool_use","name":"Edit","input":{"file_path":"src/auth.ts","old_string":"x"}}
         ]}}"#.replace('\n', "");
         assert_eq!(render(&line).unwrap(), "⏵ Edit: src/auth.ts");
+    }
+
+    #[test]
+    fn system_sem_init_e_suprimido() {
+        assert!(render(r#"{"type":"system","subtype":"status"}"#).is_none());
+        let msg = render(r#"{"type":"system","subtype":"init","model":"claude-x"}"#).unwrap();
+        assert_eq!(msg, "sessão iniciada (modelo claude-x)");
     }
 
     #[test]
