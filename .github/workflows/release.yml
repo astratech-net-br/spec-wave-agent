@@ -39,6 +39,11 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: macos-14
             target: aarch64-apple-darwin
+          # Windows 10/11 x64 (não existe label "windows-11" para x64;
+          # windows-latest gera binário que roda nos dois).
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: .exe
           # Mac Intel (x86_64-apple-darwin) fora: runners macos-13 estão em
           # desativação e ficam presos na fila. Quem usar Mac Intel compila do
           # fonte (make build) — ou reative cross-compilando no macos-14.
@@ -53,15 +58,17 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Empacota (binário cru + sha256)
+        shell: bash
         run: |
-          asset="spec-wave-agent-${{ matrix.target }}"
-          cp "target/${{ matrix.target }}/release/spec-wave-agent" "$asset"
+          asset="spec-wave-agent-${{ matrix.target }}${{ matrix.ext }}"
+          cp "target/${{ matrix.target }}/release/spec-wave-agent${{ matrix.ext }}" "$asset"
           shasum -a 256 "$asset" > "$asset.sha256"
           ls -lh "$asset"
 
       - name: Publica na release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          asset="spec-wave-agent-${{ matrix.target }}"
+          asset="spec-wave-agent-${{ matrix.target }}${{ matrix.ext }}"
           gh release upload "$TAG" "$asset" "$asset.sha256" --clobber

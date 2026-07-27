@@ -122,8 +122,13 @@ make install-config   # cria ~/.config/spec-wave-agent/config.toml se não exist
 ```
 
 Releases são publicadas pelo workflow `.github/workflows/release.yml` ao
-empurrar uma tag `vX.Y.Z` (assets: linux-x64 e darwin-arm64). Mac Intel
-compila do fonte.
+empurrar uma tag `vX.Y.Z` (assets: linux-x64, darwin-arm64 e windows-x64).
+Mac Intel compila do fonte.
+
+> **Windows**: o binário compila e roda, mas o *fencing* é mais fraco — o kill
+> por grupo de processos só existe em Unix, então netos (`npx spec-wave` → claude
+> interno) podem sobreviver ao kill. Preferir Linux/macOS enquanto isso não for
+> tratado. O `spec-wave dev-agent --install` também ainda não cobre Windows.
 
 ## Configuração
 
