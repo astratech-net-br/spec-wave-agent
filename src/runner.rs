@@ -171,16 +171,136 @@ where
     }
 }
 
-/// Mata o executor e TODA a sua árvore de processos (o executor spawna
-/// `npx spec-wave` que spawna o claude interno; matar só o filho direto
-/// deixaria netos órfãos trabalhando — buraco de fencing).
-async fn kill_tree(child: &mut tokio::process::Child) {
-    #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        // O filho é líder do grupo (process_group(0)); -pid = grupo inteiro.
-        unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
+/// Job object do Windows: todo processo criado por um processo do job entra
+/// no mesmo job, então TerminateJobObject mata a árvore inteira — é o
+/// equivalente do SIGKILL no grupo de processos do Unix.
+#[cfg(windows)]
+mod job {
+    use anyhow::{bail, Result};
+    use std::ffi::c_void;
+    use std::ptr::null;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+        TerminateJobObject, JobObjectExtendedLimitInformation,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+
+    pub struct JobHandle(HANDLE);
+
+    // SAFETY: HANDLE é um ponteiro opaco do kernel; só usamos
+    // TerminateJobObject/CloseHandle, ambos thread-safe.
+    unsafe impl Send for JobHandle {}
+    unsafe impl Sync for JobHandle {}
+
+    impl JobHandle {
+        /// Cria o job com KILL_ON_JOB_CLOSE e anexa o processo.
+        pub fn assign(pid: u32) -> Result<Self> {
+            unsafe {
+                let job = CreateJobObjectW(null(), null());
+                if job.is_null() {
+                    bail!("CreateJobObjectW falhou");
+                }
+                // KILL_ON_JOB_CLOSE: fechar o handle mata o que sobrou —
+                // mesma semântica do kill_on_drop do tokio, porém na árvore.
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                if SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                ) == 0
+                {
+                    CloseHandle(job);
+                    bail!("SetInformationJobObject falhou");
+                }
+                let proc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+                if proc.is_null() {
+                    CloseHandle(job);
+                    bail!("OpenProcess falhou para o pid {pid}");
+                }
+                let assigned = AssignProcessToJobObject(job, proc);
+                CloseHandle(proc);
+                if assigned == 0 {
+                    CloseHandle(job);
+                    bail!("AssignProcessToJobObject falhou");
+                }
+                Ok(Self(job))
+            }
+        }
+
+        pub fn terminate(&self) {
+            unsafe { TerminateJobObject(self.0, 1); }
+        }
     }
-    let _ = child.kill().await; // reap (e fallback não-unix)
+
+    impl Drop for JobHandle {
+        fn drop(&mut self) {
+            // KILL_ON_JOB_CLOSE: fechar o handle encerra o que restar.
+            unsafe { CloseHandle(self.0); }
+        }
+    }
+}
+
+/// Mecanismo de kill de árvore, por plataforma. O executor spawna
+/// `npx spec-wave`, que spawna o claude interno: matar só o filho direto
+/// deixaria netos órfãos trabalhando — buraco de fencing.
+struct ProcessTree {
+    /// Unix: o filho é líder do grupo (process_group(0) no spawn).
+    #[cfg(unix)]
+    pgid: Option<u32>,
+    /// Windows: job object ao qual o filho e todos os netos pertencem.
+    #[cfg(windows)]
+    job: Option<job::JobHandle>,
+}
+
+impl ProcessTree {
+    /// Anexa o filho recém-spawnado ao mecanismo da plataforma.
+    fn attach(child: &tokio::process::Child) -> Self {
+        #[cfg(unix)]
+        {
+            Self { pgid: child.id() }
+        }
+        #[cfg(windows)]
+        {
+            let job = child.id().and_then(|pid| match job::JobHandle::assign(pid) {
+                Ok(j) => Some(j),
+                Err(e) => {
+                    // Sem job object o fencing cobre só o filho direto —
+                    // degrada, mas avisa alto.
+                    tracing::warn!(target: "agent",
+                        "job object indisponível ({e:#}); netos podem sobreviver ao kill");
+                    None
+                }
+            });
+            Self { job }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Self {}
+        }
+    }
+
+    /// Mata a árvore inteira (best-effort; idempotente).
+    fn kill(&self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.pgid {
+            unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
+        }
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            job.terminate();
+        }
+    }
+}
+
+async fn kill_tree(child: &mut tokio::process::Child, tree: &ProcessTree) {
+    tree.kill();
+    let _ = child.kill().await; // reap (e fallback sem árvore)
 }
 
 /// Desfecho bruto do processo do executor (antes da checagem do marker).
@@ -211,6 +331,8 @@ async fn executor_round(
     cmd.process_group(0); // líder de grupo => kill_tree pega a árvore toda
     let mut child = cmd.spawn()
         .with_context(|| format!("falha ao iniciar executor {:?}", argv[0]))?;
+    // Anexa a árvore ANTES de o filho ter tempo de spawnar netos.
+    let tree = ProcessTree::attach(&child);
 
     // Prompt via stdin (fechado em seguida — o executor lê até EOF).
     if let Some(mut si) = child.stdin.take() {
@@ -225,13 +347,12 @@ async fn executor_round(
         .map(|s| tokio::spawn(stream_lines(s, issue, "out")));
     let err_task = child.stderr.take()
         .map(|s| tokio::spawn(stream_lines(s, issue, "err")));
-    let group_pid = child.id(); // antes do wait (depois vira None)
 
     let cap = TokioDuration::from_secs(cfg.implement_timeout_secs);
     let end = tokio::select! {
         status = timeout(cap, child.wait()) => match status {
             Err(_) => {
-                kill_tree(&mut child).await;
+                kill_tree(&mut child, &tree).await;
                 RoundRaw::Failed(format!("timeout de {}s", cap.as_secs()))
             }
             Ok(Ok(st)) if st.success() => RoundRaw::Success,
@@ -244,22 +365,19 @@ async fn executor_round(
         _ = lease_lost.changed() => {
             // Fencing: perdemos o lease => outro agente pode estar ativo.
             // Matar imediatamente, SEM push (o novo dono manda no branch).
-            kill_tree(&mut child).await;
+            kill_tree(&mut child, &tree).await;
             RoundRaw::LeaseLost
         }
         _ = shutdown.changed() => {
-            kill_tree(&mut child).await;
+            kill_tree(&mut child, &tree).await;
             RoundRaw::Interrupted
         }
     };
 
-    // Mesmo em saída natural do executor, mata retardatários do grupo:
-    // um orquestrador que "termina" deixando implements em background não
-    // pode deixar claudes órfãos trabalhando.
-    #[cfg(unix)]
-    if let Some(pid) = group_pid {
-        unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
-    }
+    // Mesmo em saída natural do executor, mata retardatários da árvore: um
+    // orquestrador que "termina" deixando implements em background não pode
+    // deixar claudes órfãos trabalhando.
+    tree.kill();
 
     // Drena o resto do output (após kill/exit os pipes fecham em EOF).
     for t in [out_task, err_task].into_iter().flatten() {

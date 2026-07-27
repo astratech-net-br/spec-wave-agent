@@ -77,6 +77,13 @@ lançado como **líder de grupo de processos** e recebe o `feature_prompt` pelo
 | **SIGTERM** (desligar a máquina) | checkpoint + release imediato ⇒ takeover instantâneo por outro agente |
 | **Lease perdido** | mata a árvore de processos e **não faz nada** — o novo dono manda no branch |
 
+O **kill é sempre da árvore inteira**, porque o executor spawna `npx spec-wave`
+que spawna o claude interno: em Unix, SIGKILL no grupo de processos (o filho é
+líder via `process_group(0)`); em Windows, `TerminateJobObject` num job object
+com `KILL_ON_JOB_CLOSE` ao qual o filho e todos os netos pertencem. Matar só o
+filho direto deixaria netos órfãos trabalhando no mesmo branch — buraco de
+fencing.
+
 Por que as rodadas existem: uma chamada Bash do Claude Code tem teto de ~10
 min, e um `spec-wave implement` real leva mais. O orquestrador às vezes encerra
 o turno com trabalho pendente; o agente então o relança em vez de dar a feature
@@ -136,10 +143,6 @@ Releases são publicadas pelo workflow `.github/workflows/release.yml` ao
 empurrar uma tag `vX.Y.Z` (assets: linux-x64, darwin-arm64 e windows-x64).
 Mac Intel compila do fonte.
 
-> **Windows**: o binário compila e roda, mas o *fencing* é mais fraco — o kill
-> por grupo de processos só existe em Unix, então netos (`npx spec-wave` → claude
-> interno) podem sobreviver ao kill. Preferir Linux/macOS enquanto isso não for
-> tratado. O `spec-wave dev-agent --install` também ainda não cobre Windows.
 
 ## Configuração
 
