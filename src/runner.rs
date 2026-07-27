@@ -235,7 +235,10 @@ async fn executor_round(
                 RoundRaw::Failed(format!("timeout de {}s", cap.as_secs()))
             }
             Ok(Ok(st)) if st.success() => RoundRaw::Success,
-            Ok(Ok(st)) => RoundRaw::Failed(format!("exit code {st}")),
+            Ok(Ok(st)) => RoundRaw::Failed(match st.code() {
+                Some(c) => format!("exit code {c}"),
+                None => format!("encerrado por sinal ({st})"),
+            }),
             Ok(Err(e)) => RoundRaw::Failed(e.to_string()),
         },
         _ = lease_lost.changed() => {

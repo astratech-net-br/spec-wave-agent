@@ -25,7 +25,12 @@ implement_timeout_secs = 14400
 
 # Comando do executor da feature. Argv separado por espaço (aspas simples/
 # duplas agrupam; SEM shell — sem pipes/expansões). Placeholder: {issue}
-#feature_command = "claude -p --permission-mode acceptEdits --allowedTools \"Bash(npx:*),Bash(git:*),Edit,Write,Read,Glob,Grep,Task\""
+#feature_command = "claude -p --output-format stream-json --verbose --permission-mode acceptEdits --allowedTools \"Bash(npx:*),Bash(git:*),Edit,Write,Read,Glob,Grep,Task\""
+#
+# Para fixar o modelo (ex.: cota do default esgotada), acrescente --model:
+#   claude -p --model opus --output-format stream-json ...
+# Lembre de fixar o mesmo modelo no executor interno de cada story
+# (specKit.command do .spec-wave.json ou a env SPEC_WAVE_IMPLEMENT_CMD).
 
 # Prompt de orquestração enviado ao executor via stdin. Placeholder: {issue}.
 # O default instrui: `npx spec-wave order {issue}` para obter a ordem de
