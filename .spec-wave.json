@@ -1,0 +1,79 @@
+{
+  "version": "0.10.0",
+  "owner": "astratech-net-br",
+  "repo": "spec-wave-agent",
+  "project": {
+    "title": "SpecWaveAgent",
+    "url": "https://github.com/orgs/astratech-net-br/projects/4",
+    "id": "PVT_kwDOEelBqs4BeoVO",
+    "number": 4,
+    "fields": {
+      "Etapa": {
+        "id": "PVTSSF_lADOEelBqs4BeoVOzhZBFOU",
+        "options": {
+          "📥 Backlog": "eeec8c8d",
+          "🎯 Priorizado": "ebd754ad",
+          "📋 Spec": "2b169376",
+          "📋 Plan": "bd87548b",
+          "✅ Ready": "2606e3aa",
+          "🚧 Desenvolvimento": "de8ab655",
+          "👀 Code Review": "7682fbd3",
+          "🧪 QA": "7b756f4f",
+          "📋 Homologação": "0341c906",
+          "🚀 Deploy": "9dbf9331",
+          "🎉 Done": "eb2cfdc2"
+        }
+      },
+      "Work Item Type": {
+        "id": "PVTSSF_lADOEelBqs4BeoVOzhZBFOY",
+        "options": {
+          "Initiative": "ce063385",
+          "Epic": "f0525fd8",
+          "Feature": "46d91f10",
+          "Story": "b8f52617",
+          "Task": "d95a13ac",
+          "Bug": "ce4afdc2",
+          "Spike": "a9eff66c",
+          "RFC": "b99148d5"
+        }
+      },
+      "Priority": {
+        "id": "PVTSSF_lADOEelBqs4BeoVOzhZBFOc",
+        "options": {
+          "P0": "8d8f877b",
+          "P1": "49f45fc0",
+          "P2": "5f9ce4ae",
+          "P3": "a2acbfe7"
+        }
+      },
+      "Story Points": {
+        "id": "PVTSSF_lADOEelBqs4BeoVOzhZBFOg",
+        "options": {
+          "1": "9bea3279",
+          "2": "497bcdf4",
+          "3": "1ba02f1a",
+          "5": "0937a2b0",
+          "8": "6e2c3086",
+          "13": "9978824a",
+          "21": "a12177fa"
+        }
+      },
+      "Area": {
+        "id": "PVTSSF_lADOEelBqs4BeoVOzhZBFOk",
+        "options": {
+          "Frontend": "d7bebe8b",
+          "Backend": "bef8cdca",
+          "Mobile": "dd3eee0f",
+          "Infra": "8e8efb92",
+          "DevOps": "4310e8fb",
+          "Data": "89f3d0ab"
+        }
+      }
+    }
+  },
+  "ai": {
+    "provider": "openrouter",
+    "model": "anthropic/claude-3.7-sonnet"
+  },
+  "initializedAt": "2026-07-27T22:02:04.709Z"
+}
