@@ -122,7 +122,8 @@ make install-config   # cria ~/.config/spec-wave-agent/config.toml se não exist
 ```
 
 Releases são publicadas pelo workflow `.github/workflows/release.yml` ao
-empurrar uma tag `vX.Y.Z` (assets: linux-x64, darwin-arm64, darwin-x64).
+empurrar uma tag `vX.Y.Z` (assets: linux-x64 e darwin-arm64). Mac Intel
+compila do fonte.
 
 ## Configuração
 
