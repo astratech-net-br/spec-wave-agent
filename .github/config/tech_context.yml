@@ -1,0 +1,42 @@
+# tech_context.yml — Fonte de verdade estática do sistema (RFC-002 §4)
+#
+# O comando `generate-plan` lê este arquivo para embasar o plano técnico, usando
+# APENAS as tecnologias e serviços aqui declarados. Mantenha-o atualizado.
+#
+# Augmentação dinâmica (automática, não precisa editar): o agente também lê as
+# migrations recentes e as versões exatas de pacotes (package.json) em tempo de
+# execução. Para desvios pontuais, adicione uma seção `## Tech Override` no corpo
+# da issue da Feature — ela é mesclada (deep-merge) sobre esta config.
+
+system_info:
+  name: "Order Management System"
+  stack:
+    backend: "Node.js (NestJS v10)"
+    frontend: "React 18 with Vite"
+    database: "PostgreSQL 15"
+    cache: "Redis 7"
+    messaging: "RabbitMQ"
+    infra: "Kubernetes (EKS) + Helm"
+  architecture: "Microservices via API Gateway"
+
+security:
+  auth_protocol: "JWT (Access/Refresh)"
+  rbac_roles: ["ADMIN", "MANAGER", "GARCOM", "COZINHA"]
+
+database_schemas:
+  - table: "users"
+    columns: "id, name, email, role, password_hash"
+  - table: "tables"
+    columns: "id, number, status, capacity"
+  - table: "products"
+    columns: "id, name, category, price, stock"
+
+existing_services:
+  - name: "Inventory API"
+    endpoint: "/api/inventory/{productId}/availability"
+    auth: "mTLS"
+    docs: "https://docs.internal/inventory"
+
+internal_libraries:
+  - "shared-logger"
+  - "db-client (TypeORM)"
