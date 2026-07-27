@@ -1,5 +1,8 @@
 # spec-wave-agent — instalação na máquina do dev
 
+> Guia de instalação. Para visão geral, arquitetura e desenvolvimento, veja o
+> [README](README.md).
+
 ## 1. Compilar e instalar
 
 ```bash
