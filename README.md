@@ -93,13 +93,36 @@ Checados no boot — o agente falha rápido com mensagem clara:
 - No repositório alvo: `.spec-wave.json` com `specKit.command` (o executor
   interno de cada story) — ou a env `SPEC_WAVE_IMPLEMENT_CMD`
 
-## Build e instalação
+## Instalação
+
+### Recomendado: pelo spec-wave CLI
+
+A partir de um repositório já inicializado (`spec-wave init`):
+
+```bash
+npx @spec-wave/cli@latest dev-agent --install            # binário + config
+npx @spec-wave/cli@latest dev-agent --install --service  # + systemd/launchd
+```
+
+Baixa o binário da release desta repo (`gh release download`, com as
+credenciais do próprio dev), instala em `~/.local/bin` (sem sudo), gera
+`~/.config/spec-wave-agent/config.toml` já com o `owner/repo` do
+`.spec-wave.json` e checa os pré-requisitos. Rodar depois:
+
+```bash
+npx @spec-wave/cli@latest dev-agent --run   # foreground, Ctrl+C = checkpoint
+```
+
+### Build do fonte (para quem desenvolve o agente)
 
 ```bash
 make build            # cargo build --release
 make install          # instala o binário em /usr/local/bin (PREFIX ajustável)
 make install-config   # cria ~/.config/spec-wave-agent/config.toml se não existir
 ```
+
+Releases são publicadas pelo workflow `.github/workflows/release.yml` ao
+empurrar uma tag `vX.Y.Z` (assets: linux-x64, darwin-arm64, darwin-x64).
 
 ## Configuração
 
