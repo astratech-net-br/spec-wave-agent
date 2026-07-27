@@ -62,7 +62,12 @@ jobs:
         run: |
           asset="spec-wave-agent-${{ matrix.target }}${{ matrix.ext }}"
           cp "target/${{ matrix.target }}/release/spec-wave-agent${{ matrix.ext }}" "$asset"
-          shasum -a 256 "$asset" > "$asset.sha256"
+          # macOS tem shasum; Git Bash (Windows) e Linux têm sha256sum.
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "$asset" > "$asset.sha256"
+          else
+            sha256sum "$asset" > "$asset.sha256"
+          fi
           ls -lh "$asset"
 
       - name: Publica na release

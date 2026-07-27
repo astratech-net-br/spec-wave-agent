@@ -113,7 +113,18 @@ credenciais do próprio dev), instala em `~/.local/bin` (sem sudo), gera
 npx @spec-wave/cli@latest dev-agent --run   # foreground, Ctrl+C = checkpoint
 ```
 
-### Build do fonte (para quem desenvolve o agente)
+### Build do fonte
+
+Pelo CLI (clona este repo em `~/.local/share/spec-wave-agent/src`, compila com
+cargo e instala em `~/.local/bin`) — use quando não houver binário para a sua
+plataforma (Mac Intel, Linux arm64) ou para rodar o código mais recente:
+
+```bash
+npx @spec-wave/cli@latest dev-agent --build             # branch main
+npx @spec-wave/cli@latest dev-agent --build --tag v0.1.0  # tag específica
+```
+
+Ou direto, para quem desenvolve o agente:
 
 ```bash
 make build            # cargo build --release
