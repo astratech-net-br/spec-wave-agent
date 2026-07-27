@@ -177,6 +177,12 @@ async fn process_issue(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // --version antes de qualquer coisa: o instalador (spec-wave dev-agent
+    // --install) usa isso para decidir se precisa baixar o binário.
+    if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
+        println!("spec-wave-agent {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     init_tracing();
     let cfg = load_config()?;
     cfg.validate()?;
