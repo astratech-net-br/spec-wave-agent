@@ -1,0 +1,36 @@
+name: Generate Plan
+
+on:
+  issues:
+    types: [labeled]
+
+concurrency:
+  group: spec-wave-generate-plan-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  generate-plan:
+    if: >
+      github.event.label.name == 'spec-wave:plan' &&
+      contains(github.event.issue.title, '[FEATURE]')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Generate plan.md
+        run: npx @spec-wave/cli@latest generate-plan --issue-number ${{ github.event.issue.number }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GITHUB_REPOSITORY: ${{ github.repository }}

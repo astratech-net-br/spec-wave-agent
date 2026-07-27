@@ -1,0 +1,32 @@
+name: Validate Spec + Plan
+
+on:
+  issues:
+    types: [labeled]
+
+concurrency:
+  group: spec-wave-validate-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: >
+      github.event.label.name == 'spec-wave:ready' &&
+      contains(github.event.issue.title, '[FEATURE]')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Validate spec and plan
+        run: npx @spec-wave/cli@latest validate --issue-number ${{ github.event.issue.number }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}

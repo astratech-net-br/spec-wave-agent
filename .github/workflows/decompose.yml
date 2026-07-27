@@ -1,0 +1,38 @@
+name: Decompose Feature
+
+on:
+  issues:
+    types: [labeled]
+
+# O evento `labeled` pode redisparar (re-add da label, retry de runner):
+# o concurrency serializa runs da mesma issue e o guard de idempotência
+# (label spec-wave:decomposed) descarta o run enfileirado.
+concurrency:
+  group: spec-wave-decompose-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  decompose:
+    if: >
+      github.event.label.name == 'spec-wave:decompose' &&
+      contains(github.event.issue.title, '[FEATURE]')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Decompose into Stories and Tasks
+        run: npx @spec-wave/cli@latest decompose --issue-number ${{ github.event.issue.number }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROJECT_TOKEN: ${{ secrets.GH_PROJECT_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
