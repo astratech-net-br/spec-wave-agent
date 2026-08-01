@@ -4,9 +4,19 @@
 # Repositório alvo (obrigatório), formato "owner/repo"
 repo = "sua-org/seu-repo"
 
-# Label que marca itens na fila. Aplicada em issues [FEATURE]: o agente
-# claima a feature e o executor (Claude Code) implementa todas as user
-# stories dela na ordem de dependência (via `spec-wave order`/`implement`).
+# Label que marca itens na fila. Aplicada em issues [FEATURE] ou [BUG].
+#
+#  • [FEATURE] → o executor implementa todas as user stories na ordem de
+#    dependência (via `spec-wave order`/`implement`).
+#  • [BUG]     → o executor corrige o defeito em quatro fases: reproduzir,
+#    causa raiz, fix mínimo, teste de regressão (RFC-004).
+#
+# BUGS SÃO PUXADOS PRIMEIRO. Trabalho corretivo tem severidade; feature nova,
+# não — uma FIFO pura por número deixaria um bug crítico atrás de qualquer
+# feature antiga. Dentro de cada tipo a ordem continua sendo por número.
+#
+# Story e Task avulsas NÃO entram na fila: quem as coordena é o executor da
+# Feature.
 queue_label = "spec-wave:dev-agent"
 
 # Intervalo entre consultas à fila quando ocioso (segundos)
@@ -40,6 +50,28 @@ implement_timeout_secs = 14400
 # de cada story) deve APENAS implementar — commit/push ficam com o
 # orquestrador e com o checkpoint do agente.
 #feature_prompt = ""
+
+# ---- Bug (RFC-004) ----
+
+# Tempo máximo de UM BUG, em segundos. Menor que o de feature por natureza:
+# um defeito que passa de uma hora quase sempre está mal delimitado, e o teto
+# serve para o agente devolver a issue à fila em vez de queimar o dia nela.
+#bug_timeout_secs = 3600
+
+# Comando do executor de bug. Mesmo formato do feature_command; separado para
+# permitir modelo ou ferramentas diferentes numa correção (ex.: um modelo mais
+# forte, já que investigar causa raiz é mais difícil que seguir um plano).
+#bug_command = "claude -p --output-format stream-json --verbose --permission-mode acceptEdits --allowedTools \"Bash(npx:*),Bash(git:*),Edit,Write,Read,Glob,Grep,Task\""
+
+# Prompt de correção enviado via stdin. Placeholder: {issue}. O default impõe
+# QUATRO FASES, nesta ordem — e diz explicitamente para NÃO começar pelo fix:
+#   1. reproduzir com um teste que FALHA;
+#   2. causa raiz (a origem, não o ponto onde o erro aparece);
+#   3. fix mínimo (a causa raiz e apenas ela);
+#   4. teste de regressão que falharia de novo se o fix fosse revertido.
+# Ao concluir, o executor escreve no marker os campos causa_raiz, fix,
+# teste_regressao e arquivos — que o agente publica como comentário na issue.
+#bug_prompt = ""
 
 # Diretório de trabalho do agente (clones por issue + lease-repo).
 # Use caminho ABSOLUTO ("~" não é expandido). Default: $HOME/.spec-wave-agent

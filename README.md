@@ -37,7 +37,10 @@ spec-wave. O que o agente garante é a parte que um LLM não faz bem:
 ### Fila
 
 Issues **abertas**, com a label `spec-wave:dev-agent` **e** a label de tipo
-`[FEATURE]`. FIFO por número. Uma feature por vez: o agente pega a primeira
+`[FEATURE]` ou `[BUG]`. **Bugs primeiro** — trabalho corretivo tem severidade,
+feature nova não; uma FIFO pura por número deixaria um bug crítico atrás de
+qualquer feature antiga. Dentro de cada tipo, FIFO por número. Um item por vez:
+o agente pega o primeiro
 que conseguir claimar e só volta à fila (com poll fresco) quando terminar.
 `[STORY]`/`[TASK]` avulsas **não** entram na fila.
 
@@ -161,6 +164,9 @@ repo = "sua-org/seu-repo"
 | `heartbeat_secs` | `120` | renovação do lease |
 | `lease_ttl_secs` | `600` | sem heartbeat por este tempo ⇒ pode ser roubado |
 | `implement_timeout_secs` | `14400` | teto de **uma feature inteira** (4h) |
+| `bug_timeout_secs` | `3600` | teto de **um bug** (1h) |
+| `bug_command` | `claude -p …` | executor de bug; mesmo formato do `feature_command` |
+| `bug_prompt` | (prompt das 4 fases) | reproduzir → causa raiz → fix mínimo → teste de regressão |
 | `feature_command` | `claude -p …` | executor; argv por espaço, aspas agrupam, **sem shell**. `{issue}` |
 | `feature_prompt` | (prompt de orquestração) | enviado via stdin. `{issue}` |
 | `cooldown_secs` | `900` | issue processada sai da fila local por este tempo |
@@ -170,7 +176,7 @@ repo = "sua-org/seu-repo"
 | `remote_url` | `https://github.com/{repo}.git` | override (SSH, git self-hosted, testes) |
 
 Validado no boot: `lease_ttl_secs >= 4 × heartbeat_secs`, formato `owner/repo`,
-intervalos > 0, `feature_command` parseável.
+intervalos > 0, `feature_command` e `bug_command` parseáveis, `bug_prompt` não-vazio.
 
 **Fixar o modelo** (útil quando a cota do default esgota) — lembre das **duas**
 camadas:
@@ -229,7 +235,7 @@ systemctl --user edit spec-wave-agent
    o `implement` não tem o que fazer.
 2. Na **issue da Feature** (não no card do Project, não numa Story), aplique a
    label **`spec-wave:dev-agent`**. A issue precisa ter também a label de tipo
-   `[FEATURE]` e estar aberta.
+   `[FEATURE]` ou `[BUG]` e estar aberta.
 3. Pronto. No próximo poll (≤ 1 min por default) o agente claima e começa.
 
 Acompanhe por três lugares:
@@ -267,6 +273,7 @@ Crate lib + bin: `src/lib.rs` expõe os módulos (para os testes de integração
 cargo test                          # unit + integração (sem rede)
 cargo test --test lease_integration # protocolo de lease contra bare repo local
 cargo test --test feature_integration
+cargo test --test bug_integration
 cargo test roubo_apos_expirar       # um teste específico
 ```
 

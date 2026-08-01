@@ -2,6 +2,7 @@
 //! streaming do output do filho para o console do agente.
 
 use crate::config::Config;
+use crate::queue::{QueueItem, QueueKind};
 use crate::shell::{retry_backoff, run, run_ok};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -64,18 +65,33 @@ pub async fn checkpoint(ws: &Path, issue: u64, label: &str) {
     let _ = run(ws, "git", &["push", "--quiet"]).await;
 }
 
-pub enum RunEnd { Success, Failed(String), LeaseLost, Interrupted }
+#[derive(Debug)]
+pub enum RunEnd { Success(Option<ExecResult>), Failed(String), LeaseLost, Interrupted }
 
 /// Marker que o executor escreve ao final (ver feature_prompt): exit 0 sem
 /// marker "ok" NÃO é sucesso — pega orquestrador que encerrou prematuramente
 /// (ex: deixou implements em background).
 const RESULT_MARKER: &str = ".spec-wave-agent-result.json";
 
-#[derive(serde::Deserialize)]
-struct ExecResult {
-    status: String,
+/// Marker de conclusão do executor.
+///
+/// Todos os campos além de `status` são `#[serde(default)]`: um executor antigo
+/// (ou um prompt customizado pelo usuário) escreve só `{"status": "ok"}` e
+/// continua válido. Os campos de RCA são preenchidos pelo prompt de BUG e
+/// viram o comentário na issue ao concluir.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ExecResult {
+    pub status: String,
     #[serde(default)]
-    detalhe: Option<String>,
+    pub detalhe: Option<String>,
+    #[serde(default)]
+    pub causa_raiz: Option<String>,
+    #[serde(default)]
+    pub fix: Option<String>,
+    #[serde(default)]
+    pub teste_regressao: Option<String>,
+    #[serde(default)]
+    pub arquivos: Option<Vec<String>>,
 }
 
 /// Lê e REMOVE o marker (não pode sobrar para o checkpoint commitar).
@@ -307,18 +323,24 @@ async fn kill_tree(child: &mut tokio::process::Child, tree: &ProcessTree) {
 enum RoundRaw { Success, Failed(String), LeaseLost, Interrupted }
 
 /// Desfecho de UMA rodada do executor, já com o marker aplicado.
-enum RoundEnd { Success, Incomplete, Failed(String), LeaseLost, Interrupted }
+enum RoundEnd { Success(Option<ExecResult>), Incomplete, Failed(String), LeaseLost, Interrupted }
 
 /// Roda UMA rodada do executor da feature (Claude Code orquestrador): o
 /// comando vem de `cfg.feature_command` e o prompt entra via STDIN.
 async fn executor_round(
-    cfg: &Config, ws: &Path, issue: u64,
+    cfg: &Config, ws: &Path, item: QueueItem,
     mut lease_lost: watch::Receiver<bool>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<RoundEnd> {
+    let issue = item.number;
+    let (command, prompt_tpl, timeout_secs) = match item.kind {
+        QueueKind::Bug => (&cfg.bug_command, &cfg.bug_prompt, cfg.bug_timeout_secs),
+        QueueKind::Feature =>
+            (&cfg.feature_command, &cfg.feature_prompt, cfg.implement_timeout_secs),
+    };
     let argv = crate::config::split_command(
-        &crate::config::render_template(&cfg.feature_command, issue))?;
-    let prompt = crate::config::render_template(&cfg.feature_prompt, issue);
+        &crate::config::render_template(command, issue))?;
+    let prompt = crate::config::render_template(prompt_tpl, issue);
 
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..])
@@ -348,7 +370,7 @@ async fn executor_round(
     let err_task = child.stderr.take()
         .map(|s| tokio::spawn(stream_lines(s, issue, "err")));
 
-    let cap = TokioDuration::from_secs(cfg.implement_timeout_secs);
+    let cap = TokioDuration::from_secs(timeout_secs);
     let end = tokio::select! {
         status = timeout(cap, child.wait()) => match status {
             Err(_) => {
@@ -388,11 +410,11 @@ async fn executor_round(
     // marker é "rodada incompleta" (o run_feature relança para continuar).
     let end = match end {
         RoundRaw::Success => match take_result_marker(ws) {
-            Some(r) if r.status == "ok" => RoundEnd::Success,
+            Some(r) if r.status == "ok" => RoundEnd::Success(Some(r)),
             Some(r) => RoundEnd::Failed(format!(
                 "executor terminou sem concluir tudo (status {:?}{})",
                 r.status,
-                r.detalhe.map(|d| format!(": {d}")).unwrap_or_default())),
+                r.detalhe.clone().map(|d| format!(": {d}")).unwrap_or_default())),
             None => RoundEnd::Incomplete,
         },
         RoundRaw::Failed(r) => {
@@ -419,18 +441,24 @@ async fn head_sha(ws: &Path) -> String {
 /// implements longos) => relança para continuar do estado do git/spec-wave.
 /// Estagnação (2 rodadas seguidas sem commit novo) ou estouro de
 /// max_executor_rounds => falha.
-pub async fn run_feature(
-    cfg: &Config, ws: &Path, issue: u64,
+/// Roda um item da fila até o desfecho. O TIPO escolhe comando, prompt e
+/// timeout; todo o resto — rodadas, checkpoint, fencing, kill_tree — é
+/// idêntico, e continua sendo, de propósito: a diferença entre corrigir um bug
+/// e implementar uma feature é o que se pede ao executor, não como se o
+/// supervisiona.
+pub async fn run_item(
+    cfg: &Config, ws: &Path, item: QueueItem,
     lease_lost: watch::Receiver<bool>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<RunEnd> {
+    let issue = item.number;
     let mut no_progress = 0u32;
     for round in 1..=cfg.max_executor_rounds {
         let head_before = head_sha(ws).await;
-        let end = executor_round(cfg, ws, issue,
+        let end = executor_round(cfg, ws, item,
                                  lease_lost.clone(), shutdown.clone()).await?;
         match end {
-            RoundEnd::Success => return Ok(RunEnd::Success),
+            RoundEnd::Success(r) => return Ok(RunEnd::Success(r)),
             RoundEnd::Failed(r) => return Ok(RunEnd::Failed(r)),
             RoundEnd::LeaseLost => return Ok(RunEnd::LeaseLost),
             RoundEnd::Interrupted => return Ok(RunEnd::Interrupted),

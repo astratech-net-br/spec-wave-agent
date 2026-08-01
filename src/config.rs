@@ -28,6 +28,18 @@ pub struct Config {
     /// Prompt de orquestração enviado ao executor via stdin. Placeholder: {issue}
     #[serde(default = "d_feature_prompt")]
     pub feature_prompt: String,
+    /// Comando do executor de BUG. Mesmo formato do feature_command; separado
+    /// para permitir modelo/ferramentas diferentes numa correção.
+    #[serde(default = "d_bug_command")]
+    pub bug_command: String,
+    /// Prompt de correção enviado ao executor via stdin. Placeholder: {issue}
+    #[serde(default = "d_bug_prompt")]
+    pub bug_prompt: String,
+    /// Tempo máximo de UM BUG. Menor que o de feature por natureza: um defeito
+    /// que passa de uma hora quase sempre está mal delimitado, e o teto serve
+    /// para o agente devolver a issue à fila em vez de queimar o dia nela.
+    #[serde(default = "d_bug_timeout")]
+    pub bug_timeout_secs: u64,
     /// Depois de processar uma issue (qualquer desfecho), ela fica fora da
     /// fila deste agente por este tempo — evita re-claim imediato por atraso
     /// do índice de busca do GitHub e loop de retry em falha.
@@ -51,7 +63,7 @@ fn d_poll() -> u64 { 60 }
 fn d_heartbeat() -> u64 { 120 }
 fn d_ttl() -> i64 { 600 }
 fn d_impl_timeout() -> u64 { 14400 }
-fn d_feature_command() -> String {
+fn d_executor_command() -> String {
     // stream-json: cada evento (texto, tool calls, resultado) vira uma linha
     // JSON no stdout, que o runner formata para o console (ver runner.rs).
     "claude -p --output-format stream-json --verbose \
@@ -59,6 +71,9 @@ fn d_feature_command() -> String {
      --allowedTools \"Bash(npx:*),Bash(git:*),Edit,Write,Read,Glob,Grep,Task\""
         .into()
 }
+fn d_feature_command() -> String { d_executor_command() }
+fn d_bug_command() -> String { d_executor_command() }
+fn d_bug_timeout() -> u64 { 3600 }
 fn d_cooldown() -> u64 { 900 }
 fn d_max_rounds() -> u32 { 8 }
 fn d_feature_prompt() -> String {
@@ -100,6 +115,51 @@ fn d_feature_prompt() -> String {
      story falhou definitivamente.\n\
      - NÃO escreva o marker se ainda houver stories pendentes que você \
      pretende continuar na próxima rodada.\n"
+        .into()
+}
+
+fn d_bug_prompt() -> String {
+    "Você está no clone do repositório, no branch de trabalho do Bug #{issue}.\n\
+     Corrija o defeito em QUATRO FASES, nesta ordem.\n\
+     \n\
+     NÃO comece pelo fix. O modo de falha desta tarefa é encontrar o lugar \
+     onde o sintoma aparece, remendar ali, e o defeito voltar na próxima \
+     entrada. As fases 1 e 2 existem para impedir isso.\n\
+     \n\
+     1. REPRODUZIR — rode `npx spec-wave implement {issue}` para obter o \
+     contexto (relato, comentários e o bug.md, se existir). Escreva um teste \
+     que FALHA por causa deste defeito e confirme que ele falha pelo motivo \
+     certo. Se não conseguir reproduzir, PARE e relate no marker: sem \
+     reprodução não há como provar que a correção funcionou.\n\
+     2. CAUSA RAIZ — investigue até a ORIGEM, não até o ponto onde o erro se \
+     manifesta. Se o bug.md já traz uma causa raiz, CONFIRME-A contra o \
+     código antes de aceitar: ela foi escrita por outro modelo, sem executar \
+     nada.\n\
+     3. FIX MÍNIMO — corrija a causa raiz e APENAS ela. Se vir outros \
+     problemas no caminho, anote-os no marker em vez de corrigi-los.\n\
+     4. TESTE DE REGRESSÃO — o teste da fase 1 agora passa. Garanta que ele \
+     fica no repositório e que falharia de novo se o fix fosse revertido. \
+     Rode a suíte inteira: um fix que quebra outro teste não está pronto.\n\
+     \n\
+     Regras OBRIGATÓRIAS:\n\
+     - Você roda em RODADAS: se o seu turno terminar sem o marker de \
+     conclusão, você será REINVOCADO. Ao iniciar, verifique o que já foi \
+     feito (`git log --oneline -20`) e continue de onde parou.\n\
+     - Processos em background que você deixar ao encerrar o turno são \
+     MORTOS. Execute em foreground e aguarde.\n\
+     - Commite neste branch com a CAUSA RAIZ na mensagem: \
+     \"fix: <o que estava errado> (#{issue}) [spec-wave-agent]\", com o corpo \
+     explicando a origem — não o sintoma. Depois faça push.\n\
+     - Os cards do board são movidos AUTOMATICAMENTE pelo `spec-wave \
+     implement` — não gerencie o board manualmente.\n\
+     - SOMENTE ao terminar, escreva ./.spec-wave-agent-result.json (NÃO \
+     commite este arquivo) com:\n\
+     {\"status\": \"ok\", \"causa_raiz\": \"<a origem, com arquivo e função>\", \
+     \"fix\": \"<o que mudou>\", \"teste_regressao\": \"<o teste que prova>\", \
+     \"arquivos\": [\"<caminhos tocados>\"]} se corrigiu e provou; ou\n\
+     {\"status\": \"partial\", \"detalhe\": \"<o que faltou e por quê>\"} se não \
+     conseguiu reproduzir, não achou a causa, ou o fix não passou nos testes.\n\
+     - NÃO escreva o marker se pretende continuar na próxima rodada.\n"
         .into()
 }
 
@@ -182,8 +242,16 @@ impl Config {
         if self.workdir.trim().is_empty() {
             bail!("config: workdir vazio");
         }
+        if self.bug_timeout_secs == 0 {
+            bail!("config: bug_timeout_secs deve ser > 0");
+        }
         split_command(&self.feature_command)
             .map_err(|e| anyhow::anyhow!("config: feature_command inválido: {e}"))?;
+        split_command(&self.bug_command)
+            .map_err(|e| anyhow::anyhow!("config: bug_command inválido: {e}"))?;
+        if self.bug_prompt.trim().is_empty() {
+            bail!("config: bug_prompt vazio");
+        }
         if self.feature_prompt.trim().is_empty() {
             bail!("config: feature_prompt vazio");
         }
