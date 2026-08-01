@@ -21,8 +21,8 @@
 use anyhow::{bail, Result};
 use spec_wave_agent::config::{load_config, Config};
 use spec_wave_agent::lease::{Lease, LeaseRepo, RenewError};
-use spec_wave_agent::queue;
-use spec_wave_agent::runner::{checkpoint, ensure_workspace, run_feature, RunEnd};
+use spec_wave_agent::queue::{self, QueueItem, QueueKind};
+use spec_wave_agent::runner::{checkpoint, ensure_workspace, run_item, RunEnd};
 use spec_wave_agent::shell::run;
 use std::collections::HashMap;
 use std::path::Path;
@@ -104,9 +104,13 @@ fn spawn_heartbeat(
 /// Processa uma issue. Retorna true se este agente claimou (e portanto a
 /// fila deve ser re-consultada fresca), false se outro agente ficou com ela.
 async fn process_issue(
-    cfg: &Config, leases: &LeaseRepo, me: &str, issue: u64,
+    cfg: &Config, leases: &LeaseRepo, me: &str, item: QueueItem,
     shutdown: watch::Receiver<bool>,
 ) -> Result<bool> {
+    let issue = item.number;
+    // "bug"/"feature" nas mensagens: com dois tipos na fila, um log que diz só
+    // "issue #42" obriga a abrir o GitHub para saber o que o agente está fazendo.
+    let que = match item.kind { QueueKind::Bug => "bug", QueueKind::Feature => "feature" };
     let Some(lease) = leases
         .try_acquire(issue, me, cfg.lease_ttl_secs).await? else {
         return Ok(false); // outro agente pegou: segue a vida
@@ -119,7 +123,7 @@ async fn process_issue(
 
     let outcome = async {
         let ws = ensure_workspace(cfg, issue).await?;
-        let end = run_feature(cfg, &ws, issue, lost_rx.clone(), shutdown).await?;
+        let end = run_item(cfg, &ws, item, lost_rx.clone(), shutdown).await?;
         Ok::<_, anyhow::Error>((ws, end))
     }.await;
     hb.abort();
@@ -137,15 +141,25 @@ async fn process_issue(
     };
 
     match end {
-        RunEnd::Success => {
+        RunEnd::Success(result) => {
             // Cinto de segurança: garante push de qualquer resto que o
             // executor não tenha commitado, antes de sair da fila.
             checkpoint(&ws, issue, "success").await;
+            // Num bug, o VALOR do trabalho está na causa raiz: sem publicá-la
+            // na issue, ela morre no marker (que nem é commitado) e a próxima
+            // pessoa reinvestiga o mesmo defeito.
+            if item.kind == QueueKind::Bug {
+                if let Some(body) = render_bug_report(&result, me) {
+                    let _ = run(&ws, "gh",
+                        &["issue", "comment", &issue.to_string(),
+                          "--repo", &cfg.repo, "--body", &body]).await;
+                }
+            }
             let _ = run(&ws, "gh",
                 &["issue", "edit", &issue.to_string(), "--repo", &cfg.repo,
                   "--remove-label", &cfg.queue_label]).await;
             leases.release(issue).await?;
-            info!(target: "agent", "feature #{issue} concluída");
+            info!(target: "agent", "{que} #{issue} concluído");
         }
         RunEnd::Failed(reason) => {
             checkpoint(&ws, issue, "failed").await;
@@ -158,7 +172,7 @@ async fn process_issue(
                             para ver o estado das stories. Item permanece \
                             na fila.")]).await;
             leases.release(issue).await?; // devolve p/ fila: label continua
-            warn!(target: "agent", "feature #{issue} falhou: {reason}");
+            warn!(target: "agent", "{que} #{issue} falhou: {reason}");
         }
         RunEnd::Interrupted => {
             // Dev desligando a máquina: checkpoint + release imediato para
@@ -173,6 +187,34 @@ async fn process_issue(
         }
     }
     Ok(true)
+}
+
+
+/// Comentário de conclusão de um Bug a partir do marker.
+///
+/// `None` quando o executor não preencheu nada de RCA — um comentário só com
+/// "concluído" é ruído, e a ausência já é informação (o prompt pede os campos).
+fn render_bug_report(result: &Option<spec_wave_agent::runner::ExecResult>, me: &str)
+    -> Option<String>
+{
+    let r = result.as_ref()?;
+    let mut linhas = Vec::new();
+    if let Some(c) = r.causa_raiz.as_deref().filter(|s| !s.trim().is_empty()) {
+        linhas.push(format!("**Causa raiz:** {c}"));
+    }
+    if let Some(v) = r.fix.as_deref().filter(|s| !s.trim().is_empty()) {
+        linhas.push(format!("**Escopo do fix:** {v}"));
+    }
+    if let Some(t) = r.teste_regressao.as_deref().filter(|s| !s.trim().is_empty()) {
+        linhas.push(format!("**Teste de regressão:** {t}"));
+    }
+    if let Some(a) = r.arquivos.as_ref().filter(|a| !a.is_empty()) {
+        linhas.push(format!("**Arquivos:** {}", a.join(", ")));
+    }
+    if linhas.is_empty() {
+        return None;
+    }
+    Some(format!("🐞 **Fix implementado pelo agente `{me}`**\n\n{}", linhas.join("\n\n")))
 }
 
 #[tokio::main]
@@ -215,16 +257,18 @@ async fn main() -> Result<()> {
         let mut claimed = false;
         match queue::poll_queue(&cfg, &workdir).await {
             Ok(queue) => {
-                // Uma feature por vez: pega a PRIMEIRA que conseguir claimar;
+                // Um item por vez: pega o PRIMEIRO que conseguir claimar (bugs
+                // vêm antes de features — ver QueueKind);
                 // ao terminar, volta direto ao poll (fila fresca).
-                for issue in queue {
+                for item in queue {
+                    let issue = item.number;
                     if *sd_rx.borrow() { break; }
                     if let Some(t) = cooldown.get(&issue) {
                         if t.elapsed().as_secs() < cfg.cooldown_secs {
                             continue;
                         }
                     }
-                    match process_issue(&cfg, &leases, &me, issue,
+                    match process_issue(&cfg, &leases, &me, item,
                                         sd_rx.clone()).await {
                         Ok(true) => {
                             cooldown.insert(issue, Instant::now());

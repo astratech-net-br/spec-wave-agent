@@ -2,7 +2,8 @@
 //! no lugar do Claude Code — sem rede, sem gh, sem npm.
 
 use spec_wave_agent::config::Config;
-use spec_wave_agent::runner::{ensure_workspace, run_feature, RunEnd};
+use spec_wave_agent::queue::{QueueItem, QueueKind};
+use spec_wave_agent::runner::{ensure_workspace, run_item, RunEnd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
@@ -69,8 +70,8 @@ async fn sucesso_recebe_prompt_e_pusha_trabalho() {
     let (_lt, lr, _st, sr) = channels();
 
     let ws = ensure_workspace(&cfg, 7).await.unwrap();
-    let end = run_feature(&cfg, &ws, 7, lr, sr).await.unwrap();
-    assert!(matches!(end, RunEnd::Success), "esperava Success");
+    let end = run_item(&cfg, &ws, QueueItem { kind: QueueKind::Feature, number: 7 }, lr, sr).await.unwrap();
+    assert!(matches!(end, RunEnd::Success(_)), "esperava Success");
 
     // Prompt chegou pelo stdin com o placeholder renderizado.
     let prompt = std::fs::read_to_string(ws.join("prompt-recebido.txt")).unwrap();
@@ -97,7 +98,7 @@ async fn exit_zero_sem_marker_nao_e_sucesso() {
     let (_lt, lr, _st, sr) = channels();
 
     let ws = ensure_workspace(&cfg, 10).await.unwrap();
-    let end = run_feature(&cfg, &ws, 10, lr, sr).await.unwrap();
+    let end = run_item(&cfg, &ws, QueueItem { kind: QueueKind::Feature, number: 10 }, lr, sr).await.unwrap();
     match end {
         RunEnd::Failed(r) => assert!(r.contains("sem progresso"), "motivo: {r}"),
         _ => panic!("exit 0 sem marker e sem progresso deveria ser Failed"),
@@ -128,8 +129,8 @@ async fn rodada_incompleta_com_progresso_e_relancada_ate_o_marker() {
     let (_lt, lr, _st, sr) = channels();
 
     let ws = ensure_workspace(&cfg, 12).await.unwrap();
-    let end = run_feature(&cfg, &ws, 12, lr, sr).await.unwrap();
-    assert!(matches!(end, RunEnd::Success), "esperava Success após 2 rodadas");
+    let end = run_item(&cfg, &ws, QueueItem { kind: QueueKind::Feature, number: 12 }, lr, sr).await.unwrap();
+    assert!(matches!(end, RunEnd::Success(_)), "esperava Success após 2 rodadas");
 
     let out = std::process::Command::new("git")
         .args(["log", "--format=%s", "agent/issue-12"])
@@ -150,7 +151,7 @@ async fn marker_partial_vira_falha_com_detalhe() {
     let (_lt, lr, _st, sr) = channels();
 
     let ws = ensure_workspace(&cfg, 11).await.unwrap();
-    let end = run_feature(&cfg, &ws, 11, lr, sr).await.unwrap();
+    let end = run_item(&cfg, &ws, QueueItem { kind: QueueKind::Feature, number: 11 }, lr, sr).await.unwrap();
     match end {
         RunEnd::Failed(r) => {
             assert!(r.contains("partial") && r.contains("story #215"), "motivo: {r}");
@@ -172,7 +173,7 @@ async fn timeout_mata_a_arvore_de_processos_inteira() {
     let (_lt, lr, _st, sr) = channels();
 
     let ws = ensure_workspace(&cfg, 8).await.unwrap();
-    let end = run_feature(&cfg, &ws, 8, lr, sr).await.unwrap();
+    let end = run_item(&cfg, &ws, QueueItem { kind: QueueKind::Feature, number: 8 }, lr, sr).await.unwrap();
     match end {
         RunEnd::Failed(r) => assert!(r.contains("timeout"), "motivo: {r}"),
         _ => panic!("esperava Failed(timeout)"),
@@ -193,6 +194,6 @@ async fn executor_com_exit_1_falha() {
     let (_lt, lr, _st, sr) = channels();
 
     let ws = ensure_workspace(&cfg, 9).await.unwrap();
-    let end = run_feature(&cfg, &ws, 9, lr, sr).await.unwrap();
+    let end = run_item(&cfg, &ws, QueueItem { kind: QueueKind::Feature, number: 9 }, lr, sr).await.unwrap();
     assert!(matches!(end, RunEnd::Failed(_)), "esperava Failed");
 }
