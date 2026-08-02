@@ -49,6 +49,16 @@ pub struct Config {
     /// o executor para continuar (ele retoma pelo estado do git/spec-wave).
     #[serde(default = "d_max_rounds")]
     pub max_executor_rounds: u32,
+    /// Quantas falhas SEGUIDAS na mesma issue antes de tirá-la da fila.
+    ///
+    /// Falha mantém a label de propósito — a maioria é transitória e outro
+    /// agente (ou o mesmo, depois) retoma do checkpoint. Mas há falha
+    /// DETERMINÍSTICA: o executor concluir que não há como reproduzir o
+    /// defeito, por exemplo. Essa nunca vai passar, e sem um teto a issue é
+    /// re-claimada a cada cooldown para sempre, pagando um executor inteiro
+    /// por tentativa.
+    #[serde(default = "d_max_failures")]
+    pub max_failures_per_issue: u32,
     /// Diretório de trabalho do agente
     #[serde(default = "d_workdir")]
     pub workdir: String,
@@ -76,6 +86,7 @@ fn d_bug_command() -> String { d_executor_command() }
 fn d_bug_timeout() -> u64 { 3600 }
 fn d_cooldown() -> u64 { 900 }
 fn d_max_rounds() -> u32 { 8 }
+fn d_max_failures() -> u32 { 3 }
 fn d_feature_prompt() -> String {
     "Você está no clone do repositório, no branch de trabalho da Feature #{issue}.\n\
      Implemente a feature completa usando o spec-wave:\n\
@@ -245,6 +256,9 @@ impl Config {
         if self.bug_timeout_secs == 0 {
             bail!("config: bug_timeout_secs deve ser > 0");
         }
+        if self.max_failures_per_issue == 0 {
+            bail!("config: max_failures_per_issue deve ser > 0 (use 1 para desistir na 1a falha)");
+        }
         split_command(&self.feature_command)
             .map_err(|e| anyhow::anyhow!("config: feature_command inválido: {e}"))?;
         split_command(&self.bug_command)
@@ -377,5 +391,20 @@ mod tests {
         }
         let cfg = parse("repo = \"a/b\"\nlease_ttl_secs = 0");
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn max_failures_zero_e_recusado() {
+        // 0 significaria "nunca desistir", que é o comportamento que este
+        // teto existe para eliminar. Quem quer desistir cedo usa 1.
+        let base = r#"repo = "o/r""#;
+        let cfg: Config = toml::from_str(base).unwrap();
+        assert_eq!(cfg.max_failures_per_issue, 3, "default");
+        assert!(cfg.validate().is_ok());
+
+        let zero: Config = toml::from_str(
+            &format!("{base}\nmax_failures_per_issue = 0")).unwrap();
+        let err = zero.validate().unwrap_err().to_string();
+        assert!(err.contains("max_failures_per_issue"), "erro: {err}");
     }
 }

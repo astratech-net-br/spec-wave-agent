@@ -51,6 +51,18 @@ implement_timeout_secs = 14400
 # orquestrador e com o checkpoint do agente.
 #feature_prompt = ""
 
+# Quantas falhas SEGUIDAS na mesma issue antes de tirá-la da fila.
+#
+# Falha mantém a label de propósito — a maioria é transitória e outro agente
+# (ou o mesmo, depois) retoma do checkpoint. Mas há falha DETERMINÍSTICA: o
+# executor concluir que não há como reproduzir o defeito, por exemplo. Essa
+# nunca vai passar, e sem teto a issue é re-claimada a cada cooldown para
+# sempre, pagando um executor inteiro por tentativa.
+#
+# Ao atingir o teto o agente comenta na issue e REMOVE a label; uma pessoa
+# reaplica quando tiver resolvido o que bloqueava.
+#max_failures_per_issue = 3
+
 # ---- Bug (RFC-004) ----
 
 # Tempo máximo de UM BUG, em segundos. Menor que o de feature por natureza:
