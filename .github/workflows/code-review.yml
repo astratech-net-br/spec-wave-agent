@@ -24,7 +24,7 @@ jobs:
           node-version: '24'
 
       - name: Move Feature to Code Review
-        run: npx @spec-wave/cli@latest code-review --pr-number ${{ github.event.pull_request.number }}
+        run: npx @spec-wave/cli@0.16.4 code-review --pr-number ${{ github.event.pull_request.number }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PROJECT_TOKEN: ${{ secrets.GH_PROJECT_TOKEN }}

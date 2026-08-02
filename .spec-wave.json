@@ -1,5 +1,5 @@
 {
-  "version": "0.10.0",
+  "version": "0.16.4",
   "owner": "astratech-net-br",
   "repo": "spec-wave-agent",
   "project": {
@@ -8,6 +8,14 @@
     "id": "PVT_kwDOEelBqs4BeoVO",
     "number": 4,
     "fields": {
+      "Status": {
+        "id": "PVTSSF_lADOEelBqs4BeoVOzhZBFNk",
+        "options": {
+          "Todo": "f75ad846",
+          "In Progress": "47fc9ee4",
+          "Done": "98236657"
+        }
+      },
       "Etapa": {
         "id": "PVTSSF_lADOEelBqs4BeoVOzhZBFOU",
         "options": {
@@ -75,5 +83,6 @@
     "provider": "openrouter",
     "model": "anthropic/claude-3.7-sonnet"
   },
-  "initializedAt": "2026-07-27T22:02:04.709Z"
+  "initializedAt": "2026-07-27T22:02:04.709Z",
+  "refreshedAt": "2026-08-02T23:11:41.917Z"
 }

@@ -12,7 +12,8 @@ jobs:
   validate:
     if: >
       github.event.label.name == 'spec-wave:ready' &&
-      contains(github.event.issue.title, '[FEATURE]')
+      (contains(github.event.issue.title, '[FEATURE]') ||
+       contains(github.event.issue.title, '[BUG]'))
     runs-on: ubuntu-latest
     permissions:
       issues: write
@@ -26,7 +27,7 @@ jobs:
           node-version: '24'
 
       - name: Validate spec and plan
-        run: npx @spec-wave/cli@latest validate --issue-number ${{ github.event.issue.number }}
+        run: npx @spec-wave/cli@0.16.4 validate --issue-number ${{ github.event.issue.number }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
