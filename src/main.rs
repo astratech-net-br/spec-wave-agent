@@ -101,19 +101,27 @@ fn spawn_heartbeat(
     })
 }
 
-/// Processa uma issue. Retorna true se este agente claimou (e portanto a
-/// fila deve ser re-consultada fresca), false se outro agente ficou com ela.
+/// Desfecho de uma tentativa, do ponto de vista do LOOP.
+///
+/// `failed` existe para o loop contar falhas seguidas na mesma issue: falha
+/// mantém a label (segue na fila), e sem teto uma falha determinística é
+/// re-tentada para sempre.
+#[derive(Debug, Clone, Copy)]
+struct Attempt { claimed: bool, failed: bool }
+
+/// Processa uma issue. `claimed` = este agente pegou a issue (e portanto a
+/// fila deve ser re-consultada fresca); false = outro agente ficou com ela.
 async fn process_issue(
     cfg: &Config, leases: &LeaseRepo, me: &str, item: QueueItem,
     shutdown: watch::Receiver<bool>,
-) -> Result<bool> {
+) -> Result<Attempt> {
     let issue = item.number;
     // "bug"/"feature" nas mensagens: com dois tipos na fila, um log que diz só
     // "issue #42" obriga a abrir o GitHub para saber o que o agente está fazendo.
     let que = match item.kind { QueueKind::Bug => "bug", QueueKind::Feature => "feature" };
     let Some(lease) = leases
         .try_acquire(issue, me, cfg.lease_ttl_secs).await? else {
-        return Ok(false); // outro agente pegou: segue a vida
+        return Ok(Attempt { claimed: false, failed: false }); // outro agente pegou
     };
     info!(target: "agent", "claim OK: issue #{issue} (gen {})", lease.generation);
 
@@ -140,6 +148,7 @@ async fn process_issue(
         }
     };
 
+    let mut failed = false;
     match end {
         RunEnd::Success(result) => {
             // Cinto de segurança: garante push de qualquer resto que o
@@ -172,6 +181,7 @@ async fn process_issue(
                             para ver o estado das stories. Item permanece \
                             na fila.")]).await;
             leases.release(issue).await?; // devolve p/ fila: label continua
+            failed = true;
             warn!(target: "agent", "{que} #{issue} falhou: {reason}");
         }
         RunEnd::Interrupted => {
@@ -186,7 +196,25 @@ async fn process_issue(
             warn!(target: "agent", "issue #{issue}: lease perdido, abortado");
         }
     }
-    Ok(true)
+    Ok(Attempt { claimed: true, failed })
+}
+
+/// Tira a issue da fila depois de falhas seguidas demais e explica na issue.
+///
+/// Sem isto, uma falha DETERMINÍSTICA (o executor concluir que não há como
+/// reproduzir, por exemplo) é re-claimada a cada cooldown para sempre —
+/// pagando um executor inteiro por tentativa, indefinidamente. Manter a label
+/// só faz sentido enquanto a falha puder ser transitória.
+async fn desistir_da_issue(cfg: &Config, cwd: &Path, me: &str, issue: u64, tentativas: u32) {
+    let _ = run(cwd, "gh",
+        &["issue", "comment", &issue.to_string(), "--repo", &cfg.repo,
+          "--body",
+          &format!("🛑 Agente `{me}` desistiu de #{issue} após **{tentativas} falhas                     seguidas** — as tentativas anteriores estão nos comentários acima.                     A label `{}` foi REMOVIDA para parar o ciclo de retentativa: falha                     que se repete não é transitória, e continuar tentando só gasta                     execução. Uma pessoa precisa resolver o que está bloqueando e                     reaplicar a label para reenfileirar.", cfg.queue_label)]).await;
+    let _ = run(cwd, "gh",
+        &["issue", "edit", &issue.to_string(), "--repo", &cfg.repo,
+          "--remove-label", &cfg.queue_label]).await;
+    warn!(target: "agent",
+          "issue #{issue}: {tentativas} falhas seguidas — removida da fila");
 }
 
 
@@ -249,6 +277,10 @@ async fn main() -> Result<()> {
     // evita re-claim imediato por atraso do índice de busca do GitHub após
     // remover a label, e loop quente de retry quando uma feature falha.
     let mut cooldown: HashMap<u64, Instant> = HashMap::new();
+    // Falhas SEGUIDAS por issue. Zera no sucesso e ao tirar da fila. Em
+    // memória de propósito: o objetivo é parar o ciclo do daemon em execução;
+    // depois de um restart, o humano já tem os comentários das tentativas.
+    let mut falhas: HashMap<u64, u32> = HashMap::new();
 
     loop {
         if *sd_rx.borrow() {
@@ -270,12 +302,22 @@ async fn main() -> Result<()> {
                     }
                     match process_issue(&cfg, &leases, &me, item,
                                         sd_rx.clone()).await {
-                        Ok(true) => {
+                        Ok(a) if a.claimed => {
                             cooldown.insert(issue, Instant::now());
+                            if a.failed {
+                                let n = falhas.entry(issue).or_insert(0);
+                                *n += 1;
+                                if *n >= cfg.max_failures_per_issue {
+                                    desistir_da_issue(&cfg, &workdir, &me, issue, *n).await;
+                                    falhas.remove(&issue);
+                                }
+                            } else {
+                                falhas.remove(&issue);
+                            }
                             claimed = true;
                             break;
                         }
-                        Ok(false) => {} // outro agente: tenta a próxima
+                        Ok(_) => {} // outro agente: tenta a próxima
                         Err(e) => {
                             error!(target: "agent", "erro na issue #{issue}: {e:#}");
                             cooldown.insert(issue, Instant::now());

@@ -171,6 +171,7 @@ repo = "sua-org/seu-repo"
 | `feature_prompt` | (prompt de orquestração) | enviado via stdin. `{issue}` |
 | `cooldown_secs` | `900` | issue processada sai da fila local por este tempo |
 | `max_executor_rounds` | `8` | teto de rodadas por feature |
+| `max_failures_per_issue` | `3` | falhas seguidas antes de tirar a issue da fila |
 | `workdir` | `~/.spec-wave-agent` | clones por issue + `lease-repo` |
 | `agent_id` | `usuário@hostname` | identidade nos leases e comentários |
 | `remote_url` | `https://github.com/{repo}.git` | override (SSH, git self-hosted, testes) |
