@@ -19,7 +19,7 @@
 //! Autenticação: usa o `git`/`gh` já configurados na máquina do dev.
 
 use anyhow::{bail, Result};
-use spec_wave_agent::config::{load_config, Config};
+use spec_wave_agent::config::{load_config_from, Config};
 use spec_wave_agent::lease::{Lease, LeaseRepo, RenewError};
 use spec_wave_agent::queue::{self, QueueItem, QueueKind};
 use spec_wave_agent::runner::{checkpoint, ensure_workspace, run_item, RunEnd};
@@ -245,16 +245,66 @@ fn render_bug_report(result: &Option<spec_wave_agent::runner::ExecResult>, me: &
     Some(format!("🐞 **Fix implementado pelo agente `{me}`**\n\n{}", linhas.join("\n\n")))
 }
 
+const USAGE: &str = "\
+spec-wave-agent — daemon que puxa FEATURES e BUGS da fila do GitHub
+(label `spec-wave:dev-agent`) e delega a implementação ao Claude Code.
+
+USO:
+    spec-wave-agent [OPÇÕES]
+
+OPÇÕES:
+    -c, --config <PATH>  Arquivo de configuração TOML.
+                         Default: $SPEC_WAVE_AGENT_CONFIG, ou
+                         ~/.config/spec-wave-agent/config.toml
+    -V, --version        Imprime a versão e sai
+    -h, --help           Imprime esta ajuda e sai
+
+Sem opções, o agente roda em foreground até Ctrl+C (que faz checkpoint do
+trabalho em andamento e libera o lease). Log via RUST_LOG (ex.: RUST_LOG=debug).";
+
+/// Opções da linha de comando. Um parser à mão em vez de clap: são três
+/// flags, e a dependência não se paga.
+struct Args {
+    config: Option<String>,
+}
+
+/// `Ok(None)` = já respondeu (--help/--version) e o processo deve sair.
+fn parse_args() -> Result<Option<Args>> {
+    let mut config = None;
+    let mut it = std::env::args().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            // --version antes de qualquer coisa: o instalador (spec-wave
+            // dev-agent --install) usa isso para decidir se precisa baixar o
+            // binário.
+            "--version" | "-V" => {
+                println!("spec-wave-agent {}", env!("CARGO_PKG_VERSION"));
+                return Ok(None);
+            }
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                return Ok(None);
+            }
+            "--config" | "-c" => {
+                config = Some(it.next().ok_or_else(|| {
+                    anyhow::anyhow!("--config exige um caminho")
+                })?);
+            }
+            other => {
+                // Falhar alto: um argumento ignorado silenciosamente vira um
+                // daemon rodando contra o repo errado.
+                bail!("argumento desconhecido: {other}\n\n{USAGE}");
+            }
+        }
+    }
+    Ok(Some(Args { config }))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // --version antes de qualquer coisa: o instalador (spec-wave dev-agent
-    // --install) usa isso para decidir se precisa baixar o binário.
-    if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
-        println!("spec-wave-agent {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
+    let Some(args) = parse_args()? else { return Ok(()) };
     init_tracing();
-    let cfg = load_config()?;
+    let cfg = load_config_from(args.config.as_deref())?;
     cfg.validate()?;
     let me = cfg.agent_id();
     std::fs::create_dir_all(&cfg.workdir)?;

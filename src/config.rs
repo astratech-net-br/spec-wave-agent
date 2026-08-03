@@ -217,11 +217,32 @@ pub fn dirs_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Caminho da config, na ordem de precedência: argumento `--config <path>`
+/// (passado pelo main), env `SPEC_WAVE_AGENT_CONFIG`, default no HOME.
+///
+/// O override existe porque um dev tem mais de um repositório sob spec-wave e
+/// o default é um caminho único: sem ele, apontar o agente para outro repo
+/// significa sobrescrever a config em uso.
+pub fn config_path(override_path: Option<&str>) -> PathBuf {
+    if let Some(p) = override_path {
+        return PathBuf::from(p);
+    }
+    if let Some(p) = std::env::var_os("SPEC_WAVE_AGENT_CONFIG") {
+        return PathBuf::from(p);
+    }
+    dirs_home().join(".config/spec-wave-agent/config.toml")
+}
+
 pub fn load_config() -> Result<Config> {
-    let path = dirs_home().join(".config/spec-wave-agent/config.toml");
+    load_config_from(None)
+}
+
+pub fn load_config_from(override_path: Option<&str>) -> Result<Config> {
+    let path = config_path(override_path);
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("config não encontrada em {}", path.display()))?;
-    Ok(toml::from_str(&raw)?)
+    toml::from_str(&raw)
+        .with_context(|| format!("config inválida em {}", path.display()))
 }
 
 impl Config {
@@ -318,6 +339,18 @@ mod tests {
         assert_eq!(cfg.implement_timeout_secs, 14400);
         assert!(cfg.agent_id.is_none());
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn config_path_respeita_precedencia() {
+        // Argumento explícito vence a env; a env vence o default no HOME.
+        std::env::set_var("SPEC_WAVE_AGENT_CONFIG", "/tmp/da-env.toml");
+        assert_eq!(config_path(Some("/tmp/do-arg.toml")),
+                   PathBuf::from("/tmp/do-arg.toml"));
+        assert_eq!(config_path(None), PathBuf::from("/tmp/da-env.toml"));
+        std::env::remove_var("SPEC_WAVE_AGENT_CONFIG");
+        assert_eq!(config_path(None),
+                   dirs_home().join(".config/spec-wave-agent/config.toml"));
     }
 
     #[test]
