@@ -203,7 +203,21 @@ export GH_TOKEN=$(gh auth token -u SUA-CONTA-DA-ORG)
 ```bash
 spec-wave-agent                    # nível info
 RUST_LOG=debug spec-wave-agent     # verboso
+spec-wave-agent --help             # opções
 ```
+
+Para trabalhar em **mais de um repositório**, aponte o agente para outra config
+em vez de sobrescrever a que já está em uso:
+
+```bash
+spec-wave-agent --config ~/.config/spec-wave-agent/outro-repo.toml
+SPEC_WAVE_AGENT_CONFIG=~/.config/spec-wave-agent/outro-repo.toml spec-wave-agent
+```
+
+Precedência: `--config` → `SPEC_WAVE_AGENT_CONFIG` → o default
+`~/.config/spec-wave-agent/config.toml`. Cada instância precisa de um `workdir`
+próprio na config — dois agentes compartilhando o mesmo diretório de clones
+brigariam pelos mesmos branches.
 
 Os logs do agente saem com timestamp e nível; o que o Claude Code faz aparece
 intercalado como `[#<issue>] …` (texto do orquestrador, tool calls e, no fim,
