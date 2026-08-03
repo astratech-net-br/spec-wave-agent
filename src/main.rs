@@ -22,7 +22,7 @@ use anyhow::{bail, Result};
 use spec_wave_agent::config::{load_config_from, Config};
 use spec_wave_agent::lease::{Lease, LeaseRepo, RenewError};
 use spec_wave_agent::queue::{self, QueueItem, QueueKind};
-use spec_wave_agent::runner::{checkpoint, ensure_workspace, run_item, RunEnd};
+use spec_wave_agent::runner::{checkpoint, ensure_workspace, open_pull_request, run_item, RunEnd};
 use spec_wave_agent::shell::run;
 use std::collections::HashMap;
 use std::path::Path;
@@ -164,6 +164,11 @@ async fn process_issue(
                           "--repo", &cfg.repo, "--body", &body]).await;
                 }
             }
+            // O PR vem DEPOIS do checkpoint (todo o trabalho já está pushado) e
+            // ANTES de sair da fila: é ele que dá conteúdo à etapa 👀 Code
+            // Review. Sem isso, as Stories chegavam lá e a fila do Tech Leader
+            // mostrava "sem PR" em todas.
+            open_pull_request(&ws, &cfg.repo, issue).await;
             let _ = run(&ws, "gh",
                 &["issue", "edit", &issue.to_string(), "--repo", &cfg.repo,
                   "--remove-label", &cfg.queue_label]).await;

@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::time::{timeout, Duration as TokioDuration};
-use tracing::info;
+use tracing::{info, warn};
 
 pub async fn ensure_workspace(cfg: &Config, issue: u64) -> Result<PathBuf> {
     let ws = PathBuf::from(&cfg.workdir).join(format!("issue-{issue}"));
@@ -37,7 +37,7 @@ pub async fn ensure_workspace(cfg: &Config, issue: u64) -> Result<PathBuf> {
 
     // Retomada: se o branch de trabalho já existe no remoto (outro agente
     // começou e caiu), continua dele; senão cria a partir do default.
-    let branch = format!("agent/issue-{issue}");
+    let branch = work_branch(issue);
     let remote = run(&ws, "git",
                      &["ls-remote", "--exit-code", "origin",
                        &format!("refs/heads/{branch}")]).await?;
@@ -53,6 +53,64 @@ pub async fn ensure_workspace(cfg: &Config, issue: u64) -> Result<PathBuf> {
         run_ok(&ws, "git", &["push", "--quiet", "-u", "origin", &branch]).await?;
     }
     Ok(ws)
+}
+
+/// Nome do branch de trabalho de uma issue.
+pub fn work_branch(issue: u64) -> String {
+    format!("agent/issue-{issue}")
+}
+
+/// Abre o Pull Request do trabalho concluído, se ainda não houver um.
+///
+/// UM PR por issue, não por story: o agente trabalha num branch único
+/// (`agent/issue-N`) para a feature inteira, então "um PR por Story" não teria
+/// como existir. Sem este passo, as Stories chegavam a 👀 Code Review e a fila
+/// do Tech Leader mostrava "sem PR" em todas — uma etapa de revisão sem nada
+/// para revisar.
+///
+/// Best-effort de propósito: o trabalho já está commitado e pushado, e falhar a
+/// execução inteira por causa do PR perderia o lease sem motivo. Um aviso basta
+/// para o humano abrir à mão.
+///
+/// Sem palavra-chave de fechamento (`Closes`/`Fixes`) no corpo: o merge não
+/// encerra o item — ele ainda percorre QA, Homologação e Deploy no board.
+pub async fn open_pull_request(ws: &Path, repo: &str, issue: u64) {
+    let branch = work_branch(issue);
+    // Idempotência: relançamento após rodada incompleta, ou takeover por outro
+    // agente, não podem gerar um segundo PR do mesmo branch.
+    if let Ok(existing) = run(ws, "gh", &["pr", "list", "--repo", repo, "--head", &branch,
+                                          "--state", "open", "--json", "number",
+                                          "--jq", ".[].number"]).await {
+        if existing.ok && !existing.stdout.trim().is_empty() {
+            info!(target: "agent", "PR do #{issue} já existe (#{}) — nada a fazer",
+                  existing.stdout.trim());
+            return;
+        }
+    }
+    // Título da issue: um PR chamado "agent/issue-18" não diz nada em uma fila
+    // de revisão. Falha de rede aqui não impede o PR — cai no genérico.
+    let title = match run(ws, "gh", &["issue", "view", &issue.to_string(),
+                                      "--repo", repo, "--json", "title",
+                                      "--jq", ".title"]).await {
+        Ok(o) if o.ok && !o.stdout.trim().is_empty() => o.stdout.trim().to_string(),
+        _ => format!("Implementação da issue #{issue}"),
+    };
+    let body = format!(
+        "Implementa a issue #{issue}.\n\n\
+         Branch de trabalho do `spec-wave-agent`, com um commit por Story.\n\n\
+         O merge **não** encerra a issue: ela segue por QA, Homologação e Deploy \
+         no board."
+    );
+    match run(ws, "gh", &["pr", "create", "--repo", repo, "--head", &branch,
+                          "--title", &title, "--body", &body]).await {
+        Ok(o) if o.ok => info!(target: "agent", "PR aberto: {}", o.stdout.trim()),
+        Ok(o) => warn!(target: "agent",
+            "não foi possível abrir o PR do #{issue} (abra à mão a partir de \
+             {branch}): {}", o.stderr.trim()),
+        Err(e) => warn!(target: "agent",
+            "não foi possível abrir o PR do #{issue} (abra à mão a partir de \
+             {branch}): {e:#}"),
+    }
 }
 
 /// Commita e pusha qualquer estado pendente (checkpoint para takeover).

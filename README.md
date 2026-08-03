@@ -74,11 +74,19 @@ lançado como **líder de grupo de processos** e recebe o `feature_prompt` pelo
 
 | Desfecho | O que o agente faz |
 |---|---|
-| **Sucesso** (marker `{"status":"ok"}`) | checkpoint de segurança, remove a label da fila, libera o lease |
+| **Sucesso** (marker `{"status":"ok"}`) | checkpoint de segurança, **abre o PR** do branch, remove a label da fila, libera o lease |
 | **Rodada incompleta** (exit 0 sem marker) | relança o executor, que retoma pelo `git log` + `spec-wave order` |
 | **Falha** (exit ≠ 0, timeout, marker `partial`) | checkpoint (commit+push do WIP), comentário na issue, **mantém a label** (segue na fila), libera o lease |
 | **SIGTERM** (desligar a máquina) | checkpoint + release imediato ⇒ takeover instantâneo por outro agente |
 | **Lease perdido** | mata a árvore de processos e **não faz nada** — o novo dono manda no branch |
+
+**Um PR por issue, não por story.** O trabalho inteiro vive num branch só
+(`agent/issue-<n>`), então é dele que sai o PR — aberto no sucesso, com o título
+da issue. É o PR que dá conteúdo à etapa 👀 Code Review: sem ele, as Stories
+chegam lá e a fila do Tech Leader mostra "sem PR" em todas. É idempotente (PR já
+aberto ⇒ não abre outro) e best-effort: o trabalho já está pushado, então falha
+ao abrir vira aviso, não derruba a execução. O corpo **não** usa `Closes`/`Fixes`
+— o merge não encerra o item, que ainda percorre QA, Homologação e Deploy.
 
 O **kill é sempre da árvore inteira**, porque o executor spawna `npx spec-wave`
 que spawna o claude interno: em Unix, SIGKILL no grupo de processos (o filho é
