@@ -62,6 +62,14 @@ pub struct Config {
     /// Diretório de trabalho do agente
     #[serde(default = "d_workdir")]
     pub workdir: String,
+    /// Abre o PR do trabalho concluído como RASCUNHO (`gh pr create --draft`).
+    /// Rascunho não mergeia até alguém marcar "pronto para revisão", e um
+    /// repositório que pule draft no job do required check (types com
+    /// ready_for_review + `if: !draft` no job) só paga CI quando a revisão
+    /// começa — economia real quando o trabalho chega em pilha. Default false:
+    /// quem não configurou nada mantém o comportamento de sempre.
+    #[serde(default = "d_pr_draft")]
+    pub pr_draft: bool,
     /// Identidade do agente (default: usuario@hostname)
     pub agent_id: Option<String>,
     /// Override da URL do remoto (testes / git self-hosted). Default: GitHub.
@@ -87,6 +95,7 @@ fn d_bug_timeout() -> u64 { 3600 }
 fn d_cooldown() -> u64 { 900 }
 fn d_max_rounds() -> u32 { 8 }
 fn d_max_failures() -> u32 { 3 }
+fn d_pr_draft() -> bool { false }
 fn d_feature_prompt() -> String {
     "Você está no clone do repositório, no branch de trabalho da Feature #{issue}.\n\
      Implemente a feature completa usando o spec-wave:\n\

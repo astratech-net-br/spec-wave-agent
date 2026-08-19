@@ -168,7 +168,7 @@ async fn process_issue(
             // ANTES de sair da fila: é ele que dá conteúdo à etapa 👀 Code
             // Review. Sem isso, as Stories chegavam lá e a fila do Tech Leader
             // mostrava "sem PR" em todas.
-            open_pull_request(&ws, &cfg.repo, issue).await;
+            open_pull_request(&ws, &cfg.repo, issue, cfg.pr_draft).await;
             let _ = run(&ws, "gh",
                 &["issue", "edit", &issue.to_string(), "--repo", &cfg.repo,
                   "--remove-label", &cfg.queue_label]).await;
