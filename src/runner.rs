@@ -74,7 +74,7 @@ pub fn work_branch(issue: u64) -> String {
 ///
 /// Sem palavra-chave de fechamento (`Closes`/`Fixes`) no corpo: o merge não
 /// encerra o item — ele ainda percorre QA, Homologação e Deploy no board.
-pub async fn open_pull_request(ws: &Path, repo: &str, issue: u64) {
+pub async fn open_pull_request(ws: &Path, repo: &str, issue: u64, draft: bool) {
     let branch = work_branch(issue);
     // Idempotência: relançamento após rodada incompleta, ou takeover por outro
     // agente, não podem gerar um segundo PR do mesmo branch.
@@ -101,8 +101,12 @@ pub async fn open_pull_request(ws: &Path, repo: &str, issue: u64) {
          O merge **não** encerra a issue: ela segue por QA, Homologação e Deploy \
          no board."
     );
-    match run(ws, "gh", &["pr", "create", "--repo", repo, "--head", &branch,
-                          "--title", &title, "--body", &body]).await {
+    let mut args = vec!["pr", "create", "--repo", repo, "--head", &branch,
+                        "--title", &title, "--body", &body];
+    if draft {
+        args.push("--draft");
+    }
+    match run(ws, "gh", &args).await {
         Ok(o) if o.ok => info!(target: "agent", "PR aberto: {}", o.stdout.trim()),
         Ok(o) => warn!(target: "agent",
             "não foi possível abrir o PR do #{issue} (abra à mão a partir de \

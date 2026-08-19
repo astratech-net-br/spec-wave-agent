@@ -90,6 +90,11 @@ implement_timeout_secs = 14400
 #workdir = "/home/voce/.spec-wave-agent"
 
 # Identidade do agente nos leases e comentários (default: usuario@hostname)
+# Abre o PR do trabalho concluído como rascunho (gh pr create --draft):
+# o CI de um repo que pula draft no required check só roda quando alguém
+# marca o PR como pronto para revisão. Default: false.
+#pr_draft = true
+
 #agent_id = "moacir@macbook"
 
 # Override da URL do remoto (git self-hosted / testes).
