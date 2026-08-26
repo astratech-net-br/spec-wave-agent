@@ -22,6 +22,13 @@ queue_label = "spec-wave:dev-agent"
 # Intervalo entre consultas à fila quando ocioso (segundos)
 poll_interval_secs = 60
 
+# Teto do backoff quando a fila volta VAZIA: dobra a cada rodada vazia
+# seguida (60 -> 120 -> 240 -> ...) até este teto, e zera assim que a fila
+# tiver algo de novo. Fila cheia sem claim (outro agente já pegou tudo) não
+# entra no backoff — só fila genuinamente vazia é ociosidade.
+# Invariante (validada no boot): poll_backoff_max_secs >= poll_interval_secs.
+poll_backoff_max_secs = 480
+
 # Renovação do lease (segundos)
 heartbeat_secs = 120
 

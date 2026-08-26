@@ -169,6 +169,7 @@ repo = "sua-org/seu-repo"
 | `repo` | — | `owner/repo` (obrigatório) |
 | `queue_label` | `spec-wave:dev-agent` | label que marca a fila |
 | `poll_interval_secs` | `60` | intervalo de consulta quando ocioso |
+| `poll_backoff_max_secs` | `480` | teto do backoff quando a fila volta VAZIA (dobra a cada rodada vazia seguida; fila com item de outro agente não conta) |
 | `heartbeat_secs` | `120` | renovação do lease |
 | `lease_ttl_secs` | `600` | sem heartbeat por este tempo ⇒ pode ser roubado |
 | `implement_timeout_secs` | `14400` | teto de **uma feature inteira** (4h) |
@@ -186,7 +187,8 @@ repo = "sua-org/seu-repo"
 | `remote_url` | `https://github.com/{repo}.git` | override (SSH, git self-hosted, testes) |
 
 Validado no boot: `lease_ttl_secs >= 4 × heartbeat_secs`, formato `owner/repo`,
-intervalos > 0, `feature_command` e `bug_command` parseáveis, `bug_prompt` não-vazio.
+intervalos > 0, `poll_backoff_max_secs >= poll_interval_secs`, `feature_command`
+e `bug_command` parseáveis, `bug_prompt` não-vazio.
 
 **Fixar o modelo** (útil quando a cota do default esgota) — lembre das **duas**
 camadas:

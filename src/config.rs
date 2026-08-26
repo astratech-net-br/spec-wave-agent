@@ -13,6 +13,13 @@ pub struct Config {
     pub queue_label: String,
     #[serde(default = "d_poll")]
     pub poll_interval_secs: u64,
+    /// Teto do backoff quando o poll volta com a fila VAZIA (dobra a cada
+    /// rodada vazia seguida, a partir de `poll_interval_secs`, até este
+    /// teto — zera assim que a fila tiver algo de novo). Fila cheia sem
+    /// claim (outro agente já pegou tudo) e erro de poll NÃO entram no
+    /// backoff — só fila genuinamente vazia é ociosidade.
+    #[serde(default = "d_poll_backoff_max")]
+    pub poll_backoff_max_secs: u64,
     #[serde(default = "d_heartbeat")]
     pub heartbeat_secs: u64,
     /// Sem heartbeat por este tempo => lease considerado morto (pode roubar)
@@ -78,6 +85,7 @@ pub struct Config {
 
 fn d_queue_label() -> String { "spec-wave:dev-agent".into() }
 fn d_poll() -> u64 { 60 }
+fn d_poll_backoff_max() -> u64 { 480 } // 8x o d_poll() default — ver next_poll_delay em queue.rs
 fn d_heartbeat() -> u64 { 120 }
 fn d_ttl() -> i64 { 600 }
 fn d_impl_timeout() -> u64 { 14400 }
@@ -276,6 +284,11 @@ impl Config {
                 bail!("config: {name} deve ser > 0");
             }
         }
+        if self.poll_backoff_max_secs < self.poll_interval_secs {
+            bail!("config: poll_backoff_max_secs ({}) deve ser >= poll_interval_secs ({}) \
+                   — é o teto do backoff, não pode ser menor que a base",
+                  self.poll_backoff_max_secs, self.poll_interval_secs);
+        }
         if self.lease_ttl_secs <= 0 {
             bail!("config: lease_ttl_secs deve ser > 0");
         }
@@ -350,7 +363,16 @@ mod tests {
         assert_eq!(cfg.heartbeat_secs, 120);
         assert_eq!(cfg.lease_ttl_secs, 600);
         assert_eq!(cfg.implement_timeout_secs, 14400);
+        assert_eq!(cfg.poll_backoff_max_secs, 480);
         assert!(cfg.agent_id.is_none());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn valida_poll_backoff_max_vs_poll_interval() {
+        let cfg = parse("repo = \"a/b\"\npoll_interval_secs = 60\npoll_backoff_max_secs = 59");
+        assert!(cfg.validate().is_err());
+        let cfg = parse("repo = \"a/b\"\npoll_interval_secs = 60\npoll_backoff_max_secs = 60");
         assert!(cfg.validate().is_ok());
     }
 

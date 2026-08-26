@@ -26,7 +26,7 @@ use spec_wave_agent::runner::{checkpoint, ensure_workspace, open_pull_request, r
 use spec_wave_agent::shell::run;
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio::time::{sleep, Duration as TokioDuration};
 use tracing::{error, info, warn};
@@ -214,7 +214,17 @@ async fn desistir_da_issue(cfg: &Config, cwd: &Path, me: &str, issue: u64, tenta
     let _ = run(cwd, "gh",
         &["issue", "comment", &issue.to_string(), "--repo", &cfg.repo,
           "--body",
-          &format!("🛑 Agente `{me}` desistiu de #{issue} após **{tentativas} falhas                     seguidas** — as tentativas anteriores estão nos comentários acima.                     A label `{}` foi REMOVIDA para parar o ciclo de retentativa: falha                     que se repete não é transitória, e continuar tentando só gasta                     execução. Uma pessoa precisa resolver o que está bloqueando e                     reaplicar a label para reenfileirar.", cfg.queue_label)]).await;
+          // Item 2 do rfc/plano-hardening-agentes-2026-08.md: este format!
+          // era UMA linha física sem `\` de continuação, e os espaços de
+          // indentação do editor viravam corridas de espaços literais no
+          // texto publicado na issue. Com `\`, cada quebra some junto com o
+          // espaço em branco que a segue.
+          &format!("🛑 Agente `{me}` desistiu de #{issue} após **{tentativas} falhas \
+                    seguidas** — as tentativas anteriores estão nos comentários acima. \
+                    A label `{}` foi REMOVIDA para parar o ciclo de retentativa: falha \
+                    que se repete não é transitória, e continuar tentando só gasta \
+                    execução. Uma pessoa precisa resolver o que está bloqueando e \
+                    reaplicar a label para reenfileirar.", cfg.queue_label)]).await;
     let _ = run(cwd, "gh",
         &["issue", "edit", &issue.to_string(), "--repo", &cfg.repo,
           "--remove-label", &cfg.queue_label]).await;
@@ -332,10 +342,25 @@ async fn main() -> Result<()> {
     // evita re-claim imediato por atraso do índice de busca do GitHub após
     // remover a label, e loop quente de retry quando uma feature falha.
     let mut cooldown: HashMap<u64, Instant> = HashMap::new();
-    // Falhas SEGUIDAS por issue. Zera no sucesso e ao tirar da fila. Em
-    // memória de propósito: o objetivo é parar o ciclo do daemon em execução;
-    // depois de um restart, o humano já tem os comentários das tentativas.
-    let mut falhas: HashMap<u64, u32> = HashMap::new();
+    // Falhas SEGUIDAS por issue, com o instante da ÚLTIMA falha — item 2 do
+    // rfc/plano-hardening-agentes-2026-08.md: sem o instante, 3 falhas
+    // espaçadas por dias desistiam igual a 3 falhas seguidas em 10 minutos.
+    // Zera no sucesso, ao tirar da fila, e ao expirar a janela (ver abaixo).
+    // Em memória de propósito: o objetivo é parar o ciclo do daemon em
+    // execução; depois de um restart, o humano já tem os comentários das
+    // tentativas.
+    let mut falhas: HashMap<u64, (u32, Instant)> = HashMap::new();
+    // Issues das quais o agente DESISTIU (label removida por
+    // `desistir_da_issue`) — item 2. Diferente do `cooldown`: uma issue aqui
+    // só volta a ser processada quando uma leitura FRESCA (`gh issue view`,
+    // sem o atraso do índice de busca que `gh issue list` consulta) confirma
+    // que a label foi reaplicada. Sem isto, reaplicar a label não bastava —
+    // só reiniciar o daemon destravava, porque nada verificava a label de
+    // novo antes do próximo `cooldown_secs` natural expirar.
+    let mut desistidas: HashMap<u64, Instant> = HashMap::new();
+    // Rodadas de poll SEGUIDAS em que a fila voltou vazia — item 4. Zera na
+    // primeira fila não-vazia; alimenta o backoff do sleep final do loop.
+    let mut vazios_seguidos: u32 = 0;
 
     loop {
         if *sd_rx.borrow() {
@@ -344,13 +369,36 @@ async fn main() -> Result<()> {
         let mut claimed = false;
         match queue::poll_queue(&cfg, &workdir).await {
             Ok(queue) => {
+                // Item 4: só fila GENUINAMENTE vazia conta para o backoff.
+                // Fila cheia sem claim (outro agente levou tudo) reseta
+                // igual — não é ociosidade, é atividade que não é nossa.
+                if queue.is_empty() {
+                    vazios_seguidos += 1;
+                } else {
+                    vazios_seguidos = 0;
+                }
                 // Um item por vez: pega o PRIMEIRO que conseguir claimar (bugs
                 // vêm antes de features — ver QueueKind);
                 // ao terminar, volta direto ao poll (fila fresca).
                 for item in queue {
                     let issue = item.number;
                     if *sd_rx.borrow() { break; }
-                    if let Some(t) = cooldown.get(&issue) {
+                    if desistidas.contains_key(&issue) {
+                        // Item 2: falha determinística. Só reprocessa se uma
+                        // leitura FRESCA confirmar que a label foi reaplicada
+                        // de verdade — `gh issue list` (poll_queue) pode
+                        // devolver a issue por atraso do índice de busca
+                        // mesmo já sem a label.
+                        match queue::label_present_now(&cfg, &workdir, issue).await {
+                            Ok(true) => { desistidas.remove(&issue); }
+                            Ok(false) => continue,
+                            Err(e) => {
+                                warn!(target: "agent",
+                                      "issue #{issue}: não deu para confirmar a label ({e:#}) — aguardando");
+                                continue;
+                            }
+                        }
+                    } else if let Some(t) = cooldown.get(&issue) {
                         if t.elapsed().as_secs() < cfg.cooldown_secs {
                             continue;
                         }
@@ -360,11 +408,27 @@ async fn main() -> Result<()> {
                         Ok(a) if a.claimed => {
                             cooldown.insert(issue, Instant::now());
                             if a.failed {
-                                let n = falhas.entry(issue).or_insert(0);
-                                *n += 1;
-                                if *n >= cfg.max_failures_per_issue {
-                                    desistir_da_issue(&cfg, &workdir, &me, issue, *n).await;
+                                // Item 2: janela do contador — falha antiga
+                                // demais não conta na sequência atual. Sem
+                                // isto, 3 falhas espaçadas por dias desistiam
+                                // igual a 3 falhas seguidas em 10 minutos.
+                                let janela = Duration::from_secs(
+                                    cfg.cooldown_secs.saturating_mul(cfg.max_failures_per_issue as u64));
+                                let entry = falhas.entry(issue).or_insert((0, Instant::now()));
+                                if entry.1.elapsed() > janela {
+                                    entry.0 = 0;
+                                }
+                                entry.0 += 1;
+                                entry.1 = Instant::now();
+                                let n = entry.0;
+                                if n >= cfg.max_failures_per_issue {
+                                    desistir_da_issue(&cfg, &workdir, &me, issue, n).await;
                                     falhas.remove(&issue);
+                                    // Sai do cooldown comum: a partir de agora
+                                    // é `desistidas` quem decide, com leitura
+                                    // fresca — não os 15min cegos do cooldown.
+                                    cooldown.remove(&issue);
+                                    desistidas.insert(issue, Instant::now());
                                 }
                             } else {
                                 falhas.remove(&issue);
@@ -387,8 +451,10 @@ async fn main() -> Result<()> {
         if claimed {
             continue; // terminou um fluxo => tenta obter a próxima já
         }
+        let delay = queue::next_poll_delay(
+            vazios_seguidos.max(1), cfg.poll_interval_secs, cfg.poll_backoff_max_secs);
         tokio::select! {
-            _ = sleep(TokioDuration::from_secs(cfg.poll_interval_secs)) => {}
+            _ = sleep(TokioDuration::from_secs(delay)) => {}
             _ = wait_true(sd_rx.clone()) => break,
         }
     }
