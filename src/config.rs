@@ -107,7 +107,10 @@ fn d_feature_prompt() -> String {
      3. Stories independentes entre si podem ser implementadas em paralelo \
      com sub-agentes.\n\
      4. Ao concluir cada story: rode os testes relevantes, commite neste \
-     branch com mensagem \"feat: story #<número> [spec-wave-agent]\" e faça push.\n\
+     branch (assunto livre; inclua no RODAPÉ os `git trailer` que o \
+     contexto de `npx spec-wave implement <número>` pedir — \
+     Spec-Wave-Story/Spec-Wave-Tasks/Spec-Wave-Agent, copiados literalmente) \
+     e faça push.\n\
      5. Se uma story falhar, pule as que dependem dela e continue as \
      independentes; ao final, relate o que falhou.\n\
      \n\
@@ -121,8 +124,9 @@ fn d_feature_prompt() -> String {
      MORTOS. Prefira executar cada implement em foreground e aguardar; se \
      usar background, aguarde a conclusão AINDA NESTE turno antes de \
      encerrar.\n\
-     - Commite e pushe cada story assim que concluída (mensagem \
-     \"feat: story #<número> [spec-wave-agent]\").\n\
+     - Commite e pushe cada story assim que concluída, com o rodapé de \
+     trailers que `npx spec-wave implement <número>` pedir no contexto — \
+     não invente formato de assunto, é o rodapé que é conferido.\n\
      - Os cards do board (Etapas) são movidos AUTOMATICAMENTE pelo \
      `spec-wave implement` — não gerencie o board manualmente.\n\
      - SOMENTE quando TODAS as stories estiverem commitadas e pushadas (ou \
