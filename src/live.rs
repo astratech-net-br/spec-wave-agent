@@ -172,7 +172,7 @@ async fn run(url: String, token: String, item: String, mut rx: mpsc::Receiver<St
             Err(tokio_tungstenite::tungstenite::Error::Http(res)) => {
                 let status = res.status().as_u16();
                 // Recusa definitiva: token ruim ou execução que não vale mais.
-                if matches!(status, 400 | 401 | 403 | 409 | 503) {
+                if matches!(status, 400 | 401 | 403 | 409) {
                     tracing::warn!(target: "live", "#{item}: transmissão ao vivo recusada pelo Gateway (HTTP {status}) — o trabalho segue sem ela");
                     while rx.recv().await.is_some() {} // drena até o fim da execução
                     return;
