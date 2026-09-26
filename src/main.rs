@@ -203,15 +203,25 @@ async fn process_issue(
 
     // Transmissão ao vivo para a tela Development (fonte api): melhor esforço,
     // nunca bloqueia o executor (live.rs).
-    let live = api.and_then(|(client, work)| client.start_live(work));
-    let tap = live.as_ref().map(|l| l.tap());
+    // O stream de cada story (spec-wave implement ≥ 1.4) vai para um diretório
+    // por execução, FORA do clone — não pode entrar em commit nenhum.
+    let stream_dir = Path::new(&cfg.workdir).join("streams")
+        .join(api.map(|(_, w)| w.run_id.clone()).unwrap_or_default());
+    let live = api.and_then(|(client, work)| {
+        std::fs::create_dir_all(&stream_dir).ok()?;
+        client.start_live(work, stream_dir.clone())
+    });
+    let hooks = live.as_ref().map(|l| l.hooks());
 
     let outcome = async {
         let workspace = ensure_workspace(cfg, issue).await?;
-        let end = run_item_with_tap(cfg, &workspace.hub, item, lost_rx.clone(), stop_rx, tap).await?;
+        let end = run_item_with_tap(cfg, &workspace.hub, item, lost_rx.clone(), stop_rx, hooks).await?;
         Ok::<_, anyhow::Error>((workspace, end))
     }.await;
-    if let Some(l) = live { l.finish().await; }
+    if let Some(l) = live {
+        l.finish().await;
+        let _ = std::fs::remove_dir_all(&stream_dir);
+    }
     hb.abort();
     forward.abort();
     if let Some(h) = api_hb { h.abort(); }

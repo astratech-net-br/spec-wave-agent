@@ -114,8 +114,8 @@ impl ApiClient {
     }
 
     /// Abre a transmissão ao vivo da execução para o Gateway (live.rs).
-    pub fn start_live(&self, w: &WorkItem) -> Option<crate::live::LiveStream> {
-        crate::live::LiveStream::start(self.live_base.as_deref().unwrap_or(&self.base), &self.token, w)
+    pub fn start_live(&self, w: &WorkItem, stream_dir: std::path::PathBuf) -> Option<crate::live::LiveStream> {
+        crate::live::LiveStream::start(self.live_base.as_deref().unwrap_or(&self.base), &self.token, w, stream_dir)
     }
 
     fn url(&self, path: &str) -> String {
