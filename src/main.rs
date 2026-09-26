@@ -22,7 +22,9 @@ use anyhow::{bail, Result};
 use spec_wave_agent::config::{load_config_from, Config};
 use spec_wave_agent::lease::{Lease, LeaseRepo, RenewError};
 use spec_wave_agent::queue::{self, QueueItem, QueueKind};
-use spec_wave_agent::runner::{checkpoint, ensure_workspace, open_pull_request, run_item, RunEnd};
+use spec_wave_agent::runner::{
+    checkpoint_all, ensure_workspace, open_pull_requests_all, run_item, RunEnd,
+};
 use spec_wave_agent::shell::run;
 use std::collections::HashMap;
 use std::path::Path;
@@ -130,13 +132,13 @@ async fn process_issue(
                              cfg.lease_ttl_secs, lost_tx);
 
     let outcome = async {
-        let ws = ensure_workspace(cfg, issue).await?;
-        let end = run_item(cfg, &ws, item, lost_rx.clone(), shutdown).await?;
-        Ok::<_, anyhow::Error>((ws, end))
+        let workspace = ensure_workspace(cfg, issue).await?;
+        let end = run_item(cfg, &workspace.hub, item, lost_rx.clone(), shutdown).await?;
+        Ok::<_, anyhow::Error>((workspace, end))
     }.await;
     hb.abort();
 
-    let (ws, end) = match outcome {
+    let (workspace, end) = match outcome {
         Ok(v) => v,
         Err(e) => {
             // Falha de infra (workspace/spawn): devolve o lease para não
@@ -147,19 +149,21 @@ async fn process_issue(
             return Err(e);
         }
     };
+    let ws = &workspace.hub; // "gh issue ..." fala do hub — cwd não importa pra esses, qualquer um serviria
 
     let mut failed = false;
     match end {
         RunEnd::Success(result) => {
             // Cinto de segurança: garante push de qualquer resto que o
-            // executor não tenha commitado, antes de sair da fila.
-            checkpoint(&ws, issue, "success").await;
+            // executor não tenha commitado, antes de sair da fila — no hub E
+            // em cada repositório de código que a issue tocou.
+            checkpoint_all(&workspace, issue, "success").await;
             // Num bug, o VALOR do trabalho está na causa raiz: sem publicá-la
             // na issue, ela morre no marker (que nem é commitado) e a próxima
             // pessoa reinvestiga o mesmo defeito.
             if item.kind == QueueKind::Bug {
                 if let Some(body) = render_bug_report(&result, me) {
-                    let _ = run(&ws, "gh",
+                    let _ = run(ws, "gh",
                         &["issue", "comment", &issue.to_string(),
                           "--repo", &cfg.repo, "--body", &body]).await;
                 }
@@ -167,17 +171,18 @@ async fn process_issue(
             // O PR vem DEPOIS do checkpoint (todo o trabalho já está pushado) e
             // ANTES de sair da fila: é ele que dá conteúdo à etapa 👀 Code
             // Review. Sem isso, as Stories chegavam lá e a fila do Tech Leader
-            // mostrava "sem PR" em todas.
-            open_pull_request(&ws, &cfg.repo, issue, cfg.pr_draft).await;
-            let _ = run(&ws, "gh",
+            // mostrava "sem PR" em todas. Um PR por repositório efetivamente
+            // tocado (hub sempre; código de acordo com o que a issue declarou).
+            open_pull_requests_all(&workspace, &cfg.repo, issue, cfg.pr_draft).await;
+            let _ = run(ws, "gh",
                 &["issue", "edit", &issue.to_string(), "--repo", &cfg.repo,
                   "--remove-label", &cfg.queue_label]).await;
             leases.release(issue).await?;
             info!(target: "agent", "{que} #{issue} concluído");
         }
         RunEnd::Failed(reason) => {
-            checkpoint(&ws, issue, "failed").await;
-            let _ = run(&ws, "gh",
+            checkpoint_all(&workspace, issue, "failed").await;
+            let _ = run(ws, "gh",
                 &["issue", "comment", &issue.to_string(), "--repo", &cfg.repo,
                   "--body",
                   &format!("⚠️ Agente `{me}` falhou: {reason}. Checkpoint \
@@ -192,7 +197,7 @@ async fn process_issue(
         RunEnd::Interrupted => {
             // Dev desligando a máquina: checkpoint + release imediato para
             // takeover instantâneo (sem esperar TTL).
-            checkpoint(&ws, issue, "interrupted").await;
+            checkpoint_all(&workspace, issue, "interrupted").await;
             leases.release(issue).await?;
             info!(target: "agent", "issue #{issue} interrompida; lease liberado");
         }

@@ -13,7 +13,20 @@ use tokio::sync::watch;
 use tokio::time::{timeout, Duration as TokioDuration};
 use tracing::{info, warn};
 
-pub async fn ensure_workspace(cfg: &Config, issue: u64) -> Result<PathBuf> {
+/// Workspace completo de uma issue: o hub (sempre) e os repositórios de
+/// código que ela declara (RFC-005 §6.3/§7.2 — "N clones" no lugar de um só).
+pub struct Workspace {
+    pub hub: PathBuf,
+    pub code_repos: Vec<CodeRepoWorkspace>,
+}
+
+pub struct CodeRepoWorkspace {
+    /// "owner/repo", para `--repo` do `gh`.
+    pub repo: String,
+    pub dir: PathBuf,
+}
+
+pub async fn ensure_workspace(cfg: &Config, issue: u64) -> Result<Workspace> {
     let ws = PathBuf::from(&cfg.workdir).join(format!("issue-{issue}"));
     let url = cfg.remote_url();
     if !ws.join(".git").exists() {
@@ -34,25 +47,104 @@ pub async fn ensure_workspace(cfg: &Config, issue: u64) -> Result<PathBuf> {
             }
         }).await?;
     }
+    ensure_branch(&ws, issue).await?;
 
-    // Retomada: se o branch de trabalho já existe no remoto (outro agente
-    // começou e caiu), continua dele; senão cria a partir do default.
+    // RFC-005 §6.3/§7.2: repositórios de código que a issue declara (labels
+    // `repo:<slug>`; uma Feature agrega os das Stories). Reusa o `workspace
+    // prepare` da CLI — a resolução slug→repo (via .spec-wave.json do hub) e
+    // a convenção de clone já estão lá, testadas; reimplementar em Rust
+    // duplicaria a mesma lógica em duas linguagens, com risco real de
+    // divergir (achado da migração RFC-005 do lado spec-wave-ui/sandbox).
+    let code_repos = prepare_code_repos(&ws, issue).await?;
+
+    Ok(Workspace { hub: ws, code_repos })
+}
+
+/// Retomada: se o branch de trabalho já existe no remoto (outro agente
+/// começou e caiu, ou é a segunda+ chamada desta função), continua dele;
+/// senão cria a partir do default e empurra na hora — mesma lógica pro hub e
+/// pra cada repositório de código (extraída daqui, ver `ensure_workspace` e
+/// `prepare_code_repos`).
+async fn ensure_branch(dir: &Path, issue: u64) -> Result<()> {
     let branch = work_branch(issue);
-    let remote = run(&ws, "git",
+    let remote = run(dir, "git",
                      &["ls-remote", "--exit-code", "origin",
                        &format!("refs/heads/{branch}")]).await?;
     if remote.ok {
-        run_ok(&ws, "git", &["checkout", "-B", &branch,
+        run_ok(dir, "git", &["checkout", "-B", &branch,
                              &format!("origin/{branch}")]).await?;
-        info!(target: "ws", "retomando branch existente {branch}");
+        info!(target: "ws", "retomando branch existente {branch} em {}", dir.display());
     } else {
-        let head = run_ok(&ws, "git",
+        let head = run_ok(dir, "git",
             &["symbolic-ref", "refs/remotes/origin/HEAD", "--short"]).await
             .unwrap_or_else(|_| "origin/main".into());
-        run_ok(&ws, "git", &["checkout", "-B", &branch, head.trim()]).await?;
-        run_ok(&ws, "git", &["push", "--quiet", "-u", "origin", &branch]).await?;
+        run_ok(dir, "git", &["checkout", "-B", &branch, head.trim()]).await?;
+        run_ok(dir, "git", &["push", "--quiet", "-u", "origin", &branch]).await?;
     }
-    Ok(ws)
+    Ok(())
+}
+
+/// Saída de `spec-wave workspace prepare --issue <n> --json` que interessa
+/// aqui — o resto (`workspaceDir`, `cloned`, `missing`...) é só para quem
+/// pede legibilidade humana.
+#[derive(Debug, serde::Deserialize)]
+struct WorkspacePrepareOutput {
+    repos: Vec<WorkspacePrepareRepo>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct WorkspacePrepareRepo {
+    #[allow(dead_code)]
+    slug: String,
+    #[allow(dead_code)]
+    owner: String,
+    repo: String,
+    dir: String,
+}
+
+/// Chama a CLI pra resolver e clonar os repositórios de código da issue, e
+/// garante o branch de trabalho em cada um (a CLI clona no default branch —
+/// quem commita ali por cima de uma sessão do agente é este passo).
+///
+/// Sem `.spec-wave.json` no hub, nem tenta: é um hub anterior à RFC-005 (ou
+/// um fixture de teste sem contexto de CLI nenhum), e mono-repo é o caso
+/// degenerado por desenho — `spec-wave workspace prepare` recusaria de
+/// qualquer jeito ("rode dentro do hub"). Com `.spec-wave.json` presente, uma
+/// falha de verdade (rede, repo declarado inacessível) SOBE — silenciar ali
+/// esconderia a issue chegando com código faltando, sem aviso nenhum.
+async fn prepare_code_repos(hub: &Path, issue: u64) -> Result<Vec<CodeRepoWorkspace>> {
+    if !hub.join(".spec-wave.json").exists() {
+        return Ok(Vec::new());
+    }
+    let out = run_ok(hub, "npx",
+        &["spec-wave", "workspace", "prepare", "--issue", &issue.to_string(), "--json"])
+        .await
+        .context("`spec-wave workspace prepare` falhou")?;
+    let parsed: WorkspacePrepareOutput = serde_json::from_str(out.trim())
+        .with_context(|| format!("`spec-wave workspace prepare --json`: saída inesperada: {out:?}"))?;
+    let mut code_repos = Vec::with_capacity(parsed.repos.len());
+    for r in parsed.repos {
+        let dir = PathBuf::from(&r.dir);
+        ensure_branch(&dir, issue).await
+            .with_context(|| format!("branch de trabalho em {} ({})", r.repo, dir.display()))?;
+        code_repos.push(CodeRepoWorkspace { repo: r.repo, dir });
+    }
+    Ok(code_repos)
+}
+
+/// Há commits no branch de trabalho que não estão no branch default deste
+/// repositório — só então vale abrir PR ou fazer checkpoint de verdade. Sem
+/// isto, TODO repositório de código vinculado ganharia um PR vazio a cada
+/// issue, mesmo o que a Feature nunca tocou (RFC-005 §6.3: "N PRs" não é
+/// "sempre N", é "um por repositório efetivamente tocado").
+pub async fn has_unmerged_commits(dir: &Path) -> bool {
+    let default = run_ok(dir, "git",
+        &["symbolic-ref", "refs/remotes/origin/HEAD", "--short"]).await
+        .unwrap_or_else(|_| "origin/main".into());
+    match run(dir, "git", &["rev-list", "--count", &format!("{}..HEAD", default.trim())]).await {
+        Ok(o) if o.ok => o.stdout.trim().parse::<u64>().unwrap_or(0) > 0,
+        _ => false,
+    }
 }
 
 /// Nome do branch de trabalho de uma issue.
@@ -74,15 +166,21 @@ pub fn work_branch(issue: u64) -> String {
 ///
 /// Sem palavra-chave de fechamento (`Closes`/`Fixes`) no corpo: o merge não
 /// encerra o item — ele ainda percorre QA, Homologação e Deploy no board.
-pub async fn open_pull_request(ws: &Path, repo: &str, issue: u64, draft: bool) {
+///
+/// `pr_repo` é onde o PR nasce; `hub_repo` é onde a issue #{issue} vive — nos
+/// repositórios de código de uma sessão multi-repo (RFC-005 §6.3) os dois
+/// divergem, e a referência no corpo/título precisa da forma qualificada
+/// (`owner/repo#N`), porque `#{issue}` sozinho num repo de código resolveria
+/// (se resolvesse) para uma issue LOCAL daquele repo, não a do hub.
+pub async fn open_pull_request(ws: &Path, pr_repo: &str, hub_repo: &str, issue: u64, draft: bool) {
     let branch = work_branch(issue);
     // Idempotência: relançamento após rodada incompleta, ou takeover por outro
     // agente, não podem gerar um segundo PR do mesmo branch.
-    if let Ok(existing) = run(ws, "gh", &["pr", "list", "--repo", repo, "--head", &branch,
+    if let Ok(existing) = run(ws, "gh", &["pr", "list", "--repo", pr_repo, "--head", &branch,
                                           "--state", "open", "--json", "number",
                                           "--jq", ".[].number"]).await {
         if existing.ok && !existing.stdout.trim().is_empty() {
-            info!(target: "agent", "PR do #{issue} já existe (#{}) — nada a fazer",
+            info!(target: "agent", "PR do #{issue} já existe em {pr_repo} (#{}) — nada a fazer",
                   existing.stdout.trim());
             return;
         }
@@ -90,30 +188,53 @@ pub async fn open_pull_request(ws: &Path, repo: &str, issue: u64, draft: bool) {
     // Título da issue: um PR chamado "agent/issue-18" não diz nada em uma fila
     // de revisão. Falha de rede aqui não impede o PR — cai no genérico.
     let title = match run(ws, "gh", &["issue", "view", &issue.to_string(),
-                                      "--repo", repo, "--json", "title",
+                                      "--repo", hub_repo, "--json", "title",
                                       "--jq", ".title"]).await {
         Ok(o) if o.ok && !o.stdout.trim().is_empty() => o.stdout.trim().to_string(),
-        _ => format!("Implementação da issue #{issue}"),
+        _ => format!("Implementação da issue {hub_repo}#{issue}"),
     };
     let body = format!(
-        "Implementa a issue #{issue}.\n\n\
+        "Implementa a issue {hub_repo}#{issue}.\n\n\
          Branch de trabalho do `spec-wave-agent`, com um commit por Story.\n\n\
          O merge **não** encerra a issue: ela segue por QA, Homologação e Deploy \
          no board."
     );
-    let mut args = vec!["pr", "create", "--repo", repo, "--head", &branch,
+    let mut args = vec!["pr", "create", "--repo", pr_repo, "--head", &branch,
                         "--title", &title, "--body", &body];
     if draft {
         args.push("--draft");
     }
     match run(ws, "gh", &args).await {
-        Ok(o) if o.ok => info!(target: "agent", "PR aberto: {}", o.stdout.trim()),
+        Ok(o) if o.ok => info!(target: "agent", "PR aberto em {pr_repo}: {}", o.stdout.trim()),
         Ok(o) => warn!(target: "agent",
-            "não foi possível abrir o PR do #{issue} (abra à mão a partir de \
+            "não foi possível abrir o PR do #{issue} em {pr_repo} (abra à mão a partir de \
              {branch}): {}", o.stderr.trim()),
         Err(e) => warn!(target: "agent",
-            "não foi possível abrir o PR do #{issue} (abra à mão a partir de \
+            "não foi possível abrir o PR do #{issue} em {pr_repo} (abra à mão a partir de \
              {branch}): {e:#}"),
+    }
+}
+
+/// Checkpoint do hub e de cada repositório de código — mesmo cinto de
+/// segurança do hub (garante push de qualquer resto não commitado),
+/// estendido pra todo repositório que a issue pode ter tocado.
+pub async fn checkpoint_all(workspace: &Workspace, issue: u64, label: &str) {
+    checkpoint(&workspace.hub, issue, label).await;
+    for cr in &workspace.code_repos {
+        checkpoint(&cr.dir, issue, label).await;
+    }
+}
+
+/// Abre o PR do hub (sempre, como já era) e, de cada repositório de código,
+/// só o que tem commit de verdade no branch de trabalho (RFC-005 §6.3:
+/// "N PRs" é um por repositório EFETIVAMENTE tocado, não todo repositório
+/// vinculado ao Project).
+pub async fn open_pull_requests_all(workspace: &Workspace, hub_repo: &str, issue: u64, draft: bool) {
+    open_pull_request(&workspace.hub, hub_repo, hub_repo, issue, draft).await;
+    for cr in &workspace.code_repos {
+        if has_unmerged_commits(&cr.dir).await {
+            open_pull_request(&cr.dir, &cr.repo, hub_repo, issue, draft).await;
+        }
     }
 }
 
@@ -553,6 +674,39 @@ mod tests {
 
     fn render(line: &str) -> Option<String> {
         render_out_line(line)
+    }
+
+    /// Contrato com `spec-wave workspace prepare --json` (commands/workspace.mjs
+    /// `emit()`, spec-wave-cli) — campos extras (workspaceDir, cloned, missing...)
+    /// não usados aqui são ignorados por padrão (sem `deny_unknown_fields`), então
+    /// o formato pode crescer do lado da CLI sem quebrar o parse.
+    #[test]
+    fn parseia_a_saida_do_workspace_prepare() {
+        let raw = r#"{
+            "issue": 7, "dryRun": false,
+            "workspaceDir": "/home/dev/proj", "hubDir": "/home/dev/proj/hub",
+            "repos": [
+                {"slug": "api", "owner": "acme", "repo": "acme/api",
+                 "dir": "/home/dev/proj/api", "source": "clone", "present": true},
+                {"slug": "web", "owner": "acme", "repo": "acme/web",
+                 "dir": "/home/dev/proj/web", "source": "sibling", "present": true}
+            ],
+            "repoDirs": "api=/home/dev/proj/api web=/home/dev/proj/web",
+            "cloned": ["api"], "missing": []
+        }"#;
+        let parsed: WorkspacePrepareOutput = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.repos.len(), 2);
+        assert_eq!(parsed.repos[0].repo, "acme/api");
+        assert_eq!(parsed.repos[0].dir, "/home/dev/proj/api");
+        assert_eq!(parsed.repos[1].repo, "acme/web");
+    }
+
+    #[test]
+    fn workspace_prepare_sem_code_repos_devolve_lista_vazia() {
+        let raw = r#"{"issue": 7, "dryRun": false, "workspaceDir": "/p", "hubDir": "/p/hub",
+                       "repos": [], "repoDirs": "", "cloned": [], "missing": []}"#;
+        let parsed: WorkspacePrepareOutput = serde_json::from_str(raw).unwrap();
+        assert!(parsed.repos.is_empty());
     }
 
     #[test]
