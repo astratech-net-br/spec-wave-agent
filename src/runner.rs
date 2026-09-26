@@ -353,10 +353,28 @@ fn render_out_line(line: &str) -> Option<String> {
     }
 }
 
+/// Uma linha de saída para a transmissão ao vivo. `origin`: None = o
+/// orquestrador (stdout do executor); `Some("story:<n>")` = o agente interno de
+/// uma story, lido do arquivo que o `spec-wave implement` grava (P24).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveLine {
+    pub origin: Option<String>,
+    pub line: String,
+}
+
 /// Canal opcional que recebe cada linha crua do stdout do executor — a
 /// transmissão ao vivo (live.rs) lê daqui. `try_send`: cheio, descarta; o
 /// executor nunca espera por quem assiste.
-pub type LineTap = tokio::sync::mpsc::Sender<String>;
+pub type LineTap = tokio::sync::mpsc::Sender<LiveLine>;
+
+/// Ganchos da transmissão ao vivo para o executor: o canal das linhas e o
+/// diretório onde o `spec-wave implement` grava o stream de cada story
+/// (vira SPEC_WAVE_STREAM_DIR no ambiente do executor).
+#[derive(Debug, Clone)]
+pub struct LiveHooks {
+    pub tap: LineTap,
+    pub stream_dir: PathBuf,
+}
 
 async fn stream_lines<R>(reader: R, issue: u64, stream: &'static str, tap: Option<LineTap>)
 where
@@ -366,7 +384,7 @@ where
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         if let Some(t) = &tap {
-            let _ = t.try_send(line.clone());
+            let _ = t.try_send(LiveLine { origin: None, line: line.clone() });
         }
         if stream == "out" {
             if let Some(msg) = render_out_line(&line) {
@@ -522,7 +540,7 @@ async fn executor_round(
     cfg: &Config, ws: &Path, item: QueueItem,
     mut lease_lost: watch::Receiver<bool>,
     mut shutdown: watch::Receiver<bool>,
-    tap: Option<LineTap>,
+    live: Option<LiveHooks>,
 ) -> Result<RoundEnd> {
     let issue = item.number;
     let (command, prompt_tpl, timeout_secs) = match item.kind {
@@ -541,6 +559,10 @@ async fn executor_round(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // O `spec-wave implement` (≥ 1.4) grava ali o stream de cada story.
+    if let Some(h) = &live {
+        cmd.env("SPEC_WAVE_STREAM_DIR", &h.stream_dir);
+    }
     #[cfg(unix)]
     cmd.process_group(0); // líder de grupo => kill_tree pega a árvore toda
     let mut child = cmd.spawn()
@@ -558,7 +580,7 @@ async fn executor_round(
     // Os handles saem do child via take(), então kill_tree nos braços
     // abaixo continua imediato — fencing não espera os readers.
     let out_task = child.stdout.take()
-        .map(|s| tokio::spawn(stream_lines(s, issue, "out", tap)));
+        .map(|s| tokio::spawn(stream_lines(s, issue, "out", live.map(|h| h.tap))));
     let err_task = child.stderr.take()
         .map(|s| tokio::spawn(stream_lines(s, issue, "err", None)));
 
@@ -646,19 +668,19 @@ pub async fn run_item(
     run_item_with_tap(cfg, ws, item, lease_lost, shutdown, None).await
 }
 
-/// `run_item` com a saída do executor copiada para `tap` (transmissão ao vivo).
+/// `run_item` com a saída do executor copiada para a transmissão ao vivo.
 pub async fn run_item_with_tap(
     cfg: &Config, ws: &Path, item: QueueItem,
     lease_lost: watch::Receiver<bool>,
     shutdown: watch::Receiver<bool>,
-    tap: Option<LineTap>,
+    live: Option<LiveHooks>,
 ) -> Result<RunEnd> {
     let issue = item.number;
     let mut no_progress = 0u32;
     for round in 1..=cfg.max_executor_rounds {
         let head_before = head_sha(ws).await;
         let end = executor_round(cfg, ws, item,
-                                 lease_lost.clone(), shutdown.clone(), tap.clone()).await?;
+                                 lease_lost.clone(), shutdown.clone(), live.clone()).await?;
         match end {
             RoundEnd::Success(r) => return Ok(RunEnd::Success(r)),
             RoundEnd::Failed(r) => return Ok(RunEnd::Failed(r)),

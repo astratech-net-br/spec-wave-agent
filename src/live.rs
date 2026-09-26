@@ -11,10 +11,14 @@
 //! mensagens.
 
 use crate::api::WorkItem;
+use crate::runner::{LiveHooks, LiveLine};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -94,6 +98,76 @@ pub fn normalize(line: &str) -> Vec<Frame> {
     }
 }
 
+/// `normalize` de uma linha com origem. Linhas de uma story (`story:<n>`)
+/// levam a origem dentro do payload — a tela separa a sessão por story — e não
+/// emitem `result` nem `delta`: o resultado de uma story não é o fim da sessão,
+/// e o texto parcial dela se misturaria ao do orquestrador.
+pub fn normalize_line(l: &LiveLine) -> Vec<Frame> {
+    let frames = normalize(&l.line);
+    let Some(origin) = &l.origin else { return frames };
+    frames
+        .into_iter()
+        .filter(|f| f.kind == "session.message")
+        .map(|mut f| {
+            if let Some(inner) = f.payload.get_mut("payload").and_then(Value::as_object_mut) {
+                inner.insert("origin".into(), json!(origin));
+            }
+            f
+        })
+        .collect()
+}
+
+/// Nome do arquivo de stream de uma story → origem (`story-92.jsonl` → `story:92`).
+fn origin_of(file: &Path) -> Option<String> {
+    let name = file.file_name()?.to_str()?;
+    let n = name.strip_prefix("story-")?.strip_suffix(".jsonl")?;
+    (!n.is_empty() && n.chars().all(|c| c.is_ascii_digit())).then(|| format!("story:{n}"))
+}
+
+/// Uma passada pelos arquivos de story: manda as linhas COMPLETAS novas desde a
+/// última leitura. Linha sem `\n` ainda está sendo escrita — fica para a
+/// próxima passada.
+fn scan_stories(dir: &Path, offsets: &mut HashMap<PathBuf, u64>, tx: &mpsc::Sender<LiveLine>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut files: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    files.sort();
+    for file in files {
+        let Some(origin) = origin_of(&file) else { continue };
+        let offset = offsets.entry(file.clone()).or_insert(0);
+        let Ok(mut f) = std::fs::File::open(&file) else { continue };
+        if f.seek(SeekFrom::Start(*offset)).is_err() {
+            continue;
+        }
+        // Em bytes: um caractere multibyte cortado no fim (linha ainda sendo
+        // escrita) ou um byte inválido não pode travar o arquivo inteiro.
+        let mut buf = Vec::new();
+        if f.read_to_end(&mut buf).is_err() {
+            continue;
+        }
+        let Some(end) = buf.iter().rposition(|&b| b == b'\n') else { continue };
+        for line in String::from_utf8_lossy(&buf[..end]).lines() {
+            let _ = tx.try_send(LiveLine { origin: Some(origin.clone()), line: line.to_string() });
+        }
+        *offset += (end + 1) as u64;
+    }
+}
+
+/// Acompanha o diretório de stream das stories até `stop`, com uma passada
+/// final para não perder o fim da última story.
+async fn tail_stories(dir: PathBuf, tx: mpsc::Sender<LiveLine>, mut stop: watch::Receiver<bool>) {
+    let mut offsets = HashMap::new();
+    let mut tick = interval(Duration::from_millis(500));
+    loop {
+        tokio::select! {
+            _ = tick.tick() => scan_stories(&dir, &mut offsets, &tx),
+            _ = stop.changed() => {
+                scan_stories(&dir, &mut offsets, &tx);
+                return;
+            }
+        }
+    }
+}
+
 /// URL do produtor no Gateway, derivada da `api_url`: o Gateway fica atrás do
 /// mesmo domínio (o CloudFront manda `/ws/*` para ele).
 pub fn producer_url(api_url: &str, w: &WorkItem) -> Option<String> {
@@ -125,25 +199,35 @@ fn envelope(kind: &str, payload: &Value, seq: u64) -> String {
 /// Transmissão de UMA execução. Mande as linhas cruas de stdout do executor
 /// em `tap()`; ao terminar a execução, `finish()`.
 pub struct LiveStream {
-    tx: mpsc::Sender<String>,
+    tx: mpsc::Sender<LiveLine>,
     task: JoinHandle<()>,
+    stream_dir: PathBuf,
+    tail: JoinHandle<()>,
+    stop_tail: watch::Sender<bool>,
 }
 
 impl LiveStream {
-    pub fn start(api_url: &str, token: &str, work: &WorkItem) -> Option<LiveStream> {
+    /// `stream_dir`: onde o `spec-wave implement` grava o stream de cada story
+    /// (o executor recebe o caminho em SPEC_WAVE_STREAM_DIR).
+    pub fn start(api_url: &str, token: &str, work: &WorkItem, stream_dir: PathBuf) -> Option<LiveStream> {
         let url = producer_url(api_url, work)?;
         let (tx, rx) = mpsc::channel(QUEUE);
         let task = tokio::spawn(run(url, token.to_string(), work.work_item.clone(), rx));
-        Some(LiveStream { tx, task })
+        let (stop_tail, stop_rx) = watch::channel(false);
+        let tail = tokio::spawn(tail_stories(stream_dir.clone(), tx.clone(), stop_rx));
+        Some(LiveStream { tx, task, stream_dir, tail, stop_tail })
     }
 
-    /// Canal para o runner. `try_send`: cheio = descarta, nunca espera.
-    pub fn tap(&self) -> mpsc::Sender<String> {
-        self.tx.clone()
+    /// Ganchos para o runner. `try_send`: cheio = descarta, nunca espera.
+    pub fn hooks(&self) -> LiveHooks {
+        LiveHooks { tap: self.tx.clone(), stream_dir: self.stream_dir.clone() }
     }
 
-    /// Fecha o canal e dá um instante para o resto sair; depois encerra.
+    /// Lê o fim das stories, fecha o canal e dá um instante para o resto sair;
+    /// depois encerra.
     pub async fn finish(self) {
+        let _ = self.stop_tail.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(3), self.tail).await;
         drop(self.tx);
         let mut task = self.task;
         if tokio::time::timeout(Duration::from_secs(5), &mut task).await.is_err() {
@@ -152,10 +236,10 @@ impl LiveStream {
     }
 }
 
-async fn run(url: String, token: String, item: String, mut rx: mpsc::Receiver<String>) {
+async fn run(url: String, token: String, item: String, mut rx: mpsc::Receiver<LiveLine>) {
     let mut backoff = Duration::from_secs(1);
     let mut seq: u64 = 0;
-    let mut pending: Option<String> = None; // linha lida mas não enviada (queda no meio)
+    let mut pending: Option<LiveLine> = None; // linha lida mas não enviada (queda no meio)
     loop {
         let mut req = match url.as_str().into_client_request() {
             Ok(r) => r,
@@ -225,7 +309,7 @@ async fn run(url: String, token: String, item: String, mut rx: mpsc::Receiver<St
             };
             let Some(line) = line else { continue };
             let mut dropped = false;
-            for f in normalize(&line) {
+            for f in normalize_line(&line) {
                 seq += 1;
                 if sink.send(Message::Text(envelope(f.kind, &f.payload, seq).into())).await.is_err() {
                     dropped = true;
@@ -244,7 +328,7 @@ async fn run(url: String, token: String, item: String, mut rx: mpsc::Receiver<St
 
 /// Espera o backoff. Enquanto espera, o canal continua enchendo (até o teto).
 /// false = a execução acabou (canal fechado) e não há por que reconectar.
-async fn wait_or_end(rx: &mut mpsc::Receiver<String>, backoff: &mut Duration) -> bool {
+async fn wait_or_end(rx: &mut mpsc::Receiver<LiveLine>, backoff: &mut Duration) -> bool {
     sleep(*backoff).await;
     *backoff = (*backoff * 2).min(Duration::from_secs(30));
     !rx.is_closed() || !rx.is_empty()
@@ -294,6 +378,45 @@ mod tests {
 
         let d = normalize(r#"{"type":"stream_event","event":{"delta":{"type":"text_delta","text":"parc"}}}"#);
         assert_eq!(d, vec![Frame { kind: "session.delta", payload: json!({ "text": "parc" }) }]);
+    }
+
+    #[test]
+    fn linha_de_story_leva_a_origem_e_nao_encerra_a_sessao() {
+        let story = |line: &str| LiveLine { origin: Some("story:92".into()), line: line.into() };
+        let m = normalize_line(&story(r#"{"type":"assistant","message":{"content":[]}}"#));
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].payload["payload"]["origin"], "story:92");
+        // result e delta de uma story não viram frames (não são o fim da sessão).
+        assert!(normalize_line(&story(r#"{"type":"result","subtype":"success"}"#)).is_empty());
+        assert!(normalize_line(&story(r#"{"type":"stream_event","event":{"delta":{"type":"text_delta","text":"x"}}}"#)).is_empty());
+        // Do orquestrador (sem origem), nada muda.
+        let orq = LiveLine { origin: None, line: r#"{"type":"result","subtype":"success"}"#.into() };
+        assert_eq!(normalize_line(&orq)[0].kind, "session.result");
+    }
+
+    #[test]
+    fn acompanha_so_linhas_completas_de_cada_story() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut offsets = HashMap::new();
+        std::fs::write(dir.path().join("story-92.jsonl"), "{\"a\":1}\n{\"b\"").unwrap();
+        std::fs::write(dir.path().join("outro.txt"), "ignorar\n").unwrap();
+        scan_stories(dir.path(), &mut offsets, &tx);
+        let first = rx.try_recv().unwrap();
+        assert_eq!(first, LiveLine { origin: Some("story:92".into()), line: "{\"a\":1}".into() });
+        assert!(rx.try_recv().is_err(), "linha incompleta espera a próxima passada");
+        // A linha termina de ser escrita: sai na próxima passada, sem repetir a primeira.
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(dir.path().join("story-92.jsonl")).unwrap();
+        f.write_all(b":2}\n").unwrap();
+        scan_stories(dir.path(), &mut offsets, &tx);
+        assert_eq!(rx.try_recv().unwrap().line, "{\"b\":2}");
+        assert!(rx.try_recv().is_err());
+        // Byte inválido não trava o arquivo: sai com substituição e segue.
+        f.write_all(b"{\"c\":\"\xff\"}\n{\"d\":1}\n").unwrap();
+        scan_stories(dir.path(), &mut offsets, &tx);
+        assert_eq!(rx.try_recv().unwrap().line, "{\"c\":\"\u{fffd}\"}");
+        assert_eq!(rx.try_recv().unwrap().line, "{\"d\":1}");
     }
 
     #[test]

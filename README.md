@@ -332,7 +332,12 @@ O que muda em relação à fonte por label:
   leitura), para qualquer pessoa do tenant. É melhor esforço: sem Gateway, com
   rede ruim ou recusado, o trabalho segue igual e o drawer fica sem mensagens.
   O endereço do Gateway sai do `api_url` (o CloudFront manda `/ws/*` para ele);
-  `live_url` sobrescreve quando o Gateway está em outro host.
+  `live_url` sobrescreve quando o Gateway está em outro host. **Cada story ao
+  vivo** exige o `spec-wave` CLI ≥ 1.4: o agente define `SPEC_WAVE_STREAM_DIR`
+  para o executor, o `spec-wave implement` grava ali o stream do agente
+  interno de cada story (`story-<n>.jsonl`), e o agente o retransmite com a
+  origem — o drawer separa a sessão por story. Com CLI mais antigo, o drawer
+  mostra só o orquestrador.
 - **Lease igual.** A API diz o que fazer; o lease em git ref continua sendo o
   que garante um dono por vez (inclusive entre duas máquinas suas).
 - **User-Agent.** O agente se identifica como `spec-wave-agent/<versão>`; o
