@@ -218,10 +218,9 @@ async fn process_issue(
         let end = run_item_with_tap(cfg, &workspace.hub, item, lost_rx.clone(), stop_rx, hooks).await?;
         Ok::<_, anyhow::Error>((workspace, end))
     }.await;
-    if let Some(l) = live {
-        l.finish().await;
-        let _ = std::fs::remove_dir_all(&stream_dir);
-    }
+    if let Some(l) = live { l.finish().await; }
+    // Mesmo sem transmissão (o Gateway não abriu), o diretório pode ter sido criado.
+    if api.is_some() { let _ = std::fs::remove_dir_all(&stream_dir); }
     hb.abort();
     forward.abort();
     if let Some(h) = api_hb { h.abort(); }

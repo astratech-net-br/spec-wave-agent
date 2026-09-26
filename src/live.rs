@@ -138,12 +138,14 @@ fn scan_stories(dir: &Path, offsets: &mut HashMap<PathBuf, u64>, tx: &mpsc::Send
         if f.seek(SeekFrom::Start(*offset)).is_err() {
             continue;
         }
-        let mut buf = String::new();
-        if f.read_to_string(&mut buf).is_err() {
+        // Em bytes: um caractere multibyte cortado no fim (linha ainda sendo
+        // escrita) ou um byte inválido não pode travar o arquivo inteiro.
+        let mut buf = Vec::new();
+        if f.read_to_end(&mut buf).is_err() {
             continue;
         }
-        let Some(end) = buf.rfind('\n') else { continue };
-        for line in buf[..end].lines() {
+        let Some(end) = buf.iter().rposition(|&b| b == b'\n') else { continue };
+        for line in String::from_utf8_lossy(&buf[..end]).lines() {
             let _ = tx.try_send(LiveLine { origin: Some(origin.clone()), line: line.to_string() });
         }
         *offset += (end + 1) as u64;
@@ -410,6 +412,11 @@ mod tests {
         scan_stories(dir.path(), &mut offsets, &tx);
         assert_eq!(rx.try_recv().unwrap().line, "{\"b\":2}");
         assert!(rx.try_recv().is_err());
+        // Byte inválido não trava o arquivo: sai com substituição e segue.
+        f.write_all(b"{\"c\":\"\xff\"}\n{\"d\":1}\n").unwrap();
+        scan_stories(dir.path(), &mut offsets, &tx);
+        assert_eq!(rx.try_recv().unwrap().line, "{\"c\":\"\u{fffd}\"}");
+        assert_eq!(rx.try_recv().unwrap().line, "{\"d\":1}");
     }
 
     #[test]
