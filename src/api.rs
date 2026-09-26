@@ -92,6 +92,7 @@ pub struct ApiClient {
     base: String,
     token: String,
     host: String,
+    live_base: Option<String>,
     http: reqwest::Client,
 }
 
@@ -108,7 +109,13 @@ impl ApiClient {
             .timeout(Duration::from_secs(20))
             .build()?;
         let host = if me.contains('@') { me.to_string() } else { format!("{me}@{}", hostname()) };
-        Ok(ApiClient { base: base.trim_end_matches('/').to_string(), token, host, http })
+        let live_base = cfg.live_url.as_deref().map(str::trim).filter(|u| !u.is_empty()).map(str::to_string);
+        Ok(ApiClient { base: base.trim_end_matches('/').to_string(), token, host, live_base, http })
+    }
+
+    /// Abre a transmissão ao vivo da execução para o Gateway (live.rs).
+    pub fn start_live(&self, w: &WorkItem) -> Option<crate::live::LiveStream> {
+        crate::live::LiveStream::start(self.live_base.as_deref().unwrap_or(&self.base), &self.token, w)
     }
 
     fn url(&self, path: &str) -> String {

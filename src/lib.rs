@@ -4,6 +4,7 @@
 pub mod api;
 pub mod config;
 pub mod lease;
+pub mod live;
 pub mod queue;
 pub mod runner;
 pub mod shell;
