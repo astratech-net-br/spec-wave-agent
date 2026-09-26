@@ -17,9 +17,15 @@
 //!     fila (re-poll fresco) para tentar obter a próxima.
 //!
 //! Autenticação: usa o `git`/`gh` já configurados na máquina do dev.
+//!
+//! Fonte de trabalho (`source` na config): `github-label` (default, a fila de
+//! labels acima) ou `api` — os despachos da tela Development do spec-wave para
+//! o login do dono do token de agente, em qualquer produto do tenant
+//! (RFC-008 fase 2). O lease, o executor e o checkpoint são os mesmos.
 
 use anyhow::{bail, Result};
-use spec_wave_agent::config::{load_config_from, Config};
+use spec_wave_agent::api::{queue_item_of, ApiClient, Outcome, WorkItem};
+use spec_wave_agent::config::{load_config_from, Config, Source};
 use spec_wave_agent::lease::{Lease, LeaseRepo, RenewError};
 use spec_wave_agent::queue::{self, QueueItem, QueueKind};
 use spec_wave_agent::runner::{
@@ -28,6 +34,8 @@ use spec_wave_agent::runner::{
 use spec_wave_agent::shell::run;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio::time::{sleep, Duration as TokioDuration};
@@ -111,11 +119,55 @@ fn spawn_heartbeat(
 #[derive(Debug, Clone, Copy)]
 struct Attempt { claimed: bool, failed: bool }
 
+/// Heartbeat para a API do spec-wave (`source = "api"`), em paralelo ao do
+/// lease. O primeiro sai na hora — é ele que tira o card de "Aguardando
+/// agente". Se a API disser que o despacho não vale mais (cancelado, refeito
+/// ou redirecionado), marca `cancelled` e dispara `stop`: o executor para, o
+/// trabalho vai para o branch em checkpoint e o lease é liberado.
+///
+/// Falha de rede NÃO para o trabalho: a correção está no lease, a API é
+/// informativa — o kanban só mostra "sem sinal" até o próximo heartbeat.
+fn spawn_api_heartbeat(
+    api: ApiClient, work: WorkItem, every_secs: u64,
+    stop: Arc<watch::Sender<bool>>, cancelled: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match api.heartbeat(&work).await {
+                Ok(reply) if !reply.keep_going => {
+                    let why = reply.reason.unwrap_or_else(|| "o despacho mudou".into());
+                    info!(target: "api", "#{}: parando — {why}", work.work_item);
+                    cancelled.store(true, Ordering::SeqCst);
+                    let _ = stop.send(true);
+                    return;
+                }
+                Ok(_) => {}
+                Err(e) => warn!(target: "api", "#{}: heartbeat falhou: {e:#}", work.work_item),
+            }
+            sleep(TokioDuration::from_secs(every_secs)).await;
+        }
+    })
+}
+
+/// Reporta o desfecho à API quando o item veio dela. Best-effort: o trabalho
+/// já está pushado; um erro aqui vira aviso, não derruba o loop.
+async fn report(api: Option<(&ApiClient, &WorkItem)>, outcome: Outcome) {
+    if let Some((client, work)) = api {
+        if let Err(e) = client.report(work, &outcome).await {
+            warn!(target: "api", "#{}: não deu para reportar o desfecho: {e:#}", work.work_item);
+        }
+    }
+}
+
 /// Processa uma issue. `claimed` = este agente pegou a issue (e portanto a
 /// fila deve ser re-consultada fresca); false = outro agente ficou com ela.
+///
+/// `api`: presente quando o item veio da API do spec-wave. Muda só a borda —
+/// heartbeat e desfecho vão para a API em vez de labels no GitHub.
 async fn process_issue(
     cfg: &Config, leases: &LeaseRepo, me: &str, item: QueueItem,
     shutdown: watch::Receiver<bool>,
+    api: Option<(&ApiClient, &WorkItem)>,
 ) -> Result<Attempt> {
     let issue = item.number;
     // "bug"/"feature" nas mensagens: com dois tipos na fila, um log que diz só
@@ -131,12 +183,32 @@ async fn process_issue(
     let hb = spawn_heartbeat(leases.clone(), lease, cfg.heartbeat_secs,
                              cfg.lease_ttl_secs, lost_tx);
 
+    // `stop` junta o shutdown do processo e o cancelamento vindo da API: para o
+    // executor os dois são a mesma coisa (checkpoint + release).
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let stop_tx = Arc::new(stop_tx);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let forward = {
+        let stop_tx = stop_tx.clone();
+        let mut shutdown = shutdown;
+        tokio::spawn(async move {
+            while !*shutdown.borrow() {
+                if shutdown.changed().await.is_err() { return; }
+            }
+            let _ = stop_tx.send(true);
+        })
+    };
+    let api_hb = api.map(|(client, work)| spawn_api_heartbeat(
+        client.clone(), work.clone(), cfg.heartbeat_secs, stop_tx.clone(), cancelled.clone()));
+
     let outcome = async {
         let workspace = ensure_workspace(cfg, issue).await?;
-        let end = run_item(cfg, &workspace.hub, item, lost_rx.clone(), shutdown).await?;
+        let end = run_item(cfg, &workspace.hub, item, lost_rx.clone(), stop_rx).await?;
         Ok::<_, anyhow::Error>((workspace, end))
     }.await;
     hb.abort();
+    forward.abort();
+    if let Some(h) = api_hb { h.abort(); }
 
     let (workspace, end) = match outcome {
         Ok(v) => v,
@@ -146,6 +218,7 @@ async fn process_issue(
             if !*lost_rx.borrow() {
                 let _ = leases.release(issue).await;
             }
+            report(api, Outcome::Failed(format!("erro de infraestrutura no agente: {e:#}"))).await;
             return Err(e);
         }
     };
@@ -174,9 +247,14 @@ async fn process_issue(
             // mostrava "sem PR" em todas. Um PR por repositório efetivamente
             // tocado (hub sempre; código de acordo com o que a issue declarou).
             open_pull_requests_all(&workspace, &cfg.repo, issue, cfg.pr_draft).await;
-            let _ = run(ws, "gh",
-                &["issue", "edit", &issue.to_string(), "--repo", &cfg.repo,
-                  "--remove-label", &cfg.queue_label]).await;
+            if api.is_some() {
+                // Pela API, "sair da fila" é o card ir para Review.
+                report(api, Outcome::Succeeded).await;
+            } else {
+                let _ = run(ws, "gh",
+                    &["issue", "edit", &issue.to_string(), "--repo", &cfg.repo,
+                      "--remove-label", &cfg.queue_label]).await;
+            }
             leases.release(issue).await?;
             info!(target: "agent", "{que} #{issue} concluído");
         }
@@ -191,6 +269,7 @@ async fn process_issue(
                             para ver o estado das stories. Item permanece \
                             na fila.")]).await;
             leases.release(issue).await?; // devolve p/ fila: label continua
+            report(api, Outcome::Failed(reason.clone())).await;
             failed = true;
             warn!(target: "agent", "{que} #{issue} falhou: {reason}");
         }
@@ -199,7 +278,12 @@ async fn process_issue(
             // takeover instantâneo (sem esperar TTL).
             checkpoint_all(&workspace, issue, "interrupted").await;
             leases.release(issue).await?;
-            info!(target: "agent", "issue #{issue} interrompida; lease liberado");
+            if cancelled.load(Ordering::SeqCst) {
+                info!(target: "agent", "{que} #{issue}: despacho cancelado no spec-wave; \
+                      checkpoint pushado e lease liberado");
+            } else {
+                info!(target: "agent", "issue #{issue} interrompida; lease liberado");
+            }
         }
         RunEnd::LeaseLost => {
             // NÃO faz checkpoint nem release: não somos mais donos de nada.
@@ -215,7 +299,19 @@ async fn process_issue(
 /// reproduzir, por exemplo) é re-claimada a cada cooldown para sempre —
 /// pagando um executor inteiro por tentativa, indefinidamente. Manter a label
 /// só faz sentido enquanto a falha puder ser transitória.
-async fn desistir_da_issue(cfg: &Config, cwd: &Path, me: &str, issue: u64, tentativas: u32) {
+async fn desistir_da_issue(
+    cfg: &Config, cwd: &Path, me: &str, issue: u64, tentativas: u32,
+    api: Option<(&ApiClient, &WorkItem)>,
+) {
+    if api.is_some() {
+        // Pela API, desistir é o card ir para Blocked com o motivo — é lá que
+        // uma pessoa decide (a tela tem "Devolver para Backlog"). Não há label.
+        report(api, Outcome::Blocked(format!(
+            "O agente `{me}` desistiu após {tentativas} falhas seguidas — \
+             as tentativas estão nos comentários da issue."))).await;
+        warn!(target: "agent", "issue #{issue}: {tentativas} falhas seguidas — bloqueada no spec-wave");
+        return;
+    }
     let _ = run(cwd, "gh",
         &["issue", "comment", &issue.to_string(), "--repo", &cfg.repo,
           "--body",
@@ -267,7 +363,8 @@ fn render_bug_report(result: &Option<spec_wave_agent::runner::ExecResult>, me: &
 
 const USAGE: &str = "\
 spec-wave-agent — daemon que puxa FEATURES e BUGS da fila do GitHub
-(label `spec-wave:dev-agent`) e delega a implementação ao Claude Code.
+(label `spec-wave:dev-agent`) ou, com `source = \"api\"`, os despachos da tela
+Development do spec-wave — e delega a implementação ao Claude Code.
 
 USO:
     spec-wave-agent [OPÇÕES]
@@ -330,10 +427,6 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&cfg.workdir)?;
     let workdir = Path::new(&cfg.workdir).to_path_buf();
     preflight(&workdir).await?;
-    let leases = LeaseRepo::open(
-        workdir.join("lease-repo"), &cfg.remote_url()).await?;
-    info!(target: "agent", "{me} iniciando; repo {} fila '{}'",
-          cfg.repo, cfg.queue_label);
 
     // Shutdown gracioso (SIGTERM do systemd/launchd, Ctrl+C)
     let (sd_tx, sd_rx) = watch::channel(false);
@@ -342,6 +435,15 @@ async fn main() -> Result<()> {
         info!(target: "agent", "sinal de shutdown recebido");
         let _ = sd_tx.send(true);
     });
+
+    if cfg.source == Source::Api {
+        return run_api_loop(&cfg, &me, sd_rx).await;
+    }
+
+    let leases = LeaseRepo::open(
+        workdir.join("lease-repo"), &cfg.remote_url()).await?;
+    info!(target: "agent", "{me} iniciando; repo {} fila '{}'",
+          cfg.repo, cfg.queue_label);
 
     // Issues processadas recentemente (qualquer desfecho) ficam em cooldown:
     // evita re-claim imediato por atraso do índice de busca do GitHub após
@@ -409,7 +511,7 @@ async fn main() -> Result<()> {
                         }
                     }
                     match process_issue(&cfg, &leases, &me, item,
-                                        sd_rx.clone()).await {
+                                        sd_rx.clone(), None).await {
                         Ok(a) if a.claimed => {
                             cooldown.insert(issue, Instant::now());
                             if a.failed {
@@ -427,7 +529,7 @@ async fn main() -> Result<()> {
                                 entry.1 = Instant::now();
                                 let n = entry.0;
                                 if n >= cfg.max_failures_per_issue {
-                                    desistir_da_issue(&cfg, &workdir, &me, issue, n).await;
+                                    desistir_da_issue(&cfg, &workdir, &me, issue, n, None).await;
                                     falhas.remove(&issue);
                                     // Sai do cooldown comum: a partir de agora
                                     // é `desistidas` quem decide, com leitura
@@ -455,6 +557,121 @@ async fn main() -> Result<()> {
         }
         if claimed {
             continue; // terminou um fluxo => tenta obter a próxima já
+        }
+        let delay = queue::next_poll_delay(
+            vazios_seguidos.max(1), cfg.poll_interval_secs, cfg.poll_backoff_max_secs);
+        tokio::select! {
+            _ = sleep(TokioDuration::from_secs(delay)) => {}
+            _ = wait_true(sd_rx.clone()) => break,
+        }
+    }
+    info!(target: "agent", "encerrado");
+    Ok(())
+}
+
+/// Loop de `source = "api"`: os itens vêm da API do spec-wave (despachos da
+/// tela Development para o login do dono do token), de QUALQUER produto do
+/// tenant. Cada repositório ganha diretório de trabalho e lease próprios
+/// (`Config::for_repo`); o resto — claim, executor, rodadas, checkpoint,
+/// fencing — é exatamente o do modo por label.
+///
+/// Diferenças de política em relação ao modo por label:
+/// - a chave de cooldown e de falhas é o `runId`: despachar de novo (ou
+///   devolver ao WIP) gera outro runId e zera a contagem — decisão humana
+///   explícita, como reaplicar a label;
+/// - desistir é reportar Blocked (não há label para tirar), e o item some da
+///   API por si só, sem a lista de `desistidas`.
+async fn run_api_loop(cfg: &Config, me: &str, sd_rx: watch::Receiver<bool>) -> Result<()> {
+    let client = ApiClient::from_config(cfg, me)?;
+    let mut leases_by_repo: HashMap<String, LeaseRepo> = HashMap::new();
+    let mut cooldown: HashMap<String, Instant> = HashMap::new();
+    let mut falhas: HashMap<String, u32> = HashMap::new();
+    let mut vazios_seguidos: u32 = 0;
+    let mut anunciado = false;
+
+    loop {
+        if *sd_rx.borrow() {
+            break;
+        }
+        let mut claimed = false;
+        match client.fetch_work().await {
+            Ok((login, items)) => {
+                if !anunciado {
+                    info!(target: "agent", "{me} iniciando; fonte api como `{login}`");
+                    anunciado = true;
+                }
+                vazios_seguidos = if items.is_empty() { vazios_seguidos + 1 } else { 0 };
+                for work in items {
+                    if *sd_rx.borrow() { break; }
+                    let Some(item) = queue_item_of(&work) else {
+                        warn!(target: "agent", "{} #{}: tipo \"{}\" não suportado por esta versão — ignorado",
+                              work.repo, work.work_item, work.kind);
+                        continue;
+                    };
+                    if let Some(t) = cooldown.get(&work.run_id) {
+                        if t.elapsed().as_secs() < cfg.cooldown_secs { continue; }
+                    }
+                    let item_cfg = match cfg.for_repo(&work.repo) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!(target: "agent", "item #{} ignorado: {e:#}", work.work_item);
+                            continue;
+                        }
+                    };
+                    if !leases_by_repo.contains_key(&work.repo) {
+                        // Falha aqui (repo sem acesso, rede) é de UM item: não
+                        // pode derrubar o daemon — os outros itens seguem.
+                        let opened = async {
+                            std::fs::create_dir_all(&item_cfg.workdir)?;
+                            LeaseRepo::open(
+                                Path::new(&item_cfg.workdir).join("lease-repo"),
+                                &item_cfg.remote_url()).await
+                        }.await;
+                        match opened {
+                            Ok(repo) => { leases_by_repo.insert(work.repo.clone(), repo); }
+                            Err(e) => {
+                                error!(target: "agent", "{} #{}: lease-repo indisponível: {e:#}",
+                                       work.repo, work.work_item);
+                                cooldown.insert(work.run_id.clone(), Instant::now());
+                                continue;
+                            }
+                        }
+                    }
+                    let leases = &leases_by_repo[&work.repo];
+                    let issue = item.number;
+                    match process_issue(&item_cfg, leases, me, item, sd_rx.clone(),
+                                        Some((&client, &work))).await {
+                        Ok(a) if a.claimed => {
+                            cooldown.insert(work.run_id.clone(), Instant::now());
+                            if a.failed {
+                                let n = falhas.entry(work.run_id.clone()).or_insert(0);
+                                *n += 1;
+                                if *n >= cfg.max_failures_per_issue {
+                                    let n = *n;
+                                    desistir_da_issue(&item_cfg, Path::new(&item_cfg.workdir), me,
+                                                      issue, n, Some((&client, &work))).await;
+                                    falhas.remove(&work.run_id);
+                                }
+                            } else {
+                                falhas.remove(&work.run_id);
+                            }
+                            claimed = true;
+                            break;
+                        }
+                        Ok(_) => {} // outro agente (outro host do mesmo dev): próxima
+                        Err(e) => {
+                            error!(target: "agent", "erro em {} #{issue}: {e:#}", work.repo);
+                            cooldown.insert(work.run_id.clone(), Instant::now());
+                            claimed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => error!(target: "agent", "consulta à API falhou: {e:#}"),
+        }
+        if claimed {
+            continue;
         }
         let delay = queue::next_poll_delay(
             vazios_seguidos.max(1), cfg.poll_interval_secs, cfg.poll_backoff_max_secs);

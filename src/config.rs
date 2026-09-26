@@ -4,10 +4,34 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
 
+/// De onde o agente recebe trabalho.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Source {
+    /// Issues abertas com a label da fila no repositório `repo` (RFC-001).
+    #[default]
+    GithubLabel,
+    /// Despachos da tela Development do spec-wave para o login do dono do
+    /// token (RFC-008 fase 2) — em qualquer produto do tenant.
+    Api,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    /// "owner/repo"
+    /// Fonte de trabalho. Default: label no GitHub (comportamento original).
+    #[serde(default)]
+    pub source: Source,
+    /// "owner/repo" — obrigatório em `source = "github-label"`. Em
+    /// `source = "api"` o repositório vem de cada item despachado.
+    #[serde(default)]
     pub repo: String,
+    /// Base da API do agente no spec-wave, ex.:
+    /// "https://app.specwave.dev/agent-api" (só `source = "api"`).
+    pub api_url: Option<String>,
+    /// Token de agente pessoal (Configurações → Minha conta → Tokens de
+    /// agente). A variável SPEC_WAVE_AGENT_TOKEN tem precedência — útil para
+    /// não deixar o segredo no arquivo.
+    pub agent_token: Option<String>,
     /// Label que marca itens na fila (aplicada por humano ou automação do board)
     #[serde(default = "d_queue_label")]
     pub queue_label: String,
@@ -277,12 +301,40 @@ pub fn load_config_from(override_path: Option<&str>) -> Result<Config> {
 
 impl Config {
     pub fn validate(&self) -> Result<()> {
-        let parts: Vec<&str> = self.repo.split('/').collect();
-        if parts.len() != 2
-            || parts.iter().any(|p| p.is_empty() || p.contains(char::is_whitespace))
-        {
-            bail!("config: repo deve ter o formato \"owner/repo\" (recebido: {:?})",
-                  self.repo);
+        match self.source {
+            Source::GithubLabel => validate_repo(&self.repo)?,
+            Source::Api => {
+                let url = self.api_url.as_deref().unwrap_or("").trim();
+                // Compara o host exato: prefixo aceitaria
+                // "http://localhost.evil.com" e mandaria o token em claro.
+                let local = url.strip_prefix("http://")
+                    .map(|rest| {
+                        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+                        let host = authority.rsplit_once(':')
+                            .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
+                            .map_or(authority, |(h, _)| h);
+                        host == "localhost" || host == "127.0.0.1"
+                    })
+                    .unwrap_or(false);
+                // Na fonte api cada item traz o próprio repositório: um remoto
+                // FIXO faria todos os produtos dividirem clone e lease. Git
+                // self-hosted continua possível com o placeholder {repo}.
+                if self.remote_url.as_deref().is_some_and(|r| !r.contains("{repo}")) {
+                    bail!("config: em source = \"api\", remote_url precisa do placeholder {{repo}} \
+                           (ex.: \"git@git.interno:{{repo}}.git\") — um remoto fixo faria todos os \
+                           produtos compartilharem o mesmo clone e lease");
+                }
+                if !(url.starts_with("https://") || local) {
+                    bail!("config: source = \"api\" exige api_url https:// \
+                           (ex.: \"https://app.specwave.dev/agent-api\"; recebido: {url:?})");
+                }
+                match self.agent_token() {
+                    Some(t) if t.starts_with("swa_") => {}
+                    Some(_) => bail!("config: agent_token não é um token de agente (começa com swa_)"),
+                    None => bail!("config: source = \"api\" exige agent_token (ou a variável \
+                                   SPEC_WAVE_AGENT_TOKEN) — gere em Configurações → Minha conta"),
+                }
+            }
         }
         for (name, v) in [
             ("poll_interval_secs", self.poll_interval_secs),
@@ -331,6 +383,31 @@ impl Config {
         Ok(())
     }
 
+    /// Token efetivo: a variável de ambiente vence o arquivo.
+    pub fn agent_token(&self) -> Option<String> {
+        std::env::var("SPEC_WAVE_AGENT_TOKEN").ok()
+            .or_else(|| self.agent_token.clone())
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+    }
+
+    /// Configuração de UM item recebido pela API: o repositório vem do item, e
+    /// cada repositório tem o próprio diretório de trabalho (clones
+    /// `issue-<n>` e `lease-repo`). Sem isso, a issue #12 de dois produtos
+    /// diferentes cairia no mesmo clone — e no mesmo lease.
+    pub fn for_repo(&self, repo: &str) -> Result<Config> {
+        validate_repo(repo)?;
+        let mut cfg = self.clone();
+        cfg.repo = repo.to_string();
+        cfg.remote_url = self.remote_url.as_ref().map(|r| r.replace("{repo}", repo));
+        cfg.workdir = PathBuf::from(&self.workdir)
+            .join("repos")
+            .join(repo.replace('/', "__"))
+            .to_string_lossy()
+            .into_owned();
+        Ok(cfg)
+    }
+
     pub fn remote_url(&self) -> String {
         self.remote_url.clone()
             .unwrap_or_else(|| format!("https://github.com/{}.git", self.repo))
@@ -346,7 +423,17 @@ impl Config {
     }
 }
 
-fn hostname() -> String {
+fn validate_repo(repo: &str) -> Result<()> {
+    let parts: Vec<&str> = repo.split('/').collect();
+    if parts.len() != 2
+        || parts.iter().any(|p| p.is_empty() || p.contains(char::is_whitespace) || *p == "." || *p == "..")
+    {
+        bail!("config: repo deve ter o formato \"owner/repo\" (recebido: {repo:?})");
+    }
+    Ok(())
+}
+
+pub fn hostname() -> String {
     std::process::Command::new("hostname")
         .output()
         .ok()
@@ -362,6 +449,64 @@ mod tests {
 
     fn parse(toml_str: &str) -> Config {
         toml::from_str(toml_str).unwrap()
+    }
+
+    // Token de exemplo no formato swa_ (não é um token real).
+    const TOKEN: &str = "swa_dGVuYW50.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    #[test]
+    fn fonte_padrao_e_label_e_exige_repo() {
+        let cfg = parse(r#"poll_interval_secs = 60"#);
+        assert_eq!(cfg.source, Source::GithubLabel);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn fonte_api_dispensa_repo_e_exige_url_e_token() {
+        let ok = parse(&format!(
+            "source = \"api\"\napi_url = \"https://app.specwave.dev/agent-api\"\nagent_token = \"{TOKEN}\""));
+        assert_eq!(ok.source, Source::Api);
+        assert!(ok.validate().is_ok());
+
+        let sem_token = parse("source = \"api\"\napi_url = \"https://app.specwave.dev/agent-api\"");
+        if std::env::var("SPEC_WAVE_AGENT_TOKEN").is_err() {
+            assert!(sem_token.validate().is_err());
+        }
+        let http = parse(&format!(
+            "source = \"api\"\napi_url = \"http://app.specwave.dev/agent-api\"\nagent_token = \"{TOKEN}\""));
+        assert!(http.validate().is_err(), "http:// fora de localhost vazaria o token");
+        let local = parse(&format!(
+            "source = \"api\"\napi_url = \"http://localhost:3001/agent-api\"\nagent_token = \"{TOKEN}\""));
+        assert!(local.validate().is_ok());
+        let falso_local = parse(&format!(
+            "source = \"api\"\napi_url = \"http://localhost.evil.com/agent-api\"\nagent_token = \"{TOKEN}\""));
+        assert!(falso_local.validate().is_err(), "prefixo localhost não é localhost");
+        let com_remote = parse(&format!(
+            "source = \"api\"\napi_url = \"https://x.dev/agent-api\"\nagent_token = \"{TOKEN}\"\nremote_url = \"/tmp/o.git\""));
+        assert!(com_remote.validate().is_err(), "remote_url fixo colapsaria os repositórios");
+        let com_placeholder = parse(&format!(
+            "source = \"api\"\napi_url = \"https://x.dev/agent-api\"\nagent_token = \"{TOKEN}\"\nremote_url = \"git@git.interno:{{repo}}.git\""));
+        assert!(com_placeholder.validate().is_ok());
+        assert_eq!(com_placeholder.for_repo("acme/api").unwrap().remote_url(), "git@git.interno:acme/api.git");
+        let token_errado = parse(
+            "source = \"api\"\napi_url = \"https://x.dev/agent-api\"\nagent_token = \"ghp_abc\"");
+        if std::env::var("SPEC_WAVE_AGENT_TOKEN").is_err() {
+            assert!(token_errado.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn for_repo_isola_diretorio_por_repositorio() {
+        let cfg = parse(&format!(
+            "source = \"api\"\napi_url = \"https://x.dev/agent-api\"\nagent_token = \"{TOKEN}\"\nworkdir = \"/w\""));
+        let a = cfg.for_repo("acme/api").unwrap();
+        let b = cfg.for_repo("acme/web").unwrap();
+        assert_eq!(a.repo, "acme/api");
+        assert_eq!(a.workdir, "/w/repos/acme__api");
+        assert_ne!(a.workdir, b.workdir);
+        assert_eq!(a.remote_url(), "https://github.com/acme/api.git");
+        assert!(cfg.for_repo("acme").is_err());
+        assert!(cfg.for_repo("../etc").is_err());
     }
 
     #[test]

@@ -36,7 +36,15 @@ spec-wave. O que o agente garante é a parte que um LLM não faz bem:
 
 ### Fila
 
-Issues **abertas**, com a label `spec-wave:dev-agent` **e** a label de tipo
+Duas fontes, escolhidas por `source` na configuração:
+
+- **`github-label`** (default): a fila de labels descrita abaixo, num único
+  repositório (`repo`).
+- **`api`**: os despachos da tela **Development** do spec-wave para **você**
+  (o login do GitHub vinculado ao dono do token de agente), em **qualquer
+  produto** do tenant — ver [Fonte `api`](#fonte-api-tela-development-do-spec-wave).
+
+Na fonte `github-label`: issues **abertas**, com a label `spec-wave:dev-agent` **e** a label de tipo
 `[FEATURE]` ou `[BUG]`. **Bugs primeiro** — trabalho corretivo tem severidade,
 feature nova não; uma FIFO pura por número deixaria um bug crítico atrás de
 qualquer feature antiga. Dentro de cada tipo, FIFO por número. Um item por vez:
@@ -157,7 +165,8 @@ Mac Intel compila do fonte.
 
 ## Configuração
 
-`~/.config/spec-wave-agent/config.toml` — só `repo` é obrigatório. Schema
+`~/.config/spec-wave-agent/config.toml` — só `repo` é obrigatório na fonte
+`github-label` (a fonte `api` pede `api_url` + `agent_token`). Schema
 completo comentado em [`packaging/config.example.toml`](packaging/config.example.toml).
 
 ```toml
@@ -166,7 +175,11 @@ repo = "sua-org/seu-repo"
 
 | Chave | Default | Para que serve |
 |---|---|---|
-| `repo` | — | `owner/repo` (obrigatório) |
+| `source` | `github-label` | `github-label` (fila de labels) ou `api` (tela Development do spec-wave) |
+| `repo` | — | `owner/repo` (obrigatório na fonte `github-label`) |
+| `api_url` | — | base da API do agente, ex.: `https://app.specwave.dev/agent-api` (fonte `api`) |
+| `agent_token` | — | token de agente pessoal `swa_…` (fonte `api`); `SPEC_WAVE_AGENT_TOKEN` tem precedência |
+| `remote_url` | GitHub | override do remoto (testes / git self-hosted). Na fonte `api` exige o placeholder `{repo}`, ex.: `git@git.interno:{repo}.git` |
 | `queue_label` | `spec-wave:dev-agent` | label que marca a fila |
 | `poll_interval_secs` | `60` | intervalo de consulta quando ocioso |
 | `poll_backoff_max_secs` | `480` | teto do backoff quando a fila volta VAZIA (dobra a cada rodada vazia seguida; fila com item de outro agente não conta) |
@@ -280,6 +293,43 @@ branch `agent/issue-<n>` fica pronto para o PR (a Feature avança para
 Se falhar, a label **continua** na issue (segue na fila) e um comentário
 explica o motivo; o trabalho parcial está pushado no branch. Reiniciar o
 agente retoma de onde parou — stories já concluídas são puladas.
+
+## Fonte `api` (tela Development do spec-wave)
+
+Em vez de label, quem decide o que o agente faz é a tela **Development** do
+spec-wave (RFC-008): alguém arrasta a Feature (ou o Bug) do Backlog para o WIP
+e escolhe **você** como executor. O agente recebe pela API, em qualquer
+produto do tenant.
+
+1. No spec-wave, em **Configurações → Minha conta**: vincule o seu login do
+   GitHub e crie um **token de agente** (um por máquina). Ele aparece uma vez.
+2. Na configuração do agente:
+
+   ```toml
+   source = "api"
+   api_url = "https://<seu-spec-wave>/agent-api"
+   agent_token = "swa_…"   # ou exporte SPEC_WAVE_AGENT_TOKEN
+   ```
+
+3. Rode o agente. No seletor de executor da tela Development você passa a
+   aparecer como **online**.
+
+O que muda em relação à fonte por label:
+
+- **Vários repositórios.** Cada produto tem diretório de trabalho e lease
+  próprios em `<workdir>/repos/<owner>__<repo>/` — a issue #12 de dois
+  produtos nunca cai no mesmo clone.
+- **Heartbeat para o spec-wave.** O card mostra *Rodando*, o host e a idade do
+  último heartbeat. Se o despacho for **cancelado** (o card volta ao
+  Backlog), refeito ou redirecionado, a resposta do heartbeat manda parar: o
+  agente mata o executor, faz checkpoint no branch e libera o lease.
+- **Desfechos no card.** Sucesso → *Review*; falha → continua em WIP (a falha é
+  contada); depois de `max_failures_per_issue` falhas → *Blocked*, com o
+  motivo. Não há label para tirar ou pôr — o card é a fila.
+- **Lease igual.** A API diz o que fazer; o lease em git ref continua sendo o
+  que garante um dono por vez (inclusive entre duas máquinas suas).
+- **User-Agent.** O agente se identifica como `spec-wave-agent/<versão>`; o
+  WAF do spec-wave recusa requisições sem User-Agent.
 
 ## Desenvolvimento
 
