@@ -1,8 +1,20 @@
 # Configuração do spec-wave-agent
 # Local: ~/.config/spec-wave-agent/config.toml
 
-# Repositório alvo (obrigatório), formato "owner/repo"
+# De onde vem o trabalho:
+#   "github-label" (default) — issues com a label da fila no `repo` abaixo.
+#   "api"                    — despachos da tela Development do spec-wave para
+#                              você, em qualquer produto do tenant (RFC-008).
+# source = "github-label"
+
+# Repositório alvo, formato "owner/repo" — obrigatório na fonte github-label.
 repo = "sua-org/seu-repo"
+
+# Só na fonte "api": base da API do agente e o seu token de agente pessoal
+# (spec-wave → Configurações → Minha conta → Tokens de agente). Prefira
+# exportar SPEC_WAVE_AGENT_TOKEN a deixar o token no arquivo.
+# api_url = "https://app.specwave.dev/agent-api"
+# agent_token = "swa_..."
 
 # Label que marca itens na fila. Aplicada em issues [FEATURE] ou [BUG].
 #
