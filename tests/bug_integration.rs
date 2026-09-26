@@ -89,7 +89,7 @@ JSON
     let (_lt, lr, _st, sr) = channels();
 
     let ws = ensure_workspace(&cfg, 42).await.unwrap();
-    let end = run_item(&cfg, &ws, item(42), lr, sr).await.unwrap();
+    let end = run_item(&cfg, &ws.hub, item(42), lr, sr).await.unwrap();
 
     let RunEnd::Success(result) = end else { panic!("esperava Success, veio {end:?}") };
     let r = result.expect("o marker deveria ter sido lido");
@@ -100,7 +100,7 @@ JSON
     assert_eq!(r.arquivos.unwrap().len(), 2);
 
     // O prompt entregue é o de BUG — não o de feature.
-    let prompt = std::fs::read_to_string(ws.join("prompt-recebido.txt")).unwrap();
+    let prompt = std::fs::read_to_string(ws.hub.join("prompt-recebido.txt")).unwrap();
     assert!(prompt.contains("quatro fases"), "prompt recebido: {prompt}");
     assert!(prompt.contains("42"), "o placeholder {{issue}} não foi resolvido");
     assert!(!prompt.contains("NAO DEVE SER USADO"));
@@ -122,7 +122,7 @@ async fn marker_sem_campos_de_rca_ainda_e_sucesso() {
     let (_lt, lr, _st, sr) = channels();
 
     let ws = ensure_workspace(&cfg, 43).await.unwrap();
-    let end = run_item(&cfg, &ws, item(43), lr, sr).await.unwrap();
+    let end = run_item(&cfg, &ws.hub, item(43), lr, sr).await.unwrap();
 
     let RunEnd::Success(result) = end else { panic!("esperava Success, veio {end:?}") };
     let r = result.expect("marker mínimo ainda deve ser lido");
@@ -144,7 +144,7 @@ async fn bug_usa_o_timeout_de_bug_e_nao_o_de_feature() {
 
     let ws = ensure_workspace(&cfg, 44).await.unwrap();
     let inicio = std::time::Instant::now();
-    let end = run_item(&cfg, &ws, item(44), lr, sr).await.unwrap();
+    let end = run_item(&cfg, &ws.hub, item(44), lr, sr).await.unwrap();
 
     assert!(matches!(end, RunEnd::Failed(_)), "esperava Failed por timeout, veio {end:?}");
     assert!(inicio.elapsed().as_secs() < 20,
@@ -164,7 +164,7 @@ async fn marker_partial_de_bug_vira_falha_com_o_detalhe() {
     let (_lt, lr, _st, sr) = channels();
 
     let ws = ensure_workspace(&cfg, 45).await.unwrap();
-    let end = run_item(&cfg, &ws, item(45), lr, sr).await.unwrap();
+    let end = run_item(&cfg, &ws.hub, item(45), lr, sr).await.unwrap();
 
     let RunEnd::Failed(reason) = end else { panic!("esperava Failed, veio {end:?}") };
     assert!(reason.contains("nao consegui reproduzir"), "motivo: {reason}");

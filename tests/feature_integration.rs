@@ -3,7 +3,7 @@
 
 use spec_wave_agent::config::Config;
 use spec_wave_agent::queue::{QueueItem, QueueKind};
-use spec_wave_agent::runner::{ensure_workspace, run_item, RunEnd};
+use spec_wave_agent::runner::{ensure_workspace, has_unmerged_commits, run_item, RunEnd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
@@ -70,11 +70,11 @@ async fn sucesso_recebe_prompt_e_pusha_trabalho() {
     let (_lt, lr, _st, sr) = channels();
 
     let ws = ensure_workspace(&cfg, 7).await.unwrap();
-    let end = run_item(&cfg, &ws, QueueItem { kind: QueueKind::Feature, number: 7 }, lr, sr).await.unwrap();
+    let end = run_item(&cfg, &ws.hub, QueueItem { kind: QueueKind::Feature, number: 7 }, lr, sr).await.unwrap();
     assert!(matches!(end, RunEnd::Success(_)), "esperava Success");
 
     // Prompt chegou pelo stdin com o placeholder renderizado.
-    let prompt = std::fs::read_to_string(ws.join("prompt-recebido.txt")).unwrap();
+    let prompt = std::fs::read_to_string(ws.hub.join("prompt-recebido.txt")).unwrap();
     assert!(prompt.contains("spec-wave order 7"), "prompt: {prompt}");
 
     // Trabalho da story está no origin, no branch da feature.
@@ -86,7 +86,7 @@ async fn sucesso_recebe_prompt_e_pusha_trabalho() {
     assert!(log.contains("feat: story #999 [spec-wave-agent]"), "log: {log}");
 
     // O agente consome o marker (não pode sobrar para o checkpoint).
-    assert!(!ws.join(".spec-wave-agent-result.json").exists());
+    assert!(!ws.hub.join(".spec-wave-agent-result.json").exists());
 }
 
 #[tokio::test]
@@ -98,13 +98,13 @@ async fn exit_zero_sem_marker_nao_e_sucesso() {
     let (_lt, lr, _st, sr) = channels();
 
     let ws = ensure_workspace(&cfg, 10).await.unwrap();
-    let end = run_item(&cfg, &ws, QueueItem { kind: QueueKind::Feature, number: 10 }, lr, sr).await.unwrap();
+    let end = run_item(&cfg, &ws.hub, QueueItem { kind: QueueKind::Feature, number: 10 }, lr, sr).await.unwrap();
     match end {
         RunEnd::Failed(r) => assert!(r.contains("sem progresso"), "motivo: {r}"),
         _ => panic!("exit 0 sem marker e sem progresso deveria ser Failed"),
     }
     // Foram exatamente 2 rodadas (estagnação detectada na 2ª).
-    let rodadas = std::fs::read_to_string(ws.join("rodadas.txt")).unwrap();
+    let rodadas = std::fs::read_to_string(ws.hub.join("rodadas.txt")).unwrap();
     assert_eq!(rodadas.lines().count(), 2);
 }
 
@@ -129,7 +129,7 @@ async fn rodada_incompleta_com_progresso_e_relancada_ate_o_marker() {
     let (_lt, lr, _st, sr) = channels();
 
     let ws = ensure_workspace(&cfg, 12).await.unwrap();
-    let end = run_item(&cfg, &ws, QueueItem { kind: QueueKind::Feature, number: 12 }, lr, sr).await.unwrap();
+    let end = run_item(&cfg, &ws.hub, QueueItem { kind: QueueKind::Feature, number: 12 }, lr, sr).await.unwrap();
     assert!(matches!(end, RunEnd::Success(_)), "esperava Success após 2 rodadas");
 
     let out = std::process::Command::new("git")
@@ -151,14 +151,14 @@ async fn marker_partial_vira_falha_com_detalhe() {
     let (_lt, lr, _st, sr) = channels();
 
     let ws = ensure_workspace(&cfg, 11).await.unwrap();
-    let end = run_item(&cfg, &ws, QueueItem { kind: QueueKind::Feature, number: 11 }, lr, sr).await.unwrap();
+    let end = run_item(&cfg, &ws.hub, QueueItem { kind: QueueKind::Feature, number: 11 }, lr, sr).await.unwrap();
     match end {
         RunEnd::Failed(r) => {
             assert!(r.contains("partial") && r.contains("story #215"), "motivo: {r}");
         }
         _ => panic!("status partial deveria ser Failed"),
     }
-    assert!(!ws.join(".spec-wave-agent-result.json").exists());
+    assert!(!ws.hub.join(".spec-wave-agent-result.json").exists());
 }
 
 #[tokio::test]
@@ -173,14 +173,14 @@ async fn timeout_mata_a_arvore_de_processos_inteira() {
     let (_lt, lr, _st, sr) = channels();
 
     let ws = ensure_workspace(&cfg, 8).await.unwrap();
-    let end = run_item(&cfg, &ws, QueueItem { kind: QueueKind::Feature, number: 8 }, lr, sr).await.unwrap();
+    let end = run_item(&cfg, &ws.hub, QueueItem { kind: QueueKind::Feature, number: 8 }, lr, sr).await.unwrap();
     match end {
         RunEnd::Failed(r) => assert!(r.contains("timeout"), "motivo: {r}"),
         _ => panic!("esperava Failed(timeout)"),
     }
 
     // O neto tem que morrer junto (kill de grupo). kill -0 falha se morto.
-    let pid: i32 = std::fs::read_to_string(ws.join("neto.pid")).unwrap()
+    let pid: i32 = std::fs::read_to_string(ws.hub.join("neto.pid")).unwrap()
         .trim().parse().unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let alive = unsafe { libc::kill(pid, 0) } == 0;
@@ -194,6 +194,39 @@ async fn executor_com_exit_1_falha() {
     let (_lt, lr, _st, sr) = channels();
 
     let ws = ensure_workspace(&cfg, 9).await.unwrap();
-    let end = run_item(&cfg, &ws, QueueItem { kind: QueueKind::Feature, number: 9 }, lr, sr).await.unwrap();
+    let end = run_item(&cfg, &ws.hub, QueueItem { kind: QueueKind::Feature, number: 9 }, lr, sr).await.unwrap();
     assert!(matches!(end, RunEnd::Failed(_)), "esperava Failed");
+}
+
+// RFC-005 §6.3: hub sem .spec-wave.json (todo hub deste módulo, que testa só
+// o executor "sem rede, sem gh, sem npm") tem que degradar pra mono-repo
+// SEM tentar chamar `npx spec-wave workspace prepare` — sem isso, toda a
+// suíte deste arquivo passaria a depender da CLI de verdade instalada.
+#[tokio::test]
+async fn hub_sem_spec_wave_json_degrada_pra_mono_repo_sem_chamar_a_cli() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = setup(&tmp, "cat > /dev/null\nexit 0", 60);
+    let ws = ensure_workspace(&cfg, 13).await.unwrap();
+    assert!(ws.code_repos.is_empty(),
+            "hub sem .spec-wave.json não deveria ter code repos: {:?}", ws.code_repos.len());
+    assert!(!ws.hub.join(".spec-wave.json").exists());
+}
+
+// RFC-005 §6.3: um PR por repositório de código EFETIVAMENTE tocado, não um
+// pra cada repositório vinculado ao Project — has_unmerged_commits é o guard.
+#[tokio::test]
+async fn has_unmerged_commits_distingue_branch_tocado_de_intocado() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = setup(&tmp, "cat > /dev/null\nexit 0", 60);
+
+    // Branch recém-criado por ensure_workspace: ainda sem commit próprio.
+    let ws = ensure_workspace(&cfg, 14).await.unwrap();
+    assert!(!has_unmerged_commits(&ws.hub).await,
+            "branch de trabalho recém-criado (sem commit próprio) não deveria ter unmerged commits");
+
+    // Um commit local, ainda não pushado — rev-list vê HEAD local, não o remoto.
+    sh(&ws.hub, "git config user.name t; git config user.email t@t\n\
+                 echo x > arquivo.txt && git add -A && git commit -qm 'feat: x'");
+    assert!(has_unmerged_commits(&ws.hub).await,
+            "commit no branch de trabalho deveria contar como unmerged");
 }

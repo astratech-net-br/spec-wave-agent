@@ -135,6 +135,11 @@ fn d_feature_prompt() -> String {
      - Commite e pushe cada story assim que concluída, com o rodapé de \
      trailers que `npx spec-wave implement <número>` pedir no contexto — \
      não invente formato de assunto, é o rodapé que é conferido.\n\
+     - Se o contexto de `spec-wave order`/`implement` trouxer a seção \
+     \"Workspace multi-repo\" (a Feature toca mais de um repositório de \
+     código, RFC-005), o commit e o push de CADA story acontecem no \
+     diretório do repositório que ela de fato tocou — não só no diretório \
+     atual. Uma story que toca dois repositórios commita/pusha nos dois.\n\
      - Os cards do board (Etapas) são movidos AUTOMATICAMENTE pelo \
      `spec-wave implement` — não gerencie o board manualmente.\n\
      - SOMENTE quando TODAS as stories estiverem commitadas e pushadas (ou \
@@ -182,6 +187,10 @@ fn d_bug_prompt() -> String {
      - Commite neste branch com a CAUSA RAIZ na mensagem: \
      \"fix: <o que estava errado> (#{issue}) [spec-wave-agent]\", com o corpo \
      explicando a origem — não o sintoma. Depois faça push.\n\
+     - Se o contexto de `spec-wave implement` trouxer a seção \"Workspace \
+     multi-repo\" (RFC-005), o commit e o push acontecem no diretório do \
+     repositório onde a causa raiz de fato está — não necessariamente o \
+     diretório atual.\n\
      - Os cards do board são movidos AUTOMATICAMENTE pelo `spec-wave \
      implement` — não gerencie o board manualmente.\n\
      - SOMENTE ao terminar, escreva ./.spec-wave-agent-result.json (NÃO \
