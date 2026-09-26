@@ -618,12 +618,24 @@ async fn run_api_loop(cfg: &Config, me: &str, sd_rx: watch::Receiver<bool>) -> R
                             continue;
                         }
                     };
-                    std::fs::create_dir_all(&item_cfg.workdir)?;
                     if !leases_by_repo.contains_key(&work.repo) {
-                        let repo = LeaseRepo::open(
-                            Path::new(&item_cfg.workdir).join("lease-repo"),
-                            &item_cfg.remote_url()).await?;
-                        leases_by_repo.insert(work.repo.clone(), repo);
+                        // Falha aqui (repo sem acesso, rede) é de UM item: não
+                        // pode derrubar o daemon — os outros itens seguem.
+                        let opened = async {
+                            std::fs::create_dir_all(&item_cfg.workdir)?;
+                            LeaseRepo::open(
+                                Path::new(&item_cfg.workdir).join("lease-repo"),
+                                &item_cfg.remote_url()).await
+                        }.await;
+                        match opened {
+                            Ok(repo) => { leases_by_repo.insert(work.repo.clone(), repo); }
+                            Err(e) => {
+                                error!(target: "agent", "{} #{}: lease-repo indisponível: {e:#}",
+                                       work.repo, work.work_item);
+                                cooldown.insert(work.run_id.clone(), Instant::now());
+                                continue;
+                            }
+                        }
                     }
                     let leases = &leases_by_repo[&work.repo];
                     let issue = item.number;

@@ -305,7 +305,25 @@ impl Config {
             Source::GithubLabel => validate_repo(&self.repo)?,
             Source::Api => {
                 let url = self.api_url.as_deref().unwrap_or("").trim();
-                let local = url.starts_with("http://localhost") || url.starts_with("http://127.0.0.1");
+                // Compara o host exato: prefixo aceitaria
+                // "http://localhost.evil.com" e mandaria o token em claro.
+                let local = url.strip_prefix("http://")
+                    .map(|rest| {
+                        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+                        let host = authority.rsplit_once(':')
+                            .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
+                            .map_or(authority, |(h, _)| h);
+                        host == "localhost" || host == "127.0.0.1"
+                    })
+                    .unwrap_or(false);
+                // Na fonte api cada item traz o próprio repositório: um remoto
+                // FIXO faria todos os produtos dividirem clone e lease. Git
+                // self-hosted continua possível com o placeholder {repo}.
+                if self.remote_url.as_deref().is_some_and(|r| !r.contains("{repo}")) {
+                    bail!("config: em source = \"api\", remote_url precisa do placeholder {{repo}} \
+                           (ex.: \"git@git.interno:{{repo}}.git\") — um remoto fixo faria todos os \
+                           produtos compartilharem o mesmo clone e lease");
+                }
                 if !(url.starts_with("https://") || local) {
                     bail!("config: source = \"api\" exige api_url https:// \
                            (ex.: \"https://app.specwave.dev/agent-api\"; recebido: {url:?})");
@@ -381,6 +399,7 @@ impl Config {
         validate_repo(repo)?;
         let mut cfg = self.clone();
         cfg.repo = repo.to_string();
+        cfg.remote_url = self.remote_url.as_ref().map(|r| r.replace("{repo}", repo));
         cfg.workdir = PathBuf::from(&self.workdir)
             .join("repos")
             .join(repo.replace('/', "__"))
@@ -459,6 +478,16 @@ mod tests {
         let local = parse(&format!(
             "source = \"api\"\napi_url = \"http://localhost:3001/agent-api\"\nagent_token = \"{TOKEN}\""));
         assert!(local.validate().is_ok());
+        let falso_local = parse(&format!(
+            "source = \"api\"\napi_url = \"http://localhost.evil.com/agent-api\"\nagent_token = \"{TOKEN}\""));
+        assert!(falso_local.validate().is_err(), "prefixo localhost não é localhost");
+        let com_remote = parse(&format!(
+            "source = \"api\"\napi_url = \"https://x.dev/agent-api\"\nagent_token = \"{TOKEN}\"\nremote_url = \"/tmp/o.git\""));
+        assert!(com_remote.validate().is_err(), "remote_url fixo colapsaria os repositórios");
+        let com_placeholder = parse(&format!(
+            "source = \"api\"\napi_url = \"https://x.dev/agent-api\"\nagent_token = \"{TOKEN}\"\nremote_url = \"git@git.interno:{{repo}}.git\""));
+        assert!(com_placeholder.validate().is_ok());
+        assert_eq!(com_placeholder.for_repo("acme/api").unwrap().remote_url(), "git@git.interno:acme/api.git");
         let token_errado = parse(
             "source = \"api\"\napi_url = \"https://x.dev/agent-api\"\nagent_token = \"ghp_abc\"");
         if std::env::var("SPEC_WAVE_AGENT_TOKEN").is_err() {

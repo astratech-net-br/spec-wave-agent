@@ -100,7 +100,7 @@ impl ApiClient {
         // rustls sem provedor embutido no reqwest: instala o `ring` uma vez
         // (compila sem cmake/NASM nas três plataformas do release).
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let base = cfg.api_url.clone().context("api_url ausente")?;
+        let base = cfg.api_url.as_deref().map(str::trim).context("api_url ausente")?;
         let token = cfg.agent_token().context("agent_token ausente")?;
         let http = reqwest::Client::builder()
             // O WAF do spec-wave bloqueia requisição sem User-Agent.

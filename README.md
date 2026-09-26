@@ -179,6 +179,7 @@ repo = "sua-org/seu-repo"
 | `repo` | — | `owner/repo` (obrigatório na fonte `github-label`) |
 | `api_url` | — | base da API do agente, ex.: `https://app.specwave.dev/agent-api` (fonte `api`) |
 | `agent_token` | — | token de agente pessoal `swa_…` (fonte `api`); `SPEC_WAVE_AGENT_TOKEN` tem precedência |
+| `remote_url` | GitHub | override do remoto (testes / git self-hosted). Na fonte `api` exige o placeholder `{repo}`, ex.: `git@git.interno:{repo}.git` |
 | `queue_label` | `spec-wave:dev-agent` | label que marca a fila |
 | `poll_interval_secs` | `60` | intervalo de consulta quando ocioso |
 | `poll_backoff_max_secs` | `480` | teto do backoff quando a fila volta VAZIA (dobra a cada rodada vazia seguida; fila com item de outro agente não conta) |
