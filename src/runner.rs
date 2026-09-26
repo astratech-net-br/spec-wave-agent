@@ -353,13 +353,21 @@ fn render_out_line(line: &str) -> Option<String> {
     }
 }
 
-async fn stream_lines<R>(reader: R, issue: u64, stream: &'static str)
+/// Canal opcional que recebe cada linha crua do stdout do executor — a
+/// transmissão ao vivo (live.rs) lê daqui. `try_send`: cheio, descarta; o
+/// executor nunca espera por quem assiste.
+pub type LineTap = tokio::sync::mpsc::Sender<String>;
+
+async fn stream_lines<R>(reader: R, issue: u64, stream: &'static str, tap: Option<LineTap>)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
+        if let Some(t) = &tap {
+            let _ = t.try_send(line.clone());
+        }
         if stream == "out" {
             if let Some(msg) = render_out_line(&line) {
                 info!(target: "spec-wave", "[#{issue}] {msg}");
@@ -514,6 +522,7 @@ async fn executor_round(
     cfg: &Config, ws: &Path, item: QueueItem,
     mut lease_lost: watch::Receiver<bool>,
     mut shutdown: watch::Receiver<bool>,
+    tap: Option<LineTap>,
 ) -> Result<RoundEnd> {
     let issue = item.number;
     let (command, prompt_tpl, timeout_secs) = match item.kind {
@@ -549,9 +558,9 @@ async fn executor_round(
     // Os handles saem do child via take(), então kill_tree nos braços
     // abaixo continua imediato — fencing não espera os readers.
     let out_task = child.stdout.take()
-        .map(|s| tokio::spawn(stream_lines(s, issue, "out")));
+        .map(|s| tokio::spawn(stream_lines(s, issue, "out", tap)));
     let err_task = child.stderr.take()
-        .map(|s| tokio::spawn(stream_lines(s, issue, "err")));
+        .map(|s| tokio::spawn(stream_lines(s, issue, "err", None)));
 
     let cap = TokioDuration::from_secs(timeout_secs);
     let end = tokio::select! {
@@ -634,12 +643,22 @@ pub async fn run_item(
     lease_lost: watch::Receiver<bool>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<RunEnd> {
+    run_item_with_tap(cfg, ws, item, lease_lost, shutdown, None).await
+}
+
+/// `run_item` com a saída do executor copiada para `tap` (transmissão ao vivo).
+pub async fn run_item_with_tap(
+    cfg: &Config, ws: &Path, item: QueueItem,
+    lease_lost: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
+    tap: Option<LineTap>,
+) -> Result<RunEnd> {
     let issue = item.number;
     let mut no_progress = 0u32;
     for round in 1..=cfg.max_executor_rounds {
         let head_before = head_sha(ws).await;
         let end = executor_round(cfg, ws, item,
-                                 lease_lost.clone(), shutdown.clone()).await?;
+                                 lease_lost.clone(), shutdown.clone(), tap.clone()).await?;
         match end {
             RoundEnd::Success(r) => return Ok(RunEnd::Success(r)),
             RoundEnd::Failed(r) => return Ok(RunEnd::Failed(r)),

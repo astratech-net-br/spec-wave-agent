@@ -15,6 +15,9 @@ repo = "sua-org/seu-repo"
 # exportar SPEC_WAVE_AGENT_TOKEN a deixar o token no arquivo.
 # api_url = "https://app.specwave.dev/agent-api"
 # agent_token = "swa_..."
+# Base do Session Gateway para a sessão ao vivo na tela Development. Default:
+# o host de api_url (em produção o CloudFront manda /ws/* para o Gateway).
+# live_url = "wss://gateway.interno"
 
 # Label que marca itens na fila. Aplicada em issues [FEATURE] ou [BUG].
 #

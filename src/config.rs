@@ -32,6 +32,10 @@ pub struct Config {
     /// agente). A variável SPEC_WAVE_AGENT_TOKEN tem precedência — útil para
     /// não deixar o segredo no arquivo.
     pub agent_token: Option<String>,
+    /// Base do Session Gateway para a transmissão ao vivo (fonte api), ex.:
+    /// "wss://gateway.interno". Default: o host de `api_url` (em produção o
+    /// CloudFront manda `/ws/*` do domínio do app para o Gateway).
+    pub live_url: Option<String>,
     /// Label que marca itens na fila (aplicada por humano ou automação do board)
     #[serde(default = "d_queue_label")]
     pub queue_label: String,

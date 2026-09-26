@@ -29,7 +29,7 @@ use spec_wave_agent::config::{load_config_from, Config, Source};
 use spec_wave_agent::lease::{Lease, LeaseRepo, RenewError};
 use spec_wave_agent::queue::{self, QueueItem, QueueKind};
 use spec_wave_agent::runner::{
-    checkpoint_all, ensure_workspace, open_pull_requests_all, run_item, RunEnd,
+    checkpoint_all, ensure_workspace, open_pull_requests_all, run_item_with_tap, RunEnd,
 };
 use spec_wave_agent::shell::run;
 use std::collections::HashMap;
@@ -201,11 +201,17 @@ async fn process_issue(
     let api_hb = api.map(|(client, work)| spawn_api_heartbeat(
         client.clone(), work.clone(), cfg.heartbeat_secs, stop_tx.clone(), cancelled.clone()));
 
+    // Transmissão ao vivo para a tela Development (fonte api): melhor esforço,
+    // nunca bloqueia o executor (live.rs).
+    let live = api.and_then(|(client, work)| client.start_live(work));
+    let tap = live.as_ref().map(|l| l.tap());
+
     let outcome = async {
         let workspace = ensure_workspace(cfg, issue).await?;
-        let end = run_item(cfg, &workspace.hub, item, lost_rx.clone(), stop_rx).await?;
+        let end = run_item_with_tap(cfg, &workspace.hub, item, lost_rx.clone(), stop_rx, tap).await?;
         Ok::<_, anyhow::Error>((workspace, end))
     }.await;
+    if let Some(l) = live { l.finish().await; }
     hb.abort();
     forward.abort();
     if let Some(h) = api_hb { h.abort(); }

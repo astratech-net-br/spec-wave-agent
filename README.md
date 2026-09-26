@@ -179,6 +179,7 @@ repo = "sua-org/seu-repo"
 | `repo` | — | `owner/repo` (obrigatório na fonte `github-label`) |
 | `api_url` | — | base da API do agente, ex.: `https://app.specwave.dev/agent-api` (fonte `api`) |
 | `agent_token` | — | token de agente pessoal `swa_…` (fonte `api`); `SPEC_WAVE_AGENT_TOKEN` tem precedência |
+| `live_url` | host do `api_url` | base do Session Gateway para a sessão ao vivo (fonte `api`), ex.: `wss://gateway.interno` |
 | `remote_url` | GitHub | override do remoto (testes / git self-hosted). Na fonte `api` exige o placeholder `{repo}`, ex.: `git@git.interno:{repo}.git` |
 | `queue_label` | `spec-wave:dev-agent` | label que marca a fila |
 | `poll_interval_secs` | `60` | intervalo de consulta quando ocioso |
@@ -326,6 +327,12 @@ O que muda em relação à fonte por label:
 - **Desfechos no card.** Sucesso → *Review*; falha → continua em WIP (a falha é
   contada); depois de `max_failures_per_issue` falhas → *Blocked*, com o
   motivo. Não há label para tirar ou pôr — o card é a fila.
+- **Sessão ao vivo.** A saída `stream-json` do executor é transmitida para o
+  Session Gateway, e a tela Development mostra a sessão num drawer (somente
+  leitura), para qualquer pessoa do tenant. É melhor esforço: sem Gateway, com
+  rede ruim ou recusado, o trabalho segue igual e o drawer fica sem mensagens.
+  O endereço do Gateway sai do `api_url` (o CloudFront manda `/ws/*` para ele);
+  `live_url` sobrescreve quando o Gateway está em outro host.
 - **Lease igual.** A API diz o que fazer; o lease em git ref continua sendo o
   que garante um dono por vez (inclusive entre duas máquinas suas).
 - **User-Agent.** O agente se identifica como `spec-wave-agent/<versão>`; o
