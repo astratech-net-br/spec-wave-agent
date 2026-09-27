@@ -172,17 +172,20 @@ pub fn work_branch(issue: u64) -> String {
 /// divergem, e a referência no corpo/título precisa da forma qualificada
 /// (`owner/repo#N`), porque `#{issue}` sozinho num repo de código resolveria
 /// (se resolvesse) para uma issue LOCAL daquele repo, não a do hub.
-pub async fn open_pull_request(ws: &Path, pr_repo: &str, hub_repo: &str, issue: u64, draft: bool) {
+///
+/// Devolve a URL do PR (novo ou o que já existia) — o desfecho leva ao
+/// spec-wave, e o card em Review mostra o link.
+pub async fn open_pull_request(ws: &Path, pr_repo: &str, hub_repo: &str, issue: u64, draft: bool) -> Option<String> {
     let branch = work_branch(issue);
     // Idempotência: relançamento após rodada incompleta, ou takeover por outro
     // agente, não podem gerar um segundo PR do mesmo branch.
     if let Ok(existing) = run(ws, "gh", &["pr", "list", "--repo", pr_repo, "--head", &branch,
-                                          "--state", "open", "--json", "number",
-                                          "--jq", ".[].number"]).await {
-        if existing.ok && !existing.stdout.trim().is_empty() {
-            info!(target: "agent", "PR do #{issue} já existe em {pr_repo} (#{}) — nada a fazer",
-                  existing.stdout.trim());
-            return;
+                                          "--state", "open", "--json", "url",
+                                          "--jq", ".[].url"]).await {
+        let url = existing.stdout.trim().lines().next().unwrap_or("").to_string();
+        if existing.ok && !url.is_empty() {
+            info!(target: "agent", "PR do #{issue} já existe em {pr_repo} ({url}) — nada a fazer");
+            return Some(url);
         }
     }
     // Título da issue: um PR chamado "agent/issue-18" não diz nada em uma fila
@@ -205,13 +208,23 @@ pub async fn open_pull_request(ws: &Path, pr_repo: &str, hub_repo: &str, issue: 
         args.push("--draft");
     }
     match run(ws, "gh", &args).await {
-        Ok(o) if o.ok => info!(target: "agent", "PR aberto em {pr_repo}: {}", o.stdout.trim()),
-        Ok(o) => warn!(target: "agent",
-            "não foi possível abrir o PR do #{issue} em {pr_repo} (abra à mão a partir de \
-             {branch}): {}", o.stderr.trim()),
-        Err(e) => warn!(target: "agent",
-            "não foi possível abrir o PR do #{issue} em {pr_repo} (abra à mão a partir de \
-             {branch}): {e:#}"),
+        Ok(o) if o.ok => {
+            let url = o.stdout.trim().lines().last().unwrap_or("").to_string();
+            info!(target: "agent", "PR aberto em {pr_repo}: {url}");
+            (!url.is_empty()).then_some(url)
+        }
+        Ok(o) => {
+            warn!(target: "agent",
+                "não foi possível abrir o PR do #{issue} em {pr_repo} (abra à mão a partir de \
+                 {branch}): {}", o.stderr.trim());
+            None
+        }
+        Err(e) => {
+            warn!(target: "agent",
+                "não foi possível abrir o PR do #{issue} em {pr_repo} (abra à mão a partir de \
+                 {branch}): {e:#}");
+            None
+        }
     }
 }
 
@@ -229,13 +242,15 @@ pub async fn checkpoint_all(workspace: &Workspace, issue: u64, label: &str) {
 /// só o que tem commit de verdade no branch de trabalho (RFC-005 §6.3:
 /// "N PRs" é um por repositório EFETIVAMENTE tocado, não todo repositório
 /// vinculado ao Project).
-pub async fn open_pull_requests_all(workspace: &Workspace, hub_repo: &str, issue: u64, draft: bool) {
-    open_pull_request(&workspace.hub, hub_repo, hub_repo, issue, draft).await;
+pub async fn open_pull_requests_all(workspace: &Workspace, hub_repo: &str, issue: u64, draft: bool) -> Vec<String> {
+    let mut urls = Vec::new();
+    urls.extend(open_pull_request(&workspace.hub, hub_repo, hub_repo, issue, draft).await);
     for cr in &workspace.code_repos {
         if has_unmerged_commits(&cr.dir).await {
-            open_pull_request(&cr.dir, &cr.repo, hub_repo, issue, draft).await;
+            urls.extend(open_pull_request(&cr.dir, &cr.repo, hub_repo, issue, draft).await);
         }
     }
+    urls
 }
 
 /// Commita e pusha qualquer estado pendente (checkpoint para takeover).

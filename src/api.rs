@@ -42,8 +42,8 @@ pub struct HeartbeatReply {
 /// Desfecho reportado ao spec-wave.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// Trabalho concluído: o card vai para Review.
-    Succeeded,
+    /// Trabalho concluído: o card vai para Review, com os PRs abertos.
+    Succeeded(Vec<String>),
     /// Falhou, mas pode ser transitório: continua em WIP (a API conta).
     Failed(String),
     /// O agente desistiu: o card vai para Blocked com o motivo.
@@ -57,6 +57,8 @@ struct OutcomeBody<'a> {
     outcome: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'a str>,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    pr_urls: &'a [String],
 }
 
 #[derive(Serialize)]
@@ -81,9 +83,9 @@ pub fn queue_item_of(w: &WorkItem) -> Option<QueueItem> {
 
 fn outcome_body<'a>(run_id: &'a str, outcome: &'a Outcome) -> OutcomeBody<'a> {
     match outcome {
-        Outcome::Succeeded => OutcomeBody { run_id, outcome: "succeeded", reason: None },
-        Outcome::Failed(r) => OutcomeBody { run_id, outcome: "failed", reason: Some(r) },
-        Outcome::Blocked(r) => OutcomeBody { run_id, outcome: "blocked", reason: Some(r) },
+        Outcome::Succeeded(prs) => OutcomeBody { run_id, outcome: "succeeded", reason: None, pr_urls: prs },
+        Outcome::Failed(r) => OutcomeBody { run_id, outcome: "failed", reason: Some(r), pr_urls: &[] },
+        Outcome::Blocked(r) => OutcomeBody { run_id, outcome: "blocked", reason: Some(r), pr_urls: &[] },
     }
 }
 
@@ -219,8 +221,12 @@ mod tests {
 
     #[test]
     fn corpo_do_desfecho() {
-        let ok = serde_json::to_value(outcome_body("R1", &Outcome::Succeeded)).unwrap();
+        let ok = serde_json::to_value(outcome_body("R1", &Outcome::Succeeded(vec![]))).unwrap();
         assert_eq!(ok, serde_json::json!({ "runId": "R1", "outcome": "succeeded" }));
+        let prs = vec!["https://github.com/acme/hub/pull/9".to_string()];
+        let ok = serde_json::to_value(outcome_body("R1", &Outcome::Succeeded(prs))).unwrap();
+        assert_eq!(ok, serde_json::json!({ "runId": "R1", "outcome": "succeeded",
+                                           "prUrls": ["https://github.com/acme/hub/pull/9"] }));
         let bl = serde_json::to_value(outcome_body("R1", &Outcome::Blocked("3 falhas".into()))).unwrap();
         assert_eq!(bl, serde_json::json!({ "runId": "R1", "outcome": "blocked", "reason": "3 falhas" }));
     }

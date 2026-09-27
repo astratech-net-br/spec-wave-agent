@@ -342,6 +342,39 @@ O que muda em relação à fonte por label:
   que garante um dono por vez (inclusive entre duas máquinas suas).
 - **User-Agent.** O agente se identifica como `spec-wave-agent/<versão>`; o
   WAF do spec-wave recusa requisições sem User-Agent.
+- **PRs no card.** No sucesso, o desfecho leva as URLs dos PRs abertos, e o
+  card em *Review* mostra os links.
+
+## Modo `--once` (Fleet Job da frota)
+
+Na frota do spec-wave (RFC-008), o `spec-wave-sandbox` do cliente cria um Job
+por execução, e dentro dele o `fleet-runner` roda:
+
+```bash
+spec-wave-agent --once [--config agent.toml]
+```
+
+O agente faz uma execução só — lease, executor, rodadas, checkpoint e PR,
+exatamente como no daemon — e sai. A execução vem do ambiente que o sandbox
+monta: `SPECWAVE_HUB_REPO`, `SPECWAVE_WORK_ITEM`, `SPECWAVE_KIND`, `RUN_ID` e
+`FLEET_WORKDIR` (o clone fica em `$FLEET_WORKDIR/agent`, o stream das stories
+em `$FLEET_WORKDIR/streams/<RUN_ID>`). Config: `--config`, senão
+`$SPEC_WAVE_AGENT_CONFIG` (ex.: um ConfigMap com prompt e executor da frota), senão
+os defaults.
+
+Ele **não** fala com a API do spec-wave: emite eventos JSONL no stdout (os
+logs continuam no stderr), que o `fleet-runner` traduz para o sandbox:
+
+```json
+{"event":"claimed","generation":1}
+{"event":"line","origin":null,"line":"<stream-json do orquestrador>"}
+{"event":"line","origin":"story:3","line":"<stream-json da story>"}
+{"event":"outcome","state":"succeeded","reason":null,"pr_urls":["https://…/pull/7"]}
+```
+
+`state`: `succeeded`, `failed`, `blocked`, `canceled` (SIGTERM — checkpoint
+pushado e lease liberado) ou `skipped` (outro agente já tem o lease, ou o
+lease foi perdido). Um erro de infraestrutura também sai como `failed`.
 
 ## Desenvolvimento
 

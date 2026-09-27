@@ -261,10 +261,10 @@ async fn process_issue(
             // Review. Sem isso, as Stories chegavam lá e a fila do Tech Leader
             // mostrava "sem PR" em todas. Um PR por repositório efetivamente
             // tocado (hub sempre; código de acordo com o que a issue declarou).
-            open_pull_requests_all(&workspace, &cfg.repo, issue, cfg.pr_draft).await;
+            let prs = open_pull_requests_all(&workspace, &cfg.repo, issue, cfg.pr_draft).await;
             if api.is_some() {
-                // Pela API, "sair da fila" é o card ir para Review.
-                report(api, Outcome::Succeeded).await;
+                // Pela API, "sair da fila" é o card ir para Review (com os PRs).
+                report(api, Outcome::Succeeded(prs)).await;
             } else {
                 let _ = run(ws, "gh",
                     &["issue", "edit", &issue.to_string(), "--repo", &cfg.repo,
@@ -388,6 +388,12 @@ OPÇÕES:
     -c, --config <PATH>  Arquivo de configuração TOML.
                          Default: $SPEC_WAVE_AGENT_CONFIG, ou
                          ~/.config/spec-wave-agent/config.toml
+        --once           Executa UMA execução da frota (Fleet Job, RFC-008) a
+                         partir do ambiente montado pelo spec-wave-sandbox
+                         (SPECWAVE_HUB_REPO, SPECWAVE_WORK_ITEM, SPECWAVE_KIND,
+                         RUN_ID, FLEET_WORKDIR) e emite eventos JSONL no
+                         stdout. Config: --config, senão
+                         $SPEC_WAVE_AGENT_CONFIG, senão os defaults.
     -V, --version        Imprime a versão e sai
     -h, --help           Imprime esta ajuda e sai
 
@@ -398,11 +404,13 @@ trabalho em andamento e libera o lease). Log via RUST_LOG (ex.: RUST_LOG=debug).
 /// flags, e a dependência não se paga.
 struct Args {
     config: Option<String>,
+    once: bool,
 }
 
 /// `Ok(None)` = já respondeu (--help/--version) e o processo deve sair.
 fn parse_args() -> Result<Option<Args>> {
     let mut config = None;
+    let mut once = false;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -417,6 +425,7 @@ fn parse_args() -> Result<Option<Args>> {
                 println!("{USAGE}");
                 return Ok(None);
             }
+            "--once" => once = true,
             "--config" | "-c" => {
                 config = Some(it.next().ok_or_else(|| {
                     anyhow::anyhow!("--config exige um caminho")
@@ -429,13 +438,16 @@ fn parse_args() -> Result<Option<Args>> {
             }
         }
     }
-    Ok(Some(Args { config }))
+    Ok(Some(Args { config, once }))
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let Some(args) = parse_args()? else { return Ok(()) };
     init_tracing();
+    if args.once {
+        return run_once(args.config.as_deref()).await;
+    }
     let cfg = load_config_from(args.config.as_deref())?;
     cfg.validate()?;
     let me = cfg.agent_id();
@@ -696,6 +708,196 @@ async fn run_api_loop(cfg: &Config, me: &str, sd_rx: watch::Receiver<bool>) -> R
         }
     }
     info!(target: "agent", "encerrado");
+    Ok(())
+}
+
+// ---------- Modo --once: Fleet Job (RFC-008 fase 6, spec do sandbox §19.5) ----------
+//
+// O spec-wave-sandbox cria um Job por execução; dentro dele o fleet-runner
+// lança `spec-wave-agent --once`. O agente faz exatamente o que faz no modo
+// daemon para UM item — lease, executor, rodadas, checkpoint, PR —, mas:
+//   - a execução vem do ambiente (não de fila nem de API);
+//   - não fala com a API do spec-wave: quem reporta é o fleet-runner, pelo
+//     sandbox. O agente só emite eventos JSONL no stdout (os logs vão para o
+//     stderr, como sempre):
+//       {"event":"claimed","generation":N}
+//       {"event":"line","origin":null|"story:N","line":"<stream-json>"}
+//       {"event":"outcome","state":"succeeded|failed|blocked|canceled|skipped",
+//        "reason":"...","pr_urls":[...]}
+
+/// Execução recebida do sandbox (env do Fleet Job).
+struct FleetRun {
+    hub: String,
+    issue: u64,
+    kind: QueueKind,
+    run_id: String,
+    workdir: String,
+}
+
+fn fleet_run_from_env() -> Result<FleetRun> {
+    let var = |k: &str| std::env::var(k).map(|v| v.trim().to_string()).unwrap_or_default();
+    let hub = var("SPECWAVE_HUB_REPO");
+    let issue: u64 = var("SPECWAVE_WORK_ITEM").parse().ok().filter(|n| *n > 0)
+        .ok_or_else(|| anyhow::anyhow!("SPECWAVE_WORK_ITEM ausente ou não é o número de uma issue"))?;
+    let kind = match var("SPECWAVE_KIND").as_str() {
+        "bug" => QueueKind::Bug,
+        "feature" | "" => QueueKind::Feature,
+        k => bail!("SPECWAVE_KIND desconhecido: {k}"),
+    };
+    let run_id = var("RUN_ID");
+    let workdir = var("FLEET_WORKDIR");
+    if hub.is_empty() || run_id.is_empty() || workdir.is_empty() {
+        bail!("--once exige SPECWAVE_HUB_REPO, RUN_ID e FLEET_WORKDIR (o spec-wave-sandbox monta)");
+    }
+    Ok(FleetRun { hub, issue, kind, run_id, workdir })
+}
+
+/// Eventos para o fleet-runner: uma linha JSON por evento no stdout.
+#[derive(Clone)]
+struct Events(tokio::sync::mpsc::UnboundedSender<String>);
+
+impl Events {
+    fn start() -> (Events, tokio::task::JoinHandle<()>) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let task = tokio::spawn(async move {
+            use std::io::Write;
+            // Escrita síncrona: uma linha curta por evento, com flush — o
+            // fleet-runner lê linha a linha e não pode ficar esperando buffer.
+            while let Some(line) = rx.recv().await {
+                let mut out = std::io::stdout().lock();
+                if writeln!(out, "{line}").is_err() || out.flush().is_err() { return; }
+            }
+        });
+        (Events(tx), task)
+    }
+
+    fn emit(&self, v: serde_json::Value) {
+        let _ = self.0.send(v.to_string());
+    }
+
+    fn outcome(&self, state: &str, reason: Option<&str>, pr_urls: &[String]) {
+        self.emit(serde_json::json!({
+            "event": "outcome", "state": state, "reason": reason, "pr_urls": pr_urls,
+        }));
+    }
+}
+
+async fn run_once(config: Option<&str>) -> Result<()> {
+    let (events, writer) = Events::start();
+    let result = run_once_inner(config, &events).await;
+    if let Err(e) = &result {
+        // Erro de infraestrutura (clone, preflight, lease-repo): o fleet-runner
+        // precisa de um desfecho mesmo assim.
+        events.outcome("failed", Some(&format!("erro de infraestrutura no agente: {e:#}")), &[]);
+    }
+    drop(events);
+    let _ = writer.await;
+    result
+}
+
+async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
+    let job = fleet_run_from_env()?;
+    // --config > SPEC_WAVE_AGENT_CONFIG (o cliente personaliza prompt e
+    // executor da frota — ex.: um ConfigMap montado no Job) > defaults.
+    let env_cfg = std::env::var("SPEC_WAVE_AGENT_CONFIG").ok().filter(|p| !p.trim().is_empty());
+    let mut cfg = match config.map(str::to_string).or(env_cfg) {
+        Some(path) => load_config_from(Some(&path))?,
+        None => Config::defaults(),
+    };
+    cfg.source = Source::GithubLabel; // o item vem do ambiente; a borda é o fleet-runner
+    cfg.repo = job.hub.clone();
+    cfg.workdir = Path::new(&job.workdir).join("agent").to_string_lossy().into_owned();
+    cfg.agent_id = Some(format!("fleet:{}", job.run_id));
+    cfg.validate()?;
+    let me = cfg.agent_id();
+    std::fs::create_dir_all(&cfg.workdir)?;
+    let workdir = Path::new(&cfg.workdir).to_path_buf();
+    preflight(&workdir).await?;
+
+    // SIGTERM (cancelamento pelo spec-wave, §19.9) = checkpoint + release.
+    let (stop_tx, stop_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        info!(target: "agent", "sinal de término recebido — checkpoint e release");
+        let _ = stop_tx.send(true);
+    });
+
+    let leases = LeaseRepo::open(workdir.join("lease-repo"), &cfg.remote_url()).await?;
+    let issue = job.issue;
+    let Some(lease) = leases.try_acquire(issue, &me, cfg.lease_ttl_secs).await? else {
+        events.outcome("skipped", Some("outro agente já detém o lease desta issue"), &[]);
+        return Ok(());
+    };
+    events.emit(serde_json::json!({ "event": "claimed", "generation": lease.generation }));
+    info!(target: "agent", "fleet {}: claim OK na issue #{issue} (gen {})", job.run_id, lease.generation);
+
+    let (lost_tx, lost_rx) = watch::channel(false);
+    let hb = spawn_heartbeat(leases.clone(), lease, cfg.heartbeat_secs, cfg.lease_ttl_secs, lost_tx);
+
+    // Linhas do orquestrador (tap) e de cada story (arquivos que o
+    // `spec-wave implement` ≥ 1.4 grava) viram eventos `line`.
+    let stream_dir = Path::new(&job.workdir).join("streams").join(&job.run_id);
+    std::fs::create_dir_all(&stream_dir)?;
+    let (tap_tx, mut tap_rx) = tokio::sync::mpsc::channel::<spec_wave_agent::runner::LiveLine>(4096);
+    let forward = {
+        let events = events.clone();
+        tokio::spawn(async move {
+            while let Some(l) = tap_rx.recv().await {
+                events.emit(serde_json::json!({ "event": "line", "origin": l.origin, "line": l.line }));
+            }
+        })
+    };
+    let stories = spec_wave_agent::live::StoryTail::spawn(stream_dir.clone(), tap_tx.clone());
+    let hooks = spec_wave_agent::runner::LiveHooks { tap: tap_tx.clone(), stream_dir: stream_dir.clone() };
+    drop(tap_tx);
+
+    let item = QueueItem { kind: job.kind, number: issue };
+    let outcome = async {
+        let workspace = ensure_workspace(&cfg, issue).await?;
+        let end = run_item_with_tap(&cfg, &workspace.hub, item, lost_rx.clone(), stop_rx, Some(hooks)).await?;
+        Ok::<_, anyhow::Error>((workspace, end))
+    }.await;
+    stories.finish().await;
+    let _ = forward.await;
+    hb.abort();
+
+    let (workspace, end) = match outcome {
+        Ok(v) => v,
+        Err(e) => {
+            if !*lost_rx.borrow() {
+                let _ = leases.release(issue).await;
+            }
+            return Err(e);
+        }
+    };
+    match end {
+        RunEnd::Success(result) => {
+            checkpoint_all(&workspace, issue, "success").await;
+            if item.kind == QueueKind::Bug {
+                if let Some(body) = render_bug_report(&result, &me) {
+                    let _ = run(&workspace.hub, "gh",
+                        &["issue", "comment", &issue.to_string(), "--repo", &cfg.repo, "--body", &body]).await;
+                }
+            }
+            let prs = open_pull_requests_all(&workspace, &cfg.repo, issue, cfg.pr_draft).await;
+            leases.release(issue).await?;
+            events.outcome("succeeded", None, &prs);
+        }
+        RunEnd::Failed(reason) => {
+            checkpoint_all(&workspace, issue, "failed").await;
+            leases.release(issue).await?;
+            events.outcome("failed", Some(&reason), &[]);
+        }
+        RunEnd::Interrupted => {
+            checkpoint_all(&workspace, issue, "interrupted").await;
+            leases.release(issue).await?;
+            events.outcome("canceled", Some("interrompido pelo spec-wave: checkpoint pushado no branch"), &[]);
+        }
+        RunEnd::LeaseLost => {
+            // Sem checkpoint nem release: o novo dono manda.
+            events.outcome("skipped", Some("lease perdido durante a execução — outro agente assumiu"), &[]);
+        }
+    }
     Ok(())
 }
 
