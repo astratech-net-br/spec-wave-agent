@@ -230,3 +230,37 @@ async fn has_unmerged_commits_distingue_branch_tocado_de_intocado() {
     assert!(has_unmerged_commits(&ws.hub).await,
             "commit no branch de trabalho deveria contar como unmerged");
 }
+
+#[tokio::test]
+async fn checkpoint_nao_leva_arquivos_de_trabalho_do_cli() {
+    let tmp = TempDir::new().unwrap();
+    // O executor deixa o cache e o contexto do `implement` no clone (o
+    // repositório não os ignora) e termina sem commitar o resto: é o
+    // checkpoint de sucesso que faz `git add -A`.
+    let cfg = setup(&tmp, r#"
+        cat > /dev/null
+        mkdir -p .spec-wave/cache .spec-wave/prompts
+        echo '{}' > .spec-wave/cache/subissues-7.json
+        echo contexto > .spec-wave/implement-7.md
+        echo prompt > .spec-wave/prompts/plan.md
+        echo codigo > codigo.txt
+        git config user.name t && git config user.email t@t
+        printf '{"status": "ok"}' > .spec-wave-agent-result.json
+    "#, 60);
+    let (_lt, lr, _st, sr) = channels();
+    let ws = ensure_workspace(&cfg, 7).await.unwrap();
+    let end = run_item(&cfg, &ws.hub, QueueItem { kind: QueueKind::Feature, number: 7 }, lr, sr).await.unwrap();
+    assert!(matches!(end, RunEnd::Success(_)));
+    spec_wave_agent::runner::checkpoint(&ws.hub, 7, "success").await;
+
+    let out = Command::new("git")
+        .args(["ls-tree", "-r", "--name-only", "agent/issue-7"])
+        .current_dir(tmp.path().join("origin.git"))
+        .output().unwrap();
+    let files = String::from_utf8_lossy(&out.stdout);
+    assert!(files.contains("codigo.txt"), "o trabalho precisa ir: {files}");
+    // Override de prompt do projeto é arquivo de verdade — continua indo.
+    assert!(files.contains(".spec-wave/prompts/plan.md"), "{files}");
+    assert!(!files.contains(".spec-wave/cache/"), "cache do CLI foi para o branch: {files}");
+    assert!(!files.contains("implement-7.md"), "contexto do implement foi para o branch: {files}");
+}

@@ -1,6 +1,6 @@
 [package]
 name = "spec-wave-agent"
-version = "0.38.0"
+version = "0.38.1"
 edition = "2021"
 description = "Distributed dev-machine agent for the spec-wave workflow (RFC-001)"
 

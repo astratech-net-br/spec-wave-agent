@@ -48,6 +48,7 @@ pub async fn ensure_workspace(cfg: &Config, issue: u64) -> Result<Workspace> {
         }).await?;
     }
     ensure_branch(&ws, issue).await?;
+    exclude_scratch(&ws);
 
     // RFC-005 §6.3/§7.2: repositórios de código que a issue declara (labels
     // `repo:<slug>`; uma Feature agrega os das Stories). Reusa o `workspace
@@ -58,6 +59,37 @@ pub async fn ensure_workspace(cfg: &Config, issue: u64) -> Result<Workspace> {
     let code_repos = prepare_code_repos(&ws, issue).await?;
 
     Ok(Workspace { hub: ws, code_repos })
+}
+
+/// Arquivos de trabalho LOCAIS do spec-wave CLI que nunca podem ir para o
+/// branch: o cache de rede e o contexto que o `implement` monta por item. O
+/// checkpoint faz `git add -A` — num repositório cujo `.gitignore` não os
+/// cobre, eles iam parar no PR (achado no MVP da frota, RFC-008 fase 7: +1.6k
+/// linhas de contexto no PR de uma Feature de 34 linhas).
+const SCRATCH_EXCLUDES: &[&str] = &[".spec-wave/cache/", ".spec-wave/implement-*.md"];
+
+/// Acrescenta os padrões ao `.git/info/exclude` do clone — local, não mexe no
+/// repositório de ninguém. Idempotente.
+fn exclude_scratch(dir: &Path) {
+    let path = dir.join(".git").join("info").join("exclude");
+    let current = std::fs::read_to_string(&path).unwrap_or_default();
+    let missing: Vec<&str> = SCRATCH_EXCLUDES.iter().copied()
+        .filter(|p| !current.lines().any(|l| l.trim() == *p))
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(path.parent().unwrap());
+    let mut next = current;
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    next.push_str("# spec-wave-agent: arquivos de trabalho do spec-wave CLI\n");
+    for p in missing {
+        next.push_str(p);
+        next.push('\n');
+    }
+    let _ = std::fs::write(&path, next);
 }
 
 /// Retomada: se o branch de trabalho já existe no remoto (outro agente
@@ -127,6 +159,7 @@ async fn prepare_code_repos(hub: &Path, issue: u64) -> Result<Vec<CodeRepoWorksp
         let dir = PathBuf::from(&r.dir);
         ensure_branch(&dir, issue).await
             .with_context(|| format!("branch de trabalho em {} ({})", r.repo, dir.display()))?;
+        exclude_scratch(&dir);
         code_repos.push(CodeRepoWorkspace { repo: r.repo, dir });
     }
     Ok(code_repos)
