@@ -467,8 +467,8 @@ async fn main() -> Result<()> {
         return run_api_loop(&cfg, &me, sd_rx).await;
     }
 
-    let leases = LeaseRepo::open(
-        workdir.join("lease-repo"), &cfg.remote_url()).await?;
+    let leases = LeaseRepo::open_with_prefix(
+        workdir.join("lease-repo"), &cfg.remote_url(), &cfg.lease_ref_prefix).await?;
     info!(target: "agent", "{me} iniciando; repo {} fila '{}'",
           cfg.repo, cfg.queue_label);
 
@@ -650,9 +650,9 @@ async fn run_api_loop(cfg: &Config, me: &str, sd_rx: watch::Receiver<bool>) -> R
                         // pode derrubar o daemon — os outros itens seguem.
                         let opened = async {
                             std::fs::create_dir_all(&item_cfg.workdir)?;
-                            LeaseRepo::open(
+                            LeaseRepo::open_with_prefix(
                                 Path::new(&item_cfg.workdir).join("lease-repo"),
-                                &item_cfg.remote_url()).await
+                                &item_cfg.remote_url(), &item_cfg.lease_ref_prefix).await
                         }.await;
                         match opened {
                             Ok(repo) => { leases_by_repo.insert(work.repo.clone(), repo); }
@@ -822,7 +822,8 @@ async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
         let _ = stop_tx.send(true);
     });
 
-    let leases = LeaseRepo::open(workdir.join("lease-repo"), &cfg.remote_url()).await?;
+    let leases = LeaseRepo::open_with_prefix(
+        workdir.join("lease-repo"), &cfg.remote_url(), &cfg.lease_ref_prefix).await?;
     let issue = job.issue;
     let Some(lease) = leases.try_acquire(issue, &me, cfg.lease_ttl_secs).await? else {
         events.outcome("skipped", Some("outro agente já detém o lease desta issue"), &[]);

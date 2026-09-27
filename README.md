@@ -345,6 +345,35 @@ O que muda em relação à fonte por label:
 - **PRs no card.** No sucesso, o desfecho leva as URLs dos PRs abertos, e o
   card em *Review* mostra os links.
 
+## Namespace do lease e conformidade por host
+
+O lease é uma ref git por issue. O namespace padrão é
+`refs/heads/spec-wave-agent/claims/<n>` — aceito por qualquer host, mas as refs
+aparecem na lista de branches e podem disparar CI com `on: push` sem filtro.
+Com
+
+```toml
+lease_ref_prefix = "refs/spec-wave/claims"
+```
+
+as refs saem de `refs/heads/`: não viram branch nem disparam pipeline. **Todos
+os agentes de um repositório (locais e da frota) precisam usar o mesmo
+prefixo** — dois prefixos são dois leases, e a exclusão mútua acaba.
+
+Antes de usar um host novo (ou trocar o prefixo), rode a suíte de
+conformidade contra um repositório de teste com permissão de push:
+
+```bash
+SPEC_WAVE_LEASE_REMOTE=https://github.com/<org>/<repo-de-teste>.git \
+SPEC_WAVE_LEASE_PREFIXES=refs/heads/spec-wave-agent/claims,refs/spec-wave/claims \
+cargo test --test lease_conformance -- --ignored --test-threads=1 --nocapture
+```
+
+Ela confere, em cada prefixo, que o servidor arbitra de verdade: adquirir e
+bloquear o segundo agente, corrida simultânea com um vencedor só, renovar,
+roubo depois do TTL com fencing do dono antigo, release, e onde a ref aparece.
+**GitHub passa nos dois prefixos** (2026-09-27).
+
 ## Modo `--once` (Fleet Job da frota)
 
 Na frota do spec-wave (RFC-008), o `spec-wave-sandbox` do cliente cria um Job
