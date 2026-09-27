@@ -168,6 +168,26 @@ async fn tail_stories(dir: PathBuf, tx: mpsc::Sender<LiveLine>, mut stop: watch:
     }
 }
 
+/// Acompanhamento das stories fora do LiveStream (modo `--once` do Fleet Job,
+/// em que quem transmite é o fleet-runner): mesmas regras — só linhas
+/// completas, passada final no `finish`.
+pub struct StoryTail {
+    stop: watch::Sender<bool>,
+    task: JoinHandle<()>,
+}
+
+impl StoryTail {
+    pub fn spawn(dir: PathBuf, tx: mpsc::Sender<LiveLine>) -> StoryTail {
+        let (stop, stop_rx) = watch::channel(false);
+        StoryTail { stop, task: tokio::spawn(tail_stories(dir, tx, stop_rx)) }
+    }
+
+    pub async fn finish(self) {
+        let _ = self.stop.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(3), self.task).await;
+    }
+}
+
 /// URL do produtor no Gateway, derivada da `api_url`: o Gateway fica atrás do
 /// mesmo domínio (o CloudFront manda `/ws/*` para ele).
 pub fn producer_url(api_url: &str, w: &WorkItem) -> Option<String> {

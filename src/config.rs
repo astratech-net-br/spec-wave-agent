@@ -304,6 +304,12 @@ pub fn load_config_from(override_path: Option<&str>) -> Result<Config> {
 }
 
 impl Config {
+    /// Config só com os defaults — base do modo `--once` do Fleet Job, que
+    /// recebe o resto do ambiente montado pelo spec-wave-sandbox.
+    pub fn defaults() -> Config {
+        toml::from_str("").expect("os defaults da Config são válidos")
+    }
+
     pub fn validate(&self) -> Result<()> {
         match self.source {
             Source::GithubLabel => validate_repo(&self.repo)?,
