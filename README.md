@@ -358,7 +358,9 @@ O agente faz uma execução só — lease, executor, rodadas, checkpoint e PR,
 exatamente como no daemon — e sai. A execução vem do ambiente que o sandbox
 monta: `SPECWAVE_HUB_REPO`, `SPECWAVE_WORK_ITEM`, `SPECWAVE_KIND`, `RUN_ID` e
 `FLEET_WORKDIR` (o clone fica em `$FLEET_WORKDIR/agent`, o stream das stories
-em `$FLEET_WORKDIR/streams/<RUN_ID>`). Sem `--config`, valem os defaults.
+em `$FLEET_WORKDIR/streams/<RUN_ID>`). Config: `--config`, senão
+`$SPEC_WAVE_AGENT_CONFIG` (ex.: um ConfigMap com prompt e executor da frota), senão
+os defaults.
 
 Ele **não** fala com a API do spec-wave: emite eventos JSONL no stdout (os
 logs continuam no stderr), que o `fleet-runner` traduz para o sandbox:

@@ -392,7 +392,8 @@ OPÇÕES:
                          partir do ambiente montado pelo spec-wave-sandbox
                          (SPECWAVE_HUB_REPO, SPECWAVE_WORK_ITEM, SPECWAVE_KIND,
                          RUN_ID, FLEET_WORKDIR) e emite eventos JSONL no
-                         stdout. Sem --config, usa os defaults.
+                         stdout. Config: --config, senão
+                         $SPEC_WAVE_AGENT_CONFIG, senão os defaults.
     -V, --version        Imprime a versão e sai
     -h, --help           Imprime esta ajuda e sai
 
@@ -796,8 +797,11 @@ async fn run_once(config: Option<&str>) -> Result<()> {
 
 async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
     let job = fleet_run_from_env()?;
-    let mut cfg = match config {
-        Some(path) => load_config_from(Some(path))?,
+    // --config > SPEC_WAVE_AGENT_CONFIG (o cliente personaliza prompt e
+    // executor da frota — ex.: um ConfigMap montado no Job) > defaults.
+    let env_cfg = std::env::var("SPEC_WAVE_AGENT_CONFIG").ok().filter(|p| !p.trim().is_empty());
+    let mut cfg = match config.map(str::to_string).or(env_cfg) {
+        Some(path) => load_config_from(Some(&path))?,
         None => Config::defaults(),
     };
     cfg.source = Source::GithubLabel; // o item vem do ambiente; a borda é o fleet-runner
