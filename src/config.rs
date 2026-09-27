@@ -109,7 +109,17 @@ pub struct Config {
     pub agent_id: Option<String>,
     /// Override da URL do remoto (testes / git self-hosted). Default: GitHub.
     pub remote_url: Option<String>,
+    /// Namespace das refs de lease. Default `refs/heads/spec-wave-agent/claims`
+    /// (aceito por todo host git). `refs/spec-wave/claims` tira as refs da
+    /// lista de branches e não dispara CI — passou na suíte de conformidade
+    /// do GitHub (tests/lease_conformance.rs); em outro host, rode a suíte
+    /// antes de trocar. Todos os agentes de um repositório precisam usar o
+    /// MESMO prefixo, senão o lease deixa de ser exclusivo.
+    #[serde(default = "d_lease_prefix")]
+    pub lease_ref_prefix: String,
 }
+
+fn d_lease_prefix() -> String { crate::lease::DEFAULT_LEASE_PREFIX.into() }
 
 fn d_queue_label() -> String { "spec-wave:dev-agent".into() }
 fn d_poll() -> u64 { 60 }
@@ -311,6 +321,10 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if !crate::lease::valid_lease_prefix(&self.lease_ref_prefix) {
+            bail!("lease_ref_prefix inválido: {:?} (esperado refs/…, ex.: refs/spec-wave/claims)",
+                  self.lease_ref_prefix);
+        }
         match self.source {
             Source::GithubLabel => validate_repo(&self.repo)?,
             Source::Api => {

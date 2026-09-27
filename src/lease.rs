@@ -51,13 +51,36 @@ impl std::fmt::Display for RenewError {
     }
 }
 
+/// Namespace padrão das refs de lease (o de sempre). `refs/heads/` é o que
+/// todo host git aceita; o custo é aparecer na lista de branches e poder
+/// disparar CI com `on: push` sem filtro (RFC-008 §6.9, P18).
+pub const DEFAULT_LEASE_PREFIX: &str = "refs/heads/spec-wave-agent/claims";
+
 #[derive(Clone)]
 pub struct LeaseRepo {
     dir: PathBuf,
+    prefix: String,
+}
+
+/// Prefixo aceito para refs de lease: `refs/...`, sem espaço, `..`, `~`, `^`,
+/// `:`, `?`, `*`, `[` ou `\\` (regras de nome de ref do git) e sem barra no fim.
+pub fn valid_lease_prefix(p: &str) -> bool {
+    p.starts_with("refs/") && p.len() > 5 && !p.ends_with('/')
+        && !p.contains("..") && !p.contains("//")
+        && !p.chars().any(|c| c.is_whitespace() || "~^:?*[\\".contains(c))
 }
 
 impl LeaseRepo {
     pub async fn open(dir: PathBuf, remote_url: &str) -> Result<Self> {
+        Self::open_with_prefix(dir, remote_url, DEFAULT_LEASE_PREFIX).await
+    }
+
+    /// `prefix`: namespace das refs de lease (ex.: `refs/spec-wave/claims`,
+    /// fora de `refs/heads/` — não polui branches nem dispara CI).
+    pub async fn open_with_prefix(dir: PathBuf, remote_url: &str, prefix: &str) -> Result<Self> {
+        if !valid_lease_prefix(prefix) {
+            bail!("prefixo de lease inválido: {prefix:?} (esperado refs/…)");
+        }
         if !dir.join(".git").exists() {
             std::fs::create_dir_all(&dir)?;
             run_ok(&dir, "git", &["init", "--quiet"]).await?;
@@ -67,16 +90,16 @@ impl LeaseRepo {
         // worktree; não depender do gitconfig global da máquina.
         run_ok(&dir, "git", &["config", "user.name", "spec-wave-agent"]).await?;
         run_ok(&dir, "git", &["config", "user.email", "agent@spec-wave"]).await?;
-        Ok(Self { dir })
+        Ok(Self { dir, prefix: prefix.to_string() })
     }
 
-    fn claim_ref(issue: u64) -> String {
-        format!("refs/heads/spec-wave-agent/claims/{issue}")
+    fn claim_ref(&self, issue: u64) -> String {
+        format!("{}/{issue}", self.prefix)
     }
 
     /// Lê o lease atual do remoto. Retorna (sha_da_ref, lease) ou None.
     async fn fetch(&self, issue: u64) -> Result<Option<(String, Lease)>> {
-        let r = Self::claim_ref(issue);
+        let r = self.claim_ref(issue);
         let ls = run(&self.dir, "git", &["ls-remote", "origin", &r]).await?;
         if !ls.ok {
             bail!("git ls-remote falhou: {}", ls.stderr.trim());
@@ -147,7 +170,7 @@ impl LeaseRepo {
     pub async fn try_acquire(&self, issue: u64, owner: &str, ttl: i64)
         -> Result<Option<Lease>>
     {
-        let r = Self::claim_ref(issue);
+        let r = self.claim_ref(issue);
         match self.fetch(issue).await? {
             None => {
                 // Ref não existe: push NÃO-forçado = CAS de criação.
@@ -190,7 +213,7 @@ impl LeaseRepo {
     /// Renova o heartbeat via CAS. Lost => fencing imediato (abortar tudo);
     /// Transient => o chamador pode tentar de novo dentro do orçamento.
     pub async fn renew(&self, lease: &mut Lease) -> Result<(), RenewError> {
-        let r = Self::claim_ref(lease.issue);
+        let r = self.claim_ref(lease.issue);
         let (cur_sha, cur) = match self.fetch(lease.issue).await {
             Err(e) => return Err(RenewError::Transient(e)),
             Ok(None) => return Err(RenewError::Lost("ref do lease sumiu".into())),
@@ -226,7 +249,7 @@ impl LeaseRepo {
     }
 
     pub async fn release(&self, issue: u64) -> Result<()> {
-        let r = Self::claim_ref(issue);
+        let r = self.claim_ref(issue);
         let _ = run(&self.dir, "git",
                     &["push", "--quiet", "origin", &format!(":{r}")]).await;
         Ok(())
@@ -236,6 +259,15 @@ impl LeaseRepo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefixo_de_lease() {
+        assert!(valid_lease_prefix(DEFAULT_LEASE_PREFIX));
+        assert!(valid_lease_prefix("refs/spec-wave/claims"));
+        for bad in ["refs/", "heads/x", "refs/a/", "refs/a..b", "refs/a b", "refs/a:b", "refs/a*", "refs//a"] {
+            assert!(!valid_lease_prefix(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn is_expired_fronteiras() {
