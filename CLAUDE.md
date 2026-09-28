@@ -34,3 +34,10 @@ The daemon is built around a **distributed lease implemented on git refs** — t
 - **Testability seams**: `Config.remote_url` overrides the `https://github.com/{repo}.git` default (integration tests use a local bare repo as origin; with `source = "api"` it must contain the `{repo}` placeholder, substituted per item by `for_repo` — a fixed remote would make every product share one clone and lease, so `validate()` rejects it); `LeaseRepo::open` sets a local git identity (`commit-tree` needs one).
 
 Config invariants are enforced by `Config::validate()` at boot — notably `lease_ttl_secs >= 4 × heartbeat_secs`.
+
+## Work items live in the hub (SpecWave multi-repo)
+
+This is a **code** repository of the SpecWave hub `astratech-net-br/spec-wave-ui` (`.spec-wave.json` → `role: "code"`). Issues, the GitHub Project (org project 2), specs, plans and the spec-wave flow workflows all live in the hub. Don't open issues here, and don't run flow commands (`spec-wave spec/plan/decompose/…`) in this repo — they refuse on a `code` role.
+
+- Link a PR to its Story with the qualified form `Closes astratech-net-br/spec-wave-ui#<n>`. A bare `#<n>` refers to this repo and is discarded by the hub, so the board never moves.
+- A PR here only triggers the `code-review.yml`/`qa.yml` dispatchers, which send a `repository_dispatch` to the hub (`pr-events.yml`). They need the org GitHub App secrets (`SPEC_WAVE_APP_ID` + `SPEC_WAVE_APP_PRIVATE_KEY`) or `SPEC_WAVE_HUB_TOKEN`.
