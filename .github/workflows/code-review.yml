@@ -1,101 +1,78 @@
 name: Code Review
 
+# Repositório de CÓDIGO (RFC-005 §7.1): este workflow não roda a CLI nem toca
+# no board. Ele só avisa o hub — onde vivem as issues e o GitHub Project — que
+# um PR foi aberto aqui. O hub recebe o aviso em pr-events.yml e faz o resto,
+# dentro da trava por item que o serializa com o decompose. `concurrency` do
+# GitHub é por repositório: com N repos de código, só centralizar no hub
+# devolve a serialização.
+#
+# O hub é lido do .spec-wave.json deste repositório em tempo de execução, e
+# NÃO carimbado no YAML: o `update` compara este arquivo byte a byte com o
+# template empacotado, e um hub embutido o marcaria como desatualizado para
+# sempre.
+#
+# Token para despachar (o repository_dispatch exige escrita em Contents NO
+# HUB; o GITHUB_TOKEN só enxerga este repositório): a GitHub App da
+# organização (SPEC_WAVE_APP_ID + SPEC_WAVE_APP_PRIVATE_KEY, instalada nos
+# dois repos) emite um token restrito ao hub; sem ela, o secret
+# SPEC_WAVE_HUB_TOKEN (PAT) continua valendo.
 on:
   pull_request:
     types: [opened, reopened]
 
-# Trava por PR: protege contra o mesmo PR ser processado duas vezes. A trava que
-# importa de verdade é a do job `move`, por ITEM — ver o comentário lá.
 concurrency:
-  group: spec-wave-code-review-${{ github.event.pull_request.number }}
+  group: spec-wave-dispatch-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 
+# `secrets` não entra em `if`; a presença da GitHub App vira env.
+env:
+  SPEC_WAVE_APP_PRESENT: ${{ secrets.SPEC_WAVE_APP_PRIVATE_KEY != '' }}
+
 jobs:
-  # Descobre a Feature-alvo ANTES de tocar no board. Existe só para dar a chave
-  # de concurrency ao job seguinte: `concurrency` de workflow é avaliada no
-  # trigger, quando ainda não se sabe qual issue o PR implementa.
-  resolve:
-    # Modo de execução: `spec-wave mode local` cria a variável de repositório
-    # SPEC_WAVE_EXECUTION=local e este job passa a ser PULADO — run aparece como
-    # skipped e job que não roda não é faturado. `mode actions` remove a variável.
-    # PR de DOCUMENTO não é PR de implementação. O fluxo publica spec.md,
-    # plan.md, bug.md e decomposition.md em branches `spec-wave/*`, e deixar este
-    # workflow rodar em cima delas move o board por um PR que não implementa
-    # nada. Nos Actions um PR aberto pelo GITHUB_TOKEN não dispara workflow, mas
-    # um aberto no modo local (ou via GH_PR_TOKEN) dispara.
-    #
-    # A guarda cobre também `spec-wave/update-v*`, do `update --branch` — que
-    # tampouco implementa uma Story.
-    if: vars.SPEC_WAVE_EXECUTION != 'local' && !startsWith(github.event.pull_request.head.ref, 'spec-wave/')
+  dispatch:
+    # PR de documento (`spec-wave/*`) não é PR de implementação.
+    if: "!startsWith(github.event.pull_request.head.ref, 'spec-wave/')"
     runs-on: ubuntu-latest
     permissions:
-      issues: read
-      pull-requests: read
       contents: read
-    outputs:
-      feature: ${{ steps.resolve.outputs.feature }}
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
-        with:
-          node-version: '24'
-
-      - name: Instala a CLI
-        run: npm install -g @spec-wave/cli@1.7.0
-
-      - id: resolve
-        run: spec-wave code-review --pr-number ${{ github.event.pull_request.number }} --resolve-only
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-
-  move:
-    needs: resolve
-    # PR sem vínculo explícito não resolve Feature nenhuma — e não move nada.
-    if: >
-      vars.SPEC_WAVE_EXECUTION != 'local' &&
-      !startsWith(github.event.pull_request.head.ref, 'spec-wave/') &&
-      needs.resolve.outputs.feature != ''
-    runs-on: ubuntu-latest
-    # MESMO namespace do decompose.yml: um `decompose-apply` em curso na Feature
-    # segura este job na fila em vez de disputar a subárvore com ele. Foi essa
-    # corrida que fez duas Stories e duas Tasks nascerem concluídas.
-    concurrency:
-      group: spec-wave-item-${{ needs.resolve.outputs.feature }}
-      cancel-in-progress: false
-    permissions:
-      issues: write
-      pull-requests: write
-      contents: read
-    # `secrets` não entra em `if`; a presença da GitHub App vira env do job.
-    env:
-      SPEC_WAVE_APP_PRESENT: ${{ secrets.SPEC_WAVE_APP_PRIVATE_KEY != '' }}
 
     steps:
       - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v5
-        with:
-          node-version: '24'
+      - id: hub
+        name: Lê o hub do .spec-wave.json
+        run: |
+          owner="$(jq -r '.hub.owner // ""' .spec-wave.json)"
+          name="$(jq -r '.hub.repo // ""' .spec-wave.json)"
+          if [ -z "$owner" ] || [ -z "$name" ]; then
+            echo "::error::.spec-wave.json sem hub {owner, repo}. Rode: npx @spec-wave/cli@1.7.0 init --role code --repo ${{ github.repository }} --hub <owner/repo>"
+            exit 1
+          fi
+          echo "owner=$owner" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "repo=$owner/$name" >> "$GITHUB_OUTPUT"
 
-      - name: Instala a CLI
-        run: npm install -g @spec-wave/cli@1.7.0
-
-      # Token de GitHub App da organização, quando configurada
-      # (SPEC_WAVE_APP_ID + SPEC_WAVE_APP_PRIVATE_KEY): substitui os PATs
-      # pessoais — quem sai da org não derruba o fluxo. Sem os secrets o step
-      # é pulado, `steps.app.outputs.token` fica vazio e os PATs continuam
-      # valendo pelo `||` abaixo.
       - id: app
         if: env.SPEC_WAVE_APP_PRESENT == 'true'
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.SPEC_WAVE_APP_ID }}
           private-key: ${{ secrets.SPEC_WAVE_APP_PRIVATE_KEY }}
+          owner: ${{ steps.hub.outputs.owner }}
+          repositories: ${{ steps.hub.outputs.name }}
 
-      - name: Move Feature to Code Review
-        run: spec-wave code-review --pr-number ${{ github.event.pull_request.number }}
+      - name: Avisa o hub (repository_dispatch)
+        run: |
+          gh api "repos/${{ steps.hub.outputs.repo }}/dispatches" --input - <<'PAYLOAD'
+          {
+            "event_type": "spec-wave-pr",
+            "client_payload": {
+              "event": "opened",
+              "pr_repo": "${{ github.repository }}",
+              "pr_number": ${{ github.event.pull_request.number }}
+            }
+          }
+          PAYLOAD
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PROJECT_TOKEN: ${{ steps.app.outputs.token || secrets.GH_PROJECT_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.SPEC_WAVE_HUB_TOKEN }}
