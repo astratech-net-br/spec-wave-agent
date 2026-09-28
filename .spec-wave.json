@@ -20,6 +20,7 @@
         "id": "PVTSSF_lADOEelBqs4BeoVOzhZBFOU",
         "options": {
           "📥 Backlog": "eeec8c8d",
+          "🐞 Triagem": "0b3032f0",
           "🎯 Priorizado": "ebd754ad",
           "📋 Spec": "2b169376",
           "📋 Plan": "bd87548b",
@@ -107,5 +108,5 @@
     }
   },
   "initializedAt": "2026-07-27T22:02:04.709Z",
-  "refreshedAt": "2026-09-28T20:54:43.237Z"
+  "refreshedAt": "2026-09-28T21:05:17.379Z"
 }
