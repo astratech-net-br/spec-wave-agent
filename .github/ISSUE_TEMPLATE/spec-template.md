@@ -44,8 +44,13 @@ Feature: [Nome da Feature]
 
 # Dependências
 
-- **Internas:** <!-- Serviços/APIs dentro do sistema -->
-- **Externas:** <!-- Sistemas de terceiros -->
+## Internas
+
+- <!-- Serviços/APIs dentro do sistema -->
+
+## Externas
+
+- <!-- Sistemas de terceiros -->
 
 # Requisitos Não-Funcionais
 
