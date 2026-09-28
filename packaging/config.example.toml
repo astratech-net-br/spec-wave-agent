@@ -112,7 +112,11 @@ implement_timeout_secs = 14400
 #workdir = "/home/voce/.spec-wave-agent"
 
 # Identidade do agente nos leases e comentários (default: usuario@hostname)
-# Abre o PR do trabalho concluído como rascunho (gh pr create --draft):
+# Comando que abre o PR pela porta de SCM da CLI (@spec-wave/cli >= 1.7.0). Sem o
+# comando na CLI, o agente cai no gh pr create.
+#pr_command = "npx spec-wave pr open"
+
+# Abre o PR do trabalho concluído como rascunho (--draft):
 # o CI de um repo que pula draft no required check só roda quando alguém
 # marca o PR como pronto para revisão. Default: false.
 #pr_draft = true

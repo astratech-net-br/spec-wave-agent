@@ -25,7 +25,7 @@
 
 use anyhow::{bail, Result};
 use spec_wave_agent::api::{queue_item_of, ApiClient, Outcome, WorkItem};
-use spec_wave_agent::config::{load_config_from, Config, Source};
+use spec_wave_agent::config::{load_config_from, split_command, Config, Source};
 use spec_wave_agent::lease::{Lease, LeaseRepo, RenewError};
 use spec_wave_agent::queue::{self, QueueItem, QueueKind};
 use spec_wave_agent::runner::{
@@ -50,6 +50,11 @@ fn init_tracing() {
         .with_writer(std::io::stderr)
         .with_ansi(std::io::stderr().is_terminal())
         .init();
+}
+
+/// argv do comando que abre o PR (validado no boot por `Config::validate`).
+fn pr_command(cfg: &Config) -> Vec<String> {
+    split_command(&cfg.pr_command).unwrap_or_default()
 }
 
 /// Checagens fail-fast dos pré-requisitos da máquina.
@@ -261,7 +266,7 @@ async fn process_issue(
             // Review. Sem isso, as Stories chegavam lá e a fila do Tech Leader
             // mostrava "sem PR" em todas. Um PR por repositório efetivamente
             // tocado (hub sempre; código de acordo com o que a issue declarou).
-            let prs = open_pull_requests_all(&workspace, &cfg.repo, issue, cfg.pr_draft).await;
+            let prs = open_pull_requests_all(&workspace, &pr_command(cfg), &cfg.repo, issue, cfg.pr_draft).await;
             if api.is_some() {
                 // Pela API, "sair da fila" é o card ir para Review (com os PRs).
                 report(api, Outcome::Succeeded(prs)).await;
@@ -732,6 +737,8 @@ struct FleetRun {
     kind: QueueKind,
     run_id: String,
     workdir: String,
+    /// `SPECWAVE_REMOTE_URL`: URL de clone (pode ter `{repo}`); None = GitHub.
+    remote_url: Option<String>,
 }
 
 fn fleet_run_from_env() -> Result<FleetRun> {
@@ -749,7 +756,8 @@ fn fleet_run_from_env() -> Result<FleetRun> {
     if hub.is_empty() || run_id.is_empty() || workdir.is_empty() {
         bail!("--once exige SPECWAVE_HUB_REPO, RUN_ID e FLEET_WORKDIR (o spec-wave-sandbox monta)");
     }
-    Ok(FleetRun { hub, issue, kind, run_id, workdir })
+    let remote_url = Some(var("SPECWAVE_REMOTE_URL")).filter(|u| !u.is_empty());
+    Ok(FleetRun { hub, issue, kind, run_id, workdir, remote_url })
 }
 
 /// Eventos para o fleet-runner: uma linha JSON por evento no stdout.
@@ -806,6 +814,11 @@ async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
     };
     cfg.source = Source::GithubLabel; // o item vem do ambiente; a borda é o fleet-runner
     cfg.repo = job.hub.clone();
+    // URL de clone do SCM do produto (RFC-008 P15), montada pelo sandbox;
+    // sem ela, o default do GitHub. `{repo}` vira o hub.
+    if let Some(url) = job.remote_url.as_deref() {
+        cfg.remote_url = Some(url.replace("{repo}", &job.hub));
+    }
     cfg.workdir = Path::new(&job.workdir).join("agent").to_string_lossy().into_owned();
     cfg.agent_id = Some(format!("fleet:{}", job.run_id));
     cfg.validate()?;
@@ -880,7 +893,7 @@ async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
                         &["issue", "comment", &issue.to_string(), "--repo", &cfg.repo, "--body", &body]).await;
                 }
             }
-            let prs = open_pull_requests_all(&workspace, &cfg.repo, issue, cfg.pr_draft).await;
+            let prs = open_pull_requests_all(&workspace, &pr_command(&cfg), &cfg.repo, issue, cfg.pr_draft).await;
             leases.release(issue).await?;
             events.outcome("succeeded", None, &prs);
         }
