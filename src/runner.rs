@@ -208,11 +208,95 @@ pub fn work_branch(issue: u64) -> String {
 ///
 /// Devolve a URL do PR (novo ou o que já existia) — o desfecho leva ao
 /// spec-wave, e o card em Review mostra o link.
-pub async fn open_pull_request(ws: &Path, pr_repo: &str, hub_repo: &str, issue: u64, draft: bool) -> Option<String> {
+pub async fn open_pull_request(
+    ws: &Path, pr_command: &[String], pr_repo: &str, hub_repo: &str, issue: u64, draft: bool,
+) -> Option<String> {
     let branch = work_branch(issue);
+    let body = format!(
+        "Implementa a issue {hub_repo}#{issue}.\n\n\
+         Branch de trabalho do `spec-wave-agent`, com um commit por Story.\n\n\
+         O merge **não** encerra a issue: ela segue por QA, Homologação e Deploy \
+         no board."
+    );
+    match open_pull_request_via_cli(ws, pr_command, pr_repo, hub_repo, issue, &branch, &body, draft).await {
+        CliPr::Opened(url) => {
+            info!(target: "agent", "PR em {pr_repo}: {url}");
+            return Some(url);
+        }
+        CliPr::NothingToReview => {
+            warn!(target: "agent", "{branch} não tem nada à frente da base em {pr_repo} — nenhum PR aberto");
+            return None;
+        }
+        CliPr::Unavailable(why) => {
+            warn!(target: "agent", "PR pela CLI indisponível ({why}) — tentando o gh");
+        }
+    }
+    open_pull_request_gh(ws, pr_repo, hub_repo, issue, &branch, &body, draft).await
+}
+
+/// Resultado do `spec-wave pr open`.
+#[derive(Debug, PartialEq)]
+pub enum CliPr {
+    Opened(String),
+    /// Código 2: a branch não tem nada à frente da base.
+    NothingToReview,
+    /// A CLI não abriu (comando ausente numa CLI antiga, credencial, rede):
+    /// quem chama tenta o caminho de antes.
+    Unavailable(String),
+}
+
+/// Interpreta a saída do `spec-wave pr open --json`. Pura, para os testes.
+pub fn parse_cli_pr(code: Option<i32>, stdout: &str, stderr: &str) -> CliPr {
+    if code == Some(0) {
+        let url = stdout.lines().rev()
+            .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+            .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(str::to_string))
+            .filter(|u| !u.is_empty());
+        return match url {
+            Some(u) => CliPr::Opened(u),
+            None => CliPr::Unavailable(format!("saída sem url: {}", stdout.trim())),
+        };
+    }
+    if code == Some(2) {
+        return CliPr::NothingToReview;
+    }
+    let why = stderr.trim().lines().last().unwrap_or("").to_string();
+    CliPr::Unavailable(if why.is_empty() { format!("código {code:?}") } else { why })
+}
+
+/// Abre o PR pela porta de SCM da CLI (RFC-008 P17): idempotente como o
+/// caminho do gh — um PR já aberto da branch é devolvido, não duplicado. O
+/// título vem do item no tracker (`--work-item` + `--hub`).
+#[allow(clippy::too_many_arguments)]
+async fn open_pull_request_via_cli(
+    ws: &Path, pr_command: &[String], pr_repo: &str, hub_repo: &str, issue: u64, branch: &str,
+    body: &str, draft: bool,
+) -> CliPr {
+    let Some((program, base)) = pr_command.split_first() else {
+        return CliPr::Unavailable("pr_command vazio".into());
+    };
+    let issue_s = issue.to_string();
+    let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
+    args.extend(["--repo", pr_repo, "--head", branch, "--work-item", &issue_s, "--hub", hub_repo,
+                 "--body", body, "--json"]);
+    if draft {
+        args.push("--draft");
+    }
+    match run(ws, program, &args).await {
+        Ok(o) => parse_cli_pr(o.code, &o.stdout, &o.stderr),
+        Err(e) => CliPr::Unavailable(format!("{e:#}")),
+    }
+}
+
+/// O caminho de antes da CLI: `gh pr list` + `gh pr create`. Fica como
+/// reserva enquanto houver CLI anterior à 1.7.0 no caminho (máquinas de dev,
+/// imagem do Fleet Job) — e só serve ao GitHub.
+async fn open_pull_request_gh(
+    ws: &Path, pr_repo: &str, hub_repo: &str, issue: u64, branch: &str, body: &str, draft: bool,
+) -> Option<String> {
     // Idempotência: relançamento após rodada incompleta, ou takeover por outro
     // agente, não podem gerar um segundo PR do mesmo branch.
-    if let Ok(existing) = run(ws, "gh", &["pr", "list", "--repo", pr_repo, "--head", &branch,
+    if let Ok(existing) = run(ws, "gh", &["pr", "list", "--repo", pr_repo, "--head", branch,
                                           "--state", "open", "--json", "url",
                                           "--jq", ".[].url"]).await {
         let url = existing.stdout.trim().lines().next().unwrap_or("").to_string();
@@ -229,14 +313,8 @@ pub async fn open_pull_request(ws: &Path, pr_repo: &str, hub_repo: &str, issue: 
         Ok(o) if o.ok && !o.stdout.trim().is_empty() => o.stdout.trim().to_string(),
         _ => format!("Implementação da issue {hub_repo}#{issue}"),
     };
-    let body = format!(
-        "Implementa a issue {hub_repo}#{issue}.\n\n\
-         Branch de trabalho do `spec-wave-agent`, com um commit por Story.\n\n\
-         O merge **não** encerra a issue: ela segue por QA, Homologação e Deploy \
-         no board."
-    );
-    let mut args = vec!["pr", "create", "--repo", pr_repo, "--head", &branch,
-                        "--title", &title, "--body", &body];
+    let mut args = vec!["pr", "create", "--repo", pr_repo, "--head", branch,
+                        "--title", &title, "--body", body];
     if draft {
         args.push("--draft");
     }
@@ -275,12 +353,14 @@ pub async fn checkpoint_all(workspace: &Workspace, issue: u64, label: &str) {
 /// só o que tem commit de verdade no branch de trabalho (RFC-005 §6.3:
 /// "N PRs" é um por repositório EFETIVAMENTE tocado, não todo repositório
 /// vinculado ao Project).
-pub async fn open_pull_requests_all(workspace: &Workspace, hub_repo: &str, issue: u64, draft: bool) -> Vec<String> {
+pub async fn open_pull_requests_all(
+    workspace: &Workspace, pr_command: &[String], hub_repo: &str, issue: u64, draft: bool,
+) -> Vec<String> {
     let mut urls = Vec::new();
-    urls.extend(open_pull_request(&workspace.hub, hub_repo, hub_repo, issue, draft).await);
+    urls.extend(open_pull_request(&workspace.hub, pr_command, hub_repo, hub_repo, issue, draft).await);
     for cr in &workspace.code_repos {
         if has_unmerged_commits(&cr.dir).await {
-            urls.extend(open_pull_request(&cr.dir, &cr.repo, hub_repo, issue, draft).await);
+            urls.extend(open_pull_request(&cr.dir, pr_command, &cr.repo, hub_repo, issue, draft).await);
         }
     }
     urls
@@ -759,6 +839,29 @@ pub async fn run_item_with_tap(
 
 #[cfg(test)]
 mod tests {
+    use super::{parse_cli_pr, CliPr};
+
+    #[test]
+    fn cli_pr_ok_devolve_a_url_do_json() {
+        let out = "aviso qualquer\n{\"url\":\"https://scm/pull/3\",\"number\":\"3\",\"created\":false}\n";
+        assert_eq!(parse_cli_pr(Some(0), out, ""), CliPr::Opened("https://scm/pull/3".into()));
+    }
+
+    #[test]
+    fn cli_pr_codigo_2_e_nada_a_revisar() {
+        assert_eq!(parse_cli_pr(Some(2), "", "nada à frente"), CliPr::NothingToReview);
+    }
+
+    #[test]
+    fn cli_pr_antiga_ou_com_erro_cai_no_gh() {
+        // CLI anterior à 1.7.0: commander recusa o comando.
+        assert!(matches!(parse_cli_pr(Some(1), "", "error: unknown command 'pr'"),
+                         CliPr::Unavailable(w) if w.contains("unknown command")));
+        // Exit 0 sem JSON (ex.: um npx que não é a CLI).
+        assert!(matches!(parse_cli_pr(Some(0), "10.0.0\n", ""), CliPr::Unavailable(_)));
+        assert!(matches!(parse_cli_pr(None, "", ""), CliPr::Unavailable(_)));
+    }
+
     use super::*;
 
     fn render(line: &str) -> Option<String> {

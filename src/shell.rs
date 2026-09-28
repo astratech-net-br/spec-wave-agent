@@ -10,6 +10,8 @@ use tokio::time::sleep;
 
 pub struct Out {
     pub ok: bool,
+    /// Código de saída; None quando o processo morreu por sinal.
+    pub code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
 }
@@ -27,6 +29,7 @@ pub async fn run(cwd: &Path, program: &str, args: &[&str]) -> Result<Out> {
         .with_context(|| format!("falha ao executar {program} {args:?}"))?;
     Ok(Out {
         ok: output.status.success(),
+        code: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })

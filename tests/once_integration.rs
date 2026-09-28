@@ -20,6 +20,14 @@ fn exe(path: &Path, body: &str) {
 
 /// Origin bare + stubs; devolve (config, PATH, FLEET_WORKDIR).
 fn setup(tmp: &TempDir, executor_body: &str) -> (PathBuf, String, PathBuf) {
+    setup_with(tmp, executor_body, "echo 10.0.0", true)
+}
+
+/// `npx_body`: o stub do npx (a CLI). `remote_in_config`: false tira o
+/// remote_url da config — o teste passa SPECWAVE_REMOTE_URL pelo ambiente.
+fn setup_with(tmp: &TempDir, executor_body: &str, npx_body: &str, remote_in_config: bool)
+    -> (PathBuf, String, PathBuf)
+{
     let origin = tmp.path().join("origin.git");
     sh(tmp.path(), &format!(
         "git init -q --bare -b main {o}
@@ -38,16 +46,17 @@ fn setup(tmp: &TempDir, executor_body: &str) -> (PathBuf, String, PathBuf) {
   "issue view") echo "Título da issue";;
 esac
 exit 0"#);
-    exe(&bin.join("npx"), "echo 10.0.0");
+    exe(&bin.join("npx"), npx_body);
     exe(&tmp.path().join("executor.sh"), executor_body);
     let cfg = tmp.path().join("agent.toml");
+    let remote = if remote_in_config { format!("remote_url = \"{}\"", origin.display()) } else { String::new() };
     std::fs::write(&cfg, format!(r#"
-        remote_url = "{origin}"
+        {remote}
         implement_timeout_secs = 60
         heartbeat_secs = 30
         lease_ttl_secs = 600
         feature_command = "{exec} {{issue}}"
-    "#, origin = origin.display(), exec = tmp.path().join("executor.sh").display())).unwrap();
+    "#, exec = tmp.path().join("executor.sh").display())).unwrap();
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     let workdir = tmp.path().join("fleet");
     std::fs::create_dir_all(&workdir).unwrap();
@@ -140,4 +149,42 @@ fn once_sem_ambiente_falha_com_desfecho() {
     assert!(!out.status.success());
     let evs = events(&out.stdout);
     assert_eq!(evs.last().unwrap()["state"], "failed");
+}
+
+#[test]
+fn once_abre_o_pr_pela_cli_e_clona_pela_url_do_ambiente() {
+    let tmp = TempDir::new().unwrap();
+    let args_log = tmp.path().join("npx-args.txt");
+    // A CLI (1.7.0+) abre o PR; o gh, se fosse chamado para criar, falharia.
+    let npx = format!(r#"if [ "$1 $2 $3" = "spec-wave pr open" ]; then
+  printf '%s\n' "$@" > {log}
+  echo '{{"url":"https://scm.example/test/test/pull/9","number":"9","created":true}}'
+  exit 0
+fi
+echo 10.0.0"#, log = args_log.display());
+    let (cfg, path, workdir) = setup_with(&tmp, r#"set -eu
+cat > /dev/null
+echo trabalho > feito.txt && git add feito.txt && git commit -qm "story 1"
+echo '{"status":"ok"}' > .spec-wave-agent-result.json"#, &npx, false);
+    std::fs::write(tmp.path().join("bin/gh"), "#!/usr/bin/env bash\n[ \"$1 $2\" = \"auth status\" ] && exit 0\nexit 1\n").unwrap();
+    let origin = tmp.path().join("origin.git");
+    let out = once(&tmp, &cfg, &path, &workdir)
+        .env("SPECWAVE_REMOTE_URL", origin.to_str().unwrap())
+        .output().unwrap();
+    assert!(out.status.success(), "exit {:?}", out.status);
+    let evs = events(&out.stdout);
+    let last = evs.last().unwrap();
+    assert_eq!(last["state"], "succeeded", "eventos: {evs:?}");
+    assert_eq!(last["pr_urls"][0], "https://scm.example/test/test/pull/9");
+    let args = std::fs::read_to_string(&args_log).unwrap();
+    let args: Vec<&str> = args.lines().collect();
+    for pair in [["--repo", "test/test"], ["--head", "agent/issue-42"], ["--work-item", "42"], ["--hub", "test/test"]] {
+        let i = args.iter().position(|a| *a == pair[0]).unwrap_or_else(|| panic!("sem {}: {args:?}", pair[0]));
+        assert_eq!(args[i + 1], pair[1]);
+    }
+    assert!(args.contains(&"--json"));
+    // O clone veio da URL do ambiente: o trabalho está no remoto.
+    let log = Command::new("git").args(["log", "--oneline", "agent/issue-42"])
+        .current_dir(&origin).output().unwrap();
+    assert!(String::from_utf8_lossy(&log.stdout).contains("story 1"));
 }

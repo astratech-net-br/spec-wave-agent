@@ -105,6 +105,13 @@ pub struct Config {
     /// quem não configurou nada mantém o comportamento de sempre.
     #[serde(default = "d_pr_draft")]
     pub pr_draft: bool,
+    /// Comando que abre o PR da branch de trabalho pela porta de SCM da CLI
+    /// (RFC-008 P17) — o agente acrescenta `--repo`, `--head`, `--work-item`,
+    /// `--hub`, `--body`, `--json` e `--draft`. Mesmo formato do
+    /// feature_command (sem shell). Se a CLI não tiver o comando (anterior à
+    /// 1.7.0) ou falhar, o agente cai no `gh pr create` de antes.
+    #[serde(default = "d_pr_command")]
+    pub pr_command: String,
     /// Identidade do agente (default: usuario@hostname)
     pub agent_id: Option<String>,
     /// Override da URL do remoto (testes / git self-hosted). Default: GitHub.
@@ -122,6 +129,7 @@ pub struct Config {
 fn d_lease_prefix() -> String { crate::lease::DEFAULT_LEASE_PREFIX.into() }
 
 fn d_queue_label() -> String { "spec-wave:dev-agent".into() }
+fn d_pr_command() -> String { "npx spec-wave pr open".into() }
 fn d_poll() -> u64 { 60 }
 fn d_poll_backoff_max() -> u64 { 480 } // 8x o d_poll() default — ver next_poll_delay em queue.rs
 fn d_heartbeat() -> u64 { 120 }
@@ -321,6 +329,9 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if split_command(&self.pr_command)?.is_empty() {
+            bail!("pr_command vazio (default: \"npx spec-wave pr open\")");
+        }
         if !crate::lease::valid_lease_prefix(&self.lease_ref_prefix) {
             bail!("lease_ref_prefix inválido: {:?} (esperado refs/…, ex.: refs/spec-wave/claims)",
                   self.lease_ref_prefix);
@@ -536,6 +547,7 @@ mod tests {
     #[test]
     fn defaults_com_apenas_repo() {
         let cfg = parse(r#"repo = "org/repo""#);
+        assert_eq!(cfg.pr_command, "npx spec-wave pr open");
         assert_eq!(cfg.queue_label, "spec-wave:dev-agent");
         assert_eq!(cfg.poll_interval_secs, 60);
         assert_eq!(cfg.heartbeat_secs, 120);
