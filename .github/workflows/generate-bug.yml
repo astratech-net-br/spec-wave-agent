@@ -4,33 +4,99 @@ on:
   issues:
     types: [labeled]
 
+# Trava por ITEM, no mesmo namespace de generate-spec/plan/decompose e do job
+# `move` do code-review.yml. Este job PUBLICA um documento (branch própria +
+# Pull Request) e escreve o relatório de uso no comentário da issue com
+# leitura-modificação-escrita; a trava impede que outro job do spec-wave na
+# MESMA issue faça as duas coisas ao mesmo tempo. Entre issues diferentes não há
+# mais disputa: cada documento tem a sua branch.
 concurrency:
-  group: spec-wave-generate-bug-${{ github.event.issue.number }}
+  # Um run que NÃO vai fazer nada não pode disputar este grupo.
+  #
+  # `issues: [labeled]` dispara para QUALQUER label — prioridade, tipo,
+  # `spec-wave:model:*`. O job é filtrado pelo `if:` e termina skipped, mas o RUN
+  # entra na fila de concurrency do mesmo jeito, e com `cancel-in-progress: false`
+  # o GitHub cancela o run que já estava PENDENTE para pôr o novo no lugar. Foi
+  # assim que um decompose enfileirado atrás de um generate-plan morreu cancelado
+  # em 1 segundo por causa de uma label sem relação nenhuma — a label de gatilho
+  # fica na issue, `labeled` não redispara com ela aplicada, e o fluxo trava sem
+  # nenhum sinal. Rotular o run inútil com um grupo único (`github.run_id`) o tira
+  # da fila sem afrouxar a serialização de quem realmente vai rodar.
+  group: >-
+    ${{ github.event.label.name == 'spec-wave:bug'
+    && format('spec-wave-item-{0}', github.event.issue.number)
+    || format('spec-wave-noop-{0}', github.run_id) }}
   cancel-in-progress: false
 
 jobs:
   generate-bug:
+    # Modo de execução: `spec-wave mode local` cria a variável de repositório
+    # SPEC_WAVE_EXECUTION=local e este job passa a ser PULADO — run aparece como
+    # skipped e job que não roda não é faturado. `mode actions` remove a variável.
     if: >
+      vars.SPEC_WAVE_EXECUTION != 'local' &&
       github.event.label.name == 'spec-wave:bug' &&
       contains(github.event.issue.title, '[BUG]')
     runs-on: ubuntu-latest
     permissions:
       issues: write
       contents: write
+      # `contents: write` continua necessário: o commit vai por Git Data API
+      # (createTree/createCommit/createRef), que é autorizada por ele. O que
+      # mudou foi o DESTINO — branch própria do documento, nunca a default.
+      #
+      # `pull-requests: write` é a permissão NOVA deste fluxo. Sem ela o commit
+      # é criado e o PR não, e o documento fica numa branch que ninguém vê.
+      #
+      # Atenção: o GITHUB_TOKEN só abre PR se "Allow GitHub Actions to create and
+      # approve pull requests" estiver ligado (Settings → Actions → General) —
+      # desligado por padrão em muitas organizações. `GH_PR_TOKEN` é a saída.
+      pull-requests: write
+    # `secrets` não entra em `if`; a presença da GitHub App vira env do job.
+    env:
+      SPEC_WAVE_APP_PRESENT: ${{ secrets.SPEC_WAVE_APP_PRIVATE_KEY != '' }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '24'
 
+      - name: Instala a CLI
+        run: npm install -g @spec-wave/cli@1.7.0
+
+      # Token de GitHub App da organização, quando configurada
+      # (SPEC_WAVE_APP_ID + SPEC_WAVE_APP_PRIVATE_KEY): substitui os PATs
+      # pessoais — quem sai da org não derruba o fluxo. Sem os secrets o step
+      # é pulado, `steps.app.outputs.token` fica vazio e os PATs continuam
+      # valendo pelo `||` abaixo.
+      - id: app
+        if: env.SPEC_WAVE_APP_PRESENT == 'true'
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.SPEC_WAVE_APP_ID }}
+          private-key: ${{ secrets.SPEC_WAVE_APP_PRIVATE_KEY }}
+
+      # Multi-repo (RFC-005 §7.2): clona em .spec-wave/repos/<slug>/ os repos
+      # de código que a issue declara (labels repo:<slug>), para o modelo ler
+      # CÓDIGO e não só o markdown do hub. Sem repo declarado só avisa. O
+      # GITHUB_TOKEN só enxerga este repositório — para clonar os outros vai o
+      # GH_PROJECT_TOKEN, quando existir.
+      - name: Monta o workspace multi-repo
+        run: spec-wave workspace prepare --issue ${{ github.event.issue.number }}
+        env:
+          GITHUB_TOKEN: ${{ steps.app.outputs.token || secrets.GH_PROJECT_TOKEN || secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+
       - name: Generate bug.md
-        run: npx @spec-wave/cli@0.16.4 generate-bug --issue-number ${{ github.event.issue.number }}
+        run: spec-wave generate-bug --issue-number ${{ github.event.issue.number }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_PR_TOKEN: ${{ steps.app.outputs.token || secrets.GH_PR_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           GITHUB_REPOSITORY: ${{ github.repository }}

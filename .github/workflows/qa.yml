@@ -1,8 +1,14 @@
 name: QA
 
+# Dois gatilhos, um destino: aprovação formal OU merge movem a Feature para
+# 🧪 QA. O de merge existe porque o autor não consegue aprovar o próprio PR —
+# num fluxo solo, QA por aprovação nunca aconteceria — e porque homologação de
+# verdade começa com o código integrado. Espelha o `run --pr` do modo local.
 on:
   pull_request_review:
     types: [submitted]
+  pull_request:
+    types: [closed]
 
 concurrency:
   group: spec-wave-qa-${{ github.event.pull_request.number }}
@@ -10,23 +16,61 @@ concurrency:
 
 jobs:
   qa:
-    if: github.event.review.state == 'approved'
+    # Modo de execução: `spec-wave mode local` cria a variável de repositório
+    # SPEC_WAVE_EXECUTION=local e este job passa a ser PULADO — run aparece como
+    # skipped e job que não roda não é faturado. `mode actions` remove a variável.
+    # PR de DOCUMENTO não é PR de implementação. O fluxo publica spec.md,
+    # plan.md, bug.md e decomposition.md em branches `spec-wave/*`, e deixar este
+    # workflow rodar em cima delas move o board por um PR que não implementa
+    # nada. Nos Actions um PR aberto pelo GITHUB_TOKEN não dispara workflow, mas
+    # um aberto no modo local (ou via GH_PR_TOKEN) dispara.
+    #
+    # A guarda cobre também `spec-wave/update-v*`, do `update --branch` — que
+    # tampouco implementa uma Story.
+    #
+    # Aqui a guarda é INDISPENSÁVEL, não defensiva: `pull_request_review`
+    # dispara por uma aprovação HUMANA, independentemente de quem abriu o
+    # PR. Aprovar o PR da spec moveria a Feature para 🧪 QA.
+    # A última linha aceita os dois eventos: review aprovada (pull_request_review)
+    # ou PR fechado COM merge (pull_request closed — fechado sem merge não conta).
+    if: >
+      vars.SPEC_WAVE_EXECUTION != 'local' &&
+      !startsWith(github.event.pull_request.head.ref, 'spec-wave/') &&
+      (github.event.review.state == 'approved' || github.event.pull_request.merged == true)
     runs-on: ubuntu-latest
     permissions:
       issues: write
       pull-requests: write
       contents: read
+    # `secrets` não entra em `if`; a presença da GitHub App vira env do job.
+    env:
+      SPEC_WAVE_APP_PRESENT: ${{ secrets.SPEC_WAVE_APP_PRIVATE_KEY != '' }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '24'
 
+      - name: Instala a CLI
+        run: npm install -g @spec-wave/cli@1.7.0
+
+      # Token de GitHub App da organização, quando configurada
+      # (SPEC_WAVE_APP_ID + SPEC_WAVE_APP_PRIVATE_KEY): substitui os PATs
+      # pessoais — quem sai da org não derruba o fluxo. Sem os secrets o step
+      # é pulado, `steps.app.outputs.token` fica vazio e os PATs continuam
+      # valendo pelo `||` abaixo.
+      - id: app
+        if: env.SPEC_WAVE_APP_PRESENT == 'true'
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.SPEC_WAVE_APP_ID }}
+          private-key: ${{ secrets.SPEC_WAVE_APP_PRIVATE_KEY }}
+
       - name: Move Feature to QA
-        run: npx @spec-wave/cli@0.16.4 qa --pr-number ${{ github.event.pull_request.number }}
+        run: spec-wave qa --pr-number ${{ github.event.pull_request.number }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PROJECT_TOKEN: ${{ secrets.GH_PROJECT_TOKEN }}
+          PROJECT_TOKEN: ${{ steps.app.outputs.token || secrets.GH_PROJECT_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}

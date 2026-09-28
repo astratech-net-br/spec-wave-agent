@@ -1,4 +1,4 @@
-name: Validate Spec + Plan
+name: Critique Plan
 
 on:
   issues:
@@ -17,28 +17,31 @@ concurrency:
   # nenhum sinal. Rotular o run inútil com um grupo único (`github.run_id`) o tira
   # da fila sem afrouxar a serialização de quem realmente vai rodar.
   group: >-
-    ${{ github.event.label.name == 'spec-wave:ready'
-    && format('spec-wave-validate-{0}', github.event.issue.number)
+    ${{ github.event.label.name == 'spec-wave:critique'
+    && format('spec-wave-critique-{0}', github.event.issue.number)
     || format('spec-wave-noop-{0}', github.run_id) }}
   cancel-in-progress: false
 
 jobs:
-  validate:
+  critique:
     # Modo de execução: `spec-wave mode local` cria a variável de repositório
     # SPEC_WAVE_EXECUTION=local e este job passa a ser PULADO — run aparece como
     # skipped e job que não roda não é faturado. `mode actions` remove a variável.
     if: >
       vars.SPEC_WAVE_EXECUTION != 'local' &&
-      github.event.label.name == 'spec-wave:ready' &&
-      (contains(github.event.issue.title, '[FEATURE]') ||
-       contains(github.event.issue.title, '[BUG]'))
+      github.event.label.name == 'spec-wave:critique' &&
+      contains(github.event.issue.title, '[FEATURE]')
     runs-on: ubuntu-latest
     permissions:
       issues: write
+      # read: a crítica LÊ o plan.md do checkout e não escreve arquivo nenhum —
+      # ao contrário do generate-plan, que publica o documento gerado.
       contents: read
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: actions/setup-node@v5
         with:
@@ -47,8 +50,11 @@ jobs:
       - name: Instala a CLI
         run: npm install -g @spec-wave/cli@1.7.0
 
-      - name: Validate spec and plan
-        run: spec-wave validate --issue-number ${{ github.event.issue.number }}
+      - name: Critique plan.md as-is
+        run: spec-wave critique --issue-number ${{ github.event.issue.number }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           GITHUB_REPOSITORY: ${{ github.repository }}
