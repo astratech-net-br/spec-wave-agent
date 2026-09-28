@@ -45,7 +45,7 @@ jobs:
           owner="$(jq -r '.hub.owner // ""' .spec-wave.json)"
           name="$(jq -r '.hub.repo // ""' .spec-wave.json)"
           if [ -z "$owner" ] || [ -z "$name" ]; then
-            echo "::error::.spec-wave.json sem hub {owner, repo}. Rode: npx @spec-wave/cli@1.7.0 init --role code --repo ${{ github.repository }} --hub <owner/repo>"
+            echo "::error::.spec-wave.json sem hub {owner, repo}. Rode: npx @spec-wave/cli@1.7.2 init --role code --repo ${{ github.repository }} --hub <owner/repo>"
             exit 1
           fi
           echo "owner=$owner" >> "$GITHUB_OUTPUT"
