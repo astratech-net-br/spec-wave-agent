@@ -25,7 +25,7 @@
 
 use anyhow::{bail, Result};
 use spec_wave_agent::api::{queue_item_of, ApiClient, Outcome, WorkItem};
-use spec_wave_agent::config::{load_config_from, split_command, Config, Source};
+use spec_wave_agent::config::{load_config_from, Config, Source};
 use spec_wave_agent::lease::{Lease, LeaseRepo, RenewError};
 use spec_wave_agent::queue::{self, QueueItem, QueueKind};
 use spec_wave_agent::runner::{
@@ -54,7 +54,7 @@ fn init_tracing() {
 
 /// argv do comando que abre o PR (validado no boot por `Config::validate`).
 fn pr_command(cfg: &Config) -> Vec<String> {
-    split_command(&cfg.pr_command).unwrap_or_default()
+    cfg.pr_argv()
 }
 
 /// Checagens fail-fast dos pré-requisitos da máquina.
@@ -285,9 +285,9 @@ async fn process_issue(
                   "--body",
                   &format!("⚠️ Agente `{me}` falhou: {reason}. Checkpoint \
                             pushado no branch — outro agente (ou humano) \
-                            pode retomar; rode `npx spec-wave order {issue}` \
+                            pode retomar; rode `{cli} order {issue}` \
                             para ver o estado das stories. Item permanece \
-                            na fila.")]).await;
+                            na fila.", cli = cfg.cli_command)]).await;
             leases.release(issue).await?; // devolve p/ fila: label continua
             report(api, Outcome::Failed(reason.clone())).await;
             failed = true;
@@ -455,6 +455,9 @@ async fn main() -> Result<()> {
     }
     let cfg = load_config_from(args.config.as_deref())?;
     cfg.validate()?;
+    for w in cfg.warnings() {
+        warn!(target: "agent", "{w}");
+    }
     let me = cfg.agent_id();
     std::fs::create_dir_all(&cfg.workdir)?;
     let workdir = Path::new(&cfg.workdir).to_path_buf();
@@ -822,6 +825,9 @@ async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
     cfg.workdir = Path::new(&job.workdir).join("agent").to_string_lossy().into_owned();
     cfg.agent_id = Some(format!("fleet:{}", job.run_id));
     cfg.validate()?;
+    for w in cfg.warnings() {
+        warn!(target: "agent", "{w}");
+    }
     let me = cfg.agent_id();
     std::fs::create_dir_all(&cfg.workdir)?;
     let workdir = Path::new(&cfg.workdir).to_path_buf();

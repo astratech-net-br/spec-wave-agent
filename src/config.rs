@@ -105,11 +105,20 @@ pub struct Config {
     /// quem não configurou nada mantém o comportamento de sempre.
     #[serde(default = "d_pr_draft")]
     pub pr_draft: bool,
+    /// Como chamar a CLI do spec-wave — vira o placeholder `{cli}` dos prompts
+    /// e do `pr_command`, e é por ele que o agente roda o `workspace prepare`.
+    /// Default `npx --yes @spec-wave/cli`, com o ESCOPO: o pacote npm SEM
+    /// escopo `spec-wave` é de outro projeto (publicado em 2026-09-10), e um
+    /// `npx spec-wave` numa máquina sem a CLI instalada baixa e roda ele. Com
+    /// a CLI instalada globalmente, `spec-wave` também serve.
+    #[serde(default = "d_cli_command")]
+    pub cli_command: String,
     /// Comando que abre o PR da branch de trabalho pela porta de SCM da CLI
     /// (RFC-008 P17) — o agente acrescenta `--repo`, `--head`, `--work-item`,
     /// `--hub`, `--body`, `--json` e `--draft`. Mesmo formato do
-    /// feature_command (sem shell). Se a CLI não tiver o comando (anterior à
-    /// 1.7.0) ou falhar, o agente cai no `gh pr create` de antes.
+    /// feature_command (sem shell); `{cli}` vira o `cli_command`. Se a CLI
+    /// não tiver o comando (anterior à 1.7.0) ou falhar, o agente cai no
+    /// `gh pr create` de antes.
     #[serde(default = "d_pr_command")]
     pub pr_command: String,
     /// Identidade do agente (default: usuario@hostname)
@@ -129,7 +138,8 @@ pub struct Config {
 fn d_lease_prefix() -> String { crate::lease::DEFAULT_LEASE_PREFIX.into() }
 
 fn d_queue_label() -> String { "spec-wave:dev-agent".into() }
-fn d_pr_command() -> String { "npx spec-wave pr open".into() }
+fn d_cli_command() -> String { "npx --yes @spec-wave/cli".into() }
+fn d_pr_command() -> String { "{cli} pr open".into() }
 fn d_poll() -> u64 { 60 }
 fn d_poll_backoff_max() -> u64 { 480 } // 8x o d_poll() default — ver next_poll_delay em queue.rs
 fn d_heartbeat() -> u64 { 120 }
@@ -153,16 +163,16 @@ fn d_pr_draft() -> bool { false }
 fn d_feature_prompt() -> String {
     "Você está no clone do repositório, no branch de trabalho da Feature #{issue}.\n\
      Implemente a feature completa usando o spec-wave:\n\
-     1. Rode `npx spec-wave order {issue}` para obter as user stories e a \
+     1. Rode `{cli} order {issue}` para obter as user stories e a \
      ordem de dependência.\n\
-     2. Implemente cada story rodando `npx spec-wave implement <número>`, \
+     2. Implemente cada story rodando `{cli} implement <número>`, \
      respeitando a ordem: uma story só pode começar depois que TODAS as suas \
      dependências estiverem concluídas.\n\
      3. Stories independentes entre si podem ser implementadas em paralelo \
      com sub-agentes.\n\
      4. Ao concluir cada story: rode os testes relevantes, commite neste \
      branch (assunto livre; inclua no RODAPÉ os `git trailer` que o \
-     contexto de `npx spec-wave implement <número>` pedir — \
+     contexto de `{cli} implement <número>` pedir — \
      Spec-Wave-Story/Spec-Wave-Tasks/Spec-Wave-Agent, copiados literalmente) \
      e faça push.\n\
      5. Se uma story falhar, pule as que dependem dela e continue as \
@@ -172,14 +182,14 @@ fn d_feature_prompt() -> String {
      - Você roda em RODADAS: se o seu turno terminar sem o marker de \
      conclusão (abaixo), você será REINVOCADO para continuar. Ao iniciar, \
      verifique o que já foi feito (`git log --oneline -20` e \
-     `npx spec-wave order {issue}`) e continue de onde parou — não refaça \
+     `{cli} order {issue}`) e continue de onde parou — não refaça \
      stories já commitadas.\n\
      - Processos em background que você deixar ao encerrar o turno são \
      MORTOS. Prefira executar cada implement em foreground e aguardar; se \
      usar background, aguarde a conclusão AINDA NESTE turno antes de \
      encerrar.\n\
      - Commite e pushe cada story assim que concluída, com o rodapé de \
-     trailers que `npx spec-wave implement <número>` pedir no contexto — \
+     trailers que `{cli} implement <número>` pedir no contexto — \
      não invente formato de assunto, é o rodapé que é conferido.\n\
      - Se o contexto de `spec-wave order`/`implement` trouxer a seção \
      \"Workspace multi-repo\" (a Feature toca mais de um repositório de \
@@ -209,7 +219,7 @@ fn d_bug_prompt() -> String {
      onde o sintoma aparece, remendar ali, e o defeito voltar na próxima \
      entrada. As fases 1 e 2 existem para impedir isso.\n\
      \n\
-     1. REPRODUZIR — rode `npx spec-wave implement {issue}` para obter o \
+     1. REPRODUZIR — rode `{cli} implement {issue}` para obter o \
      contexto (relato, comentários e o bug.md, se existir). Escreva um teste \
      que FALHA por causa deste defeito e confirme que ele falha pelo motivo \
      certo. Se não conseguir reproduzir, PARE e relate no marker: sem \
@@ -248,6 +258,17 @@ fn d_bug_prompt() -> String {
      conseguiu reproduzir, não achou a causa, ou o fix não passou nos testes.\n\
      - NÃO escreva o marker se pretende continuar na próxima rodada.\n"
         .into()
+}
+
+/// O texto chama `npx [-y|--yes] spec-wave[@versão]`? (o pacote sem escopo,
+/// que não é o nosso — ver `cli_command`). Função pura.
+pub fn calls_unscoped_npx(text: &str) -> bool {
+    let words: Vec<&str> = text.split(|c: char| c.is_whitespace() || "`'\"(),;".contains(c))
+        .filter(|w| !w.is_empty()).collect();
+    words.iter().enumerate().any(|(i, w)| {
+        *w == "npx" && words[i + 1..].iter().find(|a| !matches!(**a, "-y" | "--yes"))
+            .is_some_and(|pkg| *pkg == "spec-wave" || pkg.starts_with("spec-wave@"))
+    })
 }
 
 /// Split de linha de comando em argv: espaços separam, aspas simples/duplas
@@ -322,6 +343,42 @@ pub fn load_config_from(override_path: Option<&str>) -> Result<Config> {
 }
 
 impl Config {
+    /// `{issue}` e `{cli}` de um prompt ou comando da config.
+    pub fn render(&self, t: &str, issue: u64) -> String {
+        render_template(t, issue).replace("{cli}", &self.cli_command)
+    }
+
+    /// argv do `pr_command`, com o `{cli}` resolvido (validado no boot).
+    pub fn pr_argv(&self) -> Vec<String> {
+        split_command(&self.render(&self.pr_command, 0)).unwrap_or_default()
+    }
+
+    /// argv da CLI do spec-wave seguido de `args` (validado no boot).
+    pub fn cli_argv(&self, args: &[&str]) -> Vec<String> {
+        let mut argv = split_command(&self.cli_command).unwrap_or_default();
+        argv.extend(args.iter().map(|a| a.to_string()));
+        argv
+    }
+
+    /// Avisos de configuração que não impedem o boot. Hoje: um texto da
+    /// config que ainda chama `npx spec-wave` (sem escopo) — ver `cli_command`.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (name, text) in [
+            ("cli_command", &self.cli_command), ("pr_command", &self.pr_command),
+            ("feature_command", &self.feature_command), ("feature_prompt", &self.feature_prompt),
+            ("bug_command", &self.bug_command), ("bug_prompt", &self.bug_prompt),
+        ] {
+            if calls_unscoped_npx(text) {
+                out.push(format!(
+                    "config: {name} chama `npx spec-wave` — o pacote npm `spec-wave` (sem escopo) NÃO é \
+                     a CLI do spec-wave, é de outro projeto; numa máquina sem a CLI instalada o npx \
+                     baixa e roda ele. Use `{{cli}}` (ou `npx --yes @spec-wave/cli`)"));
+            }
+        }
+        out
+    }
+
     /// Config só com os defaults — base do modo `--once` do Fleet Job, que
     /// recebe o resto do ambiente montado pelo spec-wave-sandbox.
     pub fn defaults() -> Config {
@@ -330,7 +387,10 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         if split_command(&self.pr_command)?.is_empty() {
-            bail!("pr_command vazio (default: \"npx spec-wave pr open\")");
+            bail!("pr_command vazio (default: \"{{cli}} pr open\")");
+        }
+        if split_command(&self.cli_command)?.is_empty() {
+            bail!("cli_command vazio (default: \"npx --yes @spec-wave/cli\")");
         }
         if !crate::lease::valid_lease_prefix(&self.lease_ref_prefix) {
             bail!("lease_ref_prefix inválido: {:?} (esperado refs/…, ex.: refs/spec-wave/claims)",
@@ -547,7 +607,11 @@ mod tests {
     #[test]
     fn defaults_com_apenas_repo() {
         let cfg = parse(r#"repo = "org/repo""#);
-        assert_eq!(cfg.pr_command, "npx spec-wave pr open");
+        assert_eq!(cfg.pr_command, "{cli} pr open");
+        assert_eq!(cfg.cli_command, "npx --yes @spec-wave/cli");
+        assert_eq!(split_command(&cfg.render(&cfg.pr_command, 1)).unwrap(),
+                   ["npx", "--yes", "@spec-wave/cli", "pr", "open"]);
+        assert!(cfg.warnings().is_empty(), "os defaults não chamam o pacote sem escopo");
         assert_eq!(cfg.queue_label, "spec-wave:dev-agent");
         assert_eq!(cfg.poll_interval_secs, 60);
         assert_eq!(cfg.heartbeat_secs, 120);
@@ -613,6 +677,37 @@ mod tests {
         assert!(argv.iter().any(|a| a.starts_with("Bash(npx:*),")));
         assert!(cfg.feature_prompt.contains("{issue}"));
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn prompts_default_chamam_a_cli_com_escopo() {
+        let cfg = parse(r#"repo = "o/r""#);
+        for prompt in [cfg.render(&cfg.feature_prompt, 7), cfg.render(&cfg.bug_prompt, 7)] {
+            assert!(prompt.contains("`npx --yes @spec-wave/cli implement"), "{prompt}");
+            assert!(!prompt.contains("{cli}"), "placeholder sem resolver: {prompt}");
+            assert!(!calls_unscoped_npx(&prompt), "{prompt}");
+        }
+        assert!(cfg.render(&cfg.feature_prompt, 7).contains("`npx --yes @spec-wave/cli order 7`"));
+        // Com a CLI instalada globalmente, o binário serve direto.
+        let global = parse("repo = \"o/r\"\ncli_command = \"spec-wave\"");
+        assert_eq!(global.pr_argv(), ["spec-wave", "pr", "open"]);
+        assert!(parse("repo = \"o/r\"\ncli_command = \"\"").validate().is_err());
+    }
+
+    #[test]
+    fn detecta_o_npx_do_pacote_sem_escopo() {
+        for t in ["npx spec-wave pr open", "rode `npx spec-wave order 7`", "npx -y spec-wave@3 x",
+                  "npx --yes spec-wave", "(npx spec-wave)"] {
+            assert!(calls_unscoped_npx(t), "{t}");
+        }
+        for t in ["npx --yes @spec-wave/cli pr open", "npx @spec-wave/cli@1.7 order", "spec-wave order 7",
+                  "npx spec-wave-outro", "npx vitest"] {
+            assert!(!calls_unscoped_npx(t), "{t}");
+        }
+        let velho = parse("repo = \"o/r\"\npr_command = \"npx spec-wave pr open\"\nfeature_prompt = \"rode npx spec-wave order {issue}\"");
+        let w = velho.warnings();
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w[0].contains("pr_command") && w[1].contains("feature_prompt"), "{w:?}");
     }
 
     #[test]

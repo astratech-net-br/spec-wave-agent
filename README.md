@@ -17,8 +17,8 @@ issue [FEATURE] com label spec-wave:dev-agent
         ▼
   claude -p  (orquestrador)       prompt via stdin
         │
-        ├─ npx spec-wave order <feature>      → ordem de dependência das stories
-        └─ npx spec-wave implement <story>    → um claude interno por story
+        ├─ {cli} order <feature>              → ordem de dependência das stories
+        └─ {cli} implement <story>            → um claude interno por story
                 │
                 └─ move os cards do board (Projects v2) automaticamente
 ```
@@ -78,7 +78,7 @@ O trabalho acontece num clone próprio (`workdir/issue-<n>`) no branch
 `agent/issue-<n>`. O executor (`feature_command`, default `claude -p …`) é
 lançado como **líder de grupo de processos** e recebe o `feature_prompt` pelo
 **stdin**; o output em `stream-json` é formatado para o console
-(`[#9] ⏵ Bash: npx spec-wave implement 320`).
+(`[#9] ⏵ Bash: npx --yes @spec-wave/cli implement 320`).
 
 | Desfecho | O que o agente faz |
 |---|---|
@@ -96,12 +96,12 @@ aberto ⇒ não abre outro) e best-effort: o trabalho já está pushado, então 
 ao abrir vira aviso, não derruba a execução. O corpo **não** usa `Closes`/`Fixes`
 — o merge não encerra o item, que ainda percorre QA, Homologação e Deploy.
 
-O PR sai pela porta de SCM da CLI: `pr_command` (default `npx spec-wave pr open`,
+O PR sai pela porta de SCM da CLI: `pr_command` (default `{cli} pr open`,
 @spec-wave/cli ≥ 1.7.0). Com isso, outro provedor de SCM é um plugin da CLI, e o
 agente não muda (RFC-008 P17). Se a CLI instalada não tiver o comando, ou falhar,
 o agente cai no `gh pr create` de antes.
 
-O **kill é sempre da árvore inteira**, porque o executor spawna `npx spec-wave`
+O **kill é sempre da árvore inteira**, porque o executor spawna a CLI do spec-wave
 que spawna o claude interno: em Unix, SIGKILL no grupo de processos (o filho é
 líder via `process_group(0)`); em Windows, `TerminateJobObject` num job object
 com `KILL_ON_JOB_CLOSE` ao qual o filho e todos os netos pertencem. Matar só o
@@ -119,7 +119,7 @@ como concluída. Proteções: estagnação (2 rodadas sem commit novo) e teto de
 Checados no boot — o agente falha rápido com mensagem clara:
 
 - `git` e `gh` autenticados (o agente usa as credenciais do dev)
-- Node 18+ (`npx spec-wave`)
+- Node 18+ (o `cli_command` default é `npx --yes @spec-wave/cli`)
 - Claude Code instalado e logado
 - No repositório alvo: `.spec-wave.json` com `specKit.command` (o executor
   interno de cada story) — ou a env `SPEC_WAVE_IMPLEMENT_CMD`
@@ -201,7 +201,8 @@ repo = "sua-org/seu-repo"
 | `max_executor_rounds` | `8` | teto de rodadas por feature |
 | `max_failures_per_issue` | `3` | falhas seguidas antes de tirar a issue da fila |
 | `workdir` | `~/.spec-wave-agent` | clones por issue + `lease-repo` |
-| `pr_command` | `npx spec-wave pr open` | comando que abre o PR pela CLI; o agente acrescenta `--repo`, `--head`, `--work-item`, `--hub`, `--body`, `--json` e `--draft` |
+| `cli_command` | `npx --yes @spec-wave/cli` | como chamar a CLI do spec-wave: o `{cli}` dos prompts e do `pr_command`, e o `workspace prepare`. **Nunca `npx spec-wave`**: o pacote npm sem escopo `spec-wave` é de outro projeto, e numa máquina sem a CLI instalada o npx o baixa e roda. Com a CLI instalada globalmente, `spec-wave` serve |
+| `pr_command` | `{cli} pr open` | comando que abre o PR pela CLI; o agente acrescenta `--repo`, `--head`, `--work-item`, `--hub`, `--body`, `--json` e `--draft` |
 | `pr_draft` | `false` | abre o PR do trabalho como **rascunho** — CI só quando alguém marca "pronto" (exige `if: !draft` + `ready_for_review` no job do check do repo) |
 | `agent_id` | `usuário@hostname` | identidade nos leases e comentários |
 | `remote_url` | `https://github.com/{repo}.git` | override (SSH, git self-hosted, testes) |
@@ -446,7 +447,7 @@ Ao mexer no código, três invariantes não podem ser quebrados:
 2. **`RenewError::Lost` ⇒ fencing imediato**, sem checkpoint, sem push, sem
    release. Esse caminho é livre de efeitos colaterais por definição.
 3. **Kill é do grupo de processos** (`kill_tree`), porque o executor spawna
-   `npx spec-wave` que spawna o claude interno — matar só o filho direto deixa
+   a CLI do spec-wave, que spawna o claude interno — matar só o filho direto deixa
    netos órfãos trabalhando no mesmo branch.
 
 Comentários e mensagens de log são em português; mantenha o padrão.

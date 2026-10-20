@@ -264,3 +264,44 @@ async fn checkpoint_nao_leva_arquivos_de_trabalho_do_cli() {
     assert!(!files.contains(".spec-wave/cache/"), "cache do CLI foi para o branch: {files}");
     assert!(!files.contains("implement-7.md"), "contexto do implement foi para o branch: {files}");
 }
+
+// O `workspace prepare` sai pelo `cli_command`, nunca por um `npx spec-wave`
+// fixo: o pacote npm sem escopo `spec-wave` é de outro projeto, e numa máquina
+// sem a CLI instalada o npx o baixaria e rodaria.
+#[tokio::test]
+async fn workspace_prepare_usa_o_cli_command() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = setup(&tmp, "cat > /dev/null\nexit 0", 60);
+    sh(&tmp.path().join("seed"), "echo '{}' > .spec-wave.json && git add -A && git commit -qm cfg && git push -q origin main");
+    let log = tmp.path().join("cli-argv.txt");
+    let cli = tmp.path().join("cli.sh");
+    std::fs::write(&cli, format!(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > {}\necho '{{\"repos\": []}}'\n", log.display())).unwrap();
+    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    cfg.cli_command = format!("{} --perfil e2e", cli.display());
+
+    let ws = ensure_workspace(&cfg, 21).await.unwrap();
+    assert!(ws.code_repos.is_empty());
+    let argv = std::fs::read_to_string(&log).expect("o cli_command não foi chamado");
+    assert_eq!(argv.lines().collect::<Vec<_>>(),
+               ["--perfil", "e2e", "workspace", "prepare", "--issue", "21", "--json"]);
+}
+
+// O `{cli}` do prompt chega resolvido ao executor — é por ele que o
+// orquestrador chama `order`/`implement`.
+#[tokio::test]
+async fn prompt_chega_ao_executor_com_o_cli_resolvido() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = setup(&tmp, r#"
+        cat > "$HOME_PROMPT"
+        printf '{"status": "ok"}' > .spec-wave-agent-result.json
+    "#, 60);
+    let prompt_file = tmp.path().join("prompt.txt");
+    cfg.feature_prompt = "rode `{cli} order {issue}`".into();
+    cfg.cli_command = "/opt/spec-wave/bin/spec-wave".into();
+    std::env::set_var("HOME_PROMPT", &prompt_file);
+    let (_lt, lr, _st, sr) = channels();
+    let ws = ensure_workspace(&cfg, 8).await.unwrap();
+    run_item(&cfg, &ws.hub, QueueItem { kind: QueueKind::Feature, number: 8 }, lr, sr).await.unwrap();
+    assert_eq!(std::fs::read_to_string(&prompt_file).unwrap(), "rode `/opt/spec-wave/bin/spec-wave order 8`");
+}
