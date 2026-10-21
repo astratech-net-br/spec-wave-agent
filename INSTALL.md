@@ -31,7 +31,7 @@ Invariantes validadas no boot (o agente recusa config inválida):
 ## 3. Pré-requisitos na máquina (checados no boot — fail fast)
 
 - `git` e `gh` autenticados (o agente usa as credenciais do dev)
-- Node 18+ (`npx spec-wave`)
+- Node 18+ (a CLI sai por `npx --yes @spec-wave/cli` — ver `cli_command`)
 - Claude Code instalado e logado
 - Repositório com `.spec-wave.json` contendo `specKit.command`
   apontando para o Claude Code (a máquina do dev É o executor)
@@ -46,7 +46,7 @@ RUST_LOG=debug spec-wave-agent     # mais verboso
 ```
 
 Os logs do agente saem com timestamp/nível; o output do
-`npx spec-wave implement` (Claude Code) aparece intercalado como
+`npx --yes @spec-wave/cli implement` (Claude Code) aparece intercalado como
 `[#<issue>][out] ...` / `[#<issue>][err] ...`.
 
 ### Linux (systemd user unit)
@@ -73,7 +73,7 @@ home automaticamente).
 
 - Fila: issues abertas com label `spec-wave:dev-agent` + tipo `[FEATURE]`;
   FIFO por número. A label vai na FEATURE: o executor (Claude Code, via
-  `feature_prompt`) usa `npx spec-wave order`/`implement` para implementar
+  `feature_prompt`) usa `{cli} order`/`implement` (o `cli_command`) para implementar
   todas as user stories da feature na ordem de dependência, paralelizando
   as independentes com sub-agentes.
 - **Uma feature por vez**: o agente pega a primeira que conseguir

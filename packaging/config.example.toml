@@ -65,8 +65,8 @@ implement_timeout_secs = 14400
 # (specKit.command do .spec-wave.json ou a env SPEC_WAVE_IMPLEMENT_CMD).
 
 # Prompt de orquestração enviado ao executor via stdin. Placeholder: {issue}.
-# O default instrui: `npx spec-wave order {issue}` para obter a ordem de
-# dependência das stories, `npx spec-wave implement <n>` por story na ordem,
+# O default instrui: `{cli} order {issue}` para obter a ordem de
+# dependência das stories, `{cli} implement <n>` por story na ordem,
 # paralelizar independentes com sub-agentes, commit+push por story.
 # IMPORTANTE: o specKit.command / SPEC_WAVE_IMPLEMENT_CMD (executor interno
 # de cada story) deve APENAS implementar — commit/push ficam com o
@@ -114,7 +114,14 @@ implement_timeout_secs = 14400
 # Identidade do agente nos leases e comentários (default: usuario@hostname)
 # Comando que abre o PR pela porta de SCM da CLI (@spec-wave/cli >= 1.7.0). Sem o
 # comando na CLI, o agente cai no gh pr create.
-#pr_command = "npx spec-wave pr open"
+#pr_command = "{cli} pr open"
+
+# Como chamar a CLI do spec-wave — o {cli} dos prompts e do pr_command, e o
+# `workspace prepare`. Com o ESCOPO: o pacote npm sem escopo `spec-wave` é de
+# outro projeto, e `npx spec-wave` numa máquina sem a CLI instalada baixa e
+# roda ele (o agente avisa no boot se a config ainda usar essa forma). Com a
+# CLI instalada globalmente (`npm i -g @spec-wave/cli`), "spec-wave" serve.
+#cli_command = "npx --yes @spec-wave/cli"
 
 # Abre o PR do trabalho concluído como rascunho (--draft):
 # o CI de um repo que pula draft no required check só roda quando alguém

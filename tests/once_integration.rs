@@ -156,7 +156,8 @@ fn once_abre_o_pr_pela_cli_e_clona_pela_url_do_ambiente() {
     let tmp = TempDir::new().unwrap();
     let args_log = tmp.path().join("npx-args.txt");
     // A CLI (1.7.0+) abre o PR; o gh, se fosse chamado para criar, falharia.
-    let npx = format!(r#"if [ "$1 $2 $3" = "spec-wave pr open" ]; then
+    // O default do pr_command é `{cli} pr open` = `npx --yes @spec-wave/cli pr open`.
+    let npx = format!(r#"if [ "$1 $2 $3 $4" = "--yes @spec-wave/cli pr open" ]; then
   printf '%s\n' "$@" > {log}
   echo '{{"url":"https://scm.example/test/test/pull/9","number":"9","created":true}}'
   exit 0

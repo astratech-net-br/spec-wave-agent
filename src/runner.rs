@@ -56,7 +56,7 @@ pub async fn ensure_workspace(cfg: &Config, issue: u64) -> Result<Workspace> {
     // a convenção de clone já estão lá, testadas; reimplementar em Rust
     // duplicaria a mesma lógica em duas linguagens, com risco real de
     // divergir (achado da migração RFC-005 do lado spec-wave-ui/sandbox).
-    let code_repos = prepare_code_repos(&ws, issue).await?;
+    let code_repos = prepare_code_repos(cfg, &ws, issue).await?;
 
     Ok(Workspace { hub: ws, code_repos })
 }
@@ -144,12 +144,14 @@ struct WorkspacePrepareRepo {
 /// qualquer jeito ("rode dentro do hub"). Com `.spec-wave.json` presente, uma
 /// falha de verdade (rede, repo declarado inacessível) SOBE — silenciar ali
 /// esconderia a issue chegando com código faltando, sem aviso nenhum.
-async fn prepare_code_repos(hub: &Path, issue: u64) -> Result<Vec<CodeRepoWorkspace>> {
+async fn prepare_code_repos(cfg: &Config, hub: &Path, issue: u64) -> Result<Vec<CodeRepoWorkspace>> {
     if !hub.join(".spec-wave.json").exists() {
         return Ok(Vec::new());
     }
-    let out = run_ok(hub, "npx",
-        &["spec-wave", "workspace", "prepare", "--issue", &issue.to_string(), "--json"])
+    let issue_arg = issue.to_string();
+    let argv = cfg.cli_argv(&["workspace", "prepare", "--issue", &issue_arg, "--json"]);
+    let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
+    let out = run_ok(hub, &argv[0], &args)
         .await
         .context("`spec-wave workspace prepare` falhou")?;
     let parsed: WorkspacePrepareOutput = serde_json::from_str(out.trim())
@@ -676,9 +678,8 @@ async fn executor_round(
         QueueKind::Feature =>
             (&cfg.feature_command, &cfg.feature_prompt, cfg.implement_timeout_secs),
     };
-    let argv = crate::config::split_command(
-        &crate::config::render_template(command, issue))?;
-    let prompt = crate::config::render_template(prompt_tpl, issue);
+    let argv = crate::config::split_command(&cfg.render(command, issue))?;
+    let prompt = cfg.render(prompt_tpl, issue);
 
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..])
