@@ -676,8 +676,10 @@ async fn executor_round(
         QueueKind::Feature =>
             (&cfg.feature_command, &cfg.feature_prompt, cfg.implement_timeout_secs),
     };
-    let argv = crate::config::split_command(
-        &crate::config::render_template(command, issue))?;
+    // Frota: MCP configurável (SPECWAVE_MCP_CONFIG / SPECWAVE_MCP_ALLOWED_TOOLS).
+    // Sem as envs o argv fica idêntico; nada do conteúdo é logado.
+    let argv = crate::config::apply_mcp_env(crate::config::split_command(
+        &crate::config::render_template(command, issue))?);
     let prompt = crate::config::render_template(prompt_tpl, issue);
 
     let mut cmd = Command::new(&argv[0]);

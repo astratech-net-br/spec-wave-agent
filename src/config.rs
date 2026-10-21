@@ -278,6 +278,60 @@ pub fn split_command(s: &str) -> Result<Vec<String>> {
     Ok(argv)
 }
 
+/// Acrescenta ao argv do `claude` as flags de MCP (frota): `--mcp-config <path>`
+/// e `--allowedTools <lista>`. Cada valor vai como argumento próprio (sem
+/// shell). Se o argv já tem `--allowedTools`/`--allowed-tools`, a lista é
+/// mesclada ao valor existente (vírgula, sem duplicar) em vez de repetir a
+/// flag. Valores ausentes/vazios deixam o argv byte a byte igual.
+pub fn apply_mcp_args(
+    mut argv: Vec<String>, mcp_config: Option<&str>, allowed_tools: Option<&str>,
+) -> Vec<String> {
+    let mcp_config = mcp_config.map(str::trim).filter(|v| !v.is_empty());
+    let allowed: Vec<&str> = allowed_tools.unwrap_or("").split(',')
+        .map(str::trim).filter(|t| !t.is_empty()).collect();
+    if let Some(path) = mcp_config {
+        argv.push("--mcp-config".into());
+        argv.push(path.to_string());
+    }
+    if allowed.is_empty() { return argv; }
+    let merge = |existing: &str| -> String {
+        let mut items: Vec<String> = existing.split(',')
+            .map(str::trim).filter(|t| !t.is_empty()).map(String::from).collect();
+        for t in &allowed {
+            if !items.iter().any(|i| i == t) { items.push((*t).to_string()); }
+        }
+        items.join(",")
+    };
+    for i in 0..argv.len() {
+        let a = argv[i].clone();
+        if a == "--allowedTools" || a == "--allowed-tools" {
+            if let Some(v) = argv.get(i + 1).filter(|v| !v.starts_with("--")) {
+                let merged = merge(v);
+                argv[i + 1] = merged;
+                return argv;
+            }
+        } else if let Some(v) = a.strip_prefix("--allowedTools=")
+            .or_else(|| a.strip_prefix("--allowed-tools="))
+        {
+            let flag = &a[..a.find('=').unwrap()];
+            argv[i] = format!("{flag}={}", merge(v));
+            return argv;
+        }
+    }
+    argv.push("--allowedTools".into());
+    argv.push(allowed.join(","));
+    argv
+}
+
+/// `apply_mcp_args` com `SPECWAVE_MCP_CONFIG` / `SPECWAVE_MCP_ALLOWED_TOOLS`.
+pub fn apply_mcp_env(argv: Vec<String>) -> Vec<String> {
+    apply_mcp_args(
+        argv,
+        std::env::var("SPECWAVE_MCP_CONFIG").ok().as_deref(),
+        std::env::var("SPECWAVE_MCP_ALLOWED_TOOLS").ok().as_deref(),
+    )
+}
+
 /// Substitui o placeholder {issue}.
 pub fn render_template(t: &str, issue: u64) -> String {
     t.replace("{issue}", &issue.to_string())
@@ -613,6 +667,34 @@ mod tests {
         assert!(argv.iter().any(|a| a.starts_with("Bash(npx:*),")));
         assert!(cfg.feature_prompt.contains("{issue}"));
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn mcp_sem_env_nao_altera_argv() {
+        let base = split_command("claude -p --allowedTools \"Bash(x:*),Read\"").unwrap();
+        assert_eq!(apply_mcp_args(base.clone(), None, None), base);
+        assert_eq!(apply_mcp_args(base.clone(), Some(" "), Some(",")), base);
+    }
+
+    #[test]
+    fn mcp_acrescenta_flags_como_argumentos_separados() {
+        let base = split_command("claude -p").unwrap();
+        let out = apply_mcp_args(base, Some("/h/a b;rm.json"),
+            Some("mcp__a__t1, mcp__a__t2"));
+        assert_eq!(out, vec!["claude", "-p", "--mcp-config", "/h/a b;rm.json",
+            "--allowedTools", "mcp__a__t1,mcp__a__t2"]);
+    }
+
+    #[test]
+    fn mcp_mescla_com_allowed_tools_existente() {
+        let base = split_command("claude -p --allowedTools \"Bash(x:*),Read\" --model m").unwrap();
+        let out = apply_mcp_args(base, None, Some("mcp__a__t,Read"));
+        assert_eq!(out, vec!["claude", "-p", "--allowedTools",
+            "Bash(x:*),Read,mcp__a__t", "--model", "m"]);
+        assert_eq!(out.iter().filter(|a| *a == "--allowedTools").count(), 1);
+        let eq = apply_mcp_args(vec!["claude".into(), "--allowed-tools=Read".into()],
+            None, Some("mcp__a__t"));
+        assert_eq!(eq, vec!["claude", "--allowed-tools=Read,mcp__a__t"]);
     }
 
     #[test]
