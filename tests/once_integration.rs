@@ -53,6 +53,8 @@ exit 0"#);
     std::fs::write(&cfg, format!(r#"
         {remote}
         implement_timeout_secs = 60
+        ci_poll_secs = 1
+        ci_no_checks_grace_secs = 1
         heartbeat_secs = 30
         lease_ttl_secs = 600
         feature_command = "{exec} {{issue}}"
