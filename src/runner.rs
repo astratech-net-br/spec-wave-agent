@@ -356,14 +356,27 @@ pub async fn checkpoint_all(workspace: &Workspace, issue: u64, label: &str) {
 pub async fn open_pull_requests_all(
     workspace: &Workspace, pr_command: &[String], hub_repo: &str, issue: u64, draft: bool,
 ) -> Vec<String> {
-    let mut urls = Vec::new();
-    urls.extend(open_pull_request(&workspace.hub, pr_command, hub_repo, hub_repo, issue, draft).await);
+    open_pull_requests_with_dirs(workspace, pr_command, hub_repo, issue, draft).await
+        .into_iter().map(|(url, _)| url).collect()
+}
+
+/// `open_pull_requests_all` devolvendo também o clone de cada PR — o gate de
+/// CI compara os checks com o HEAD daquele clone.
+async fn open_pull_requests_with_dirs(
+    workspace: &Workspace, pr_command: &[String], hub_repo: &str, issue: u64, draft: bool,
+) -> Vec<(String, PathBuf)> {
+    let mut prs = Vec::new();
+    if let Some(url) = open_pull_request(&workspace.hub, pr_command, hub_repo, hub_repo, issue, draft).await {
+        prs.push((url, workspace.hub.clone()));
+    }
     for cr in &workspace.code_repos {
         if has_unmerged_commits(&cr.dir).await {
-            urls.extend(open_pull_request(&cr.dir, pr_command, &cr.repo, hub_repo, issue, draft).await);
+            if let Some(url) = open_pull_request(&cr.dir, pr_command, &cr.repo, hub_repo, issue, draft).await {
+                prs.push((url, cr.dir.clone()));
+            }
         }
     }
-    urls
+    prs
 }
 
 /// Commita e pusha qualquer estado pendente (checkpoint para takeover).
@@ -669,6 +682,7 @@ async fn executor_round(
     mut lease_lost: watch::Receiver<bool>,
     mut shutdown: watch::Receiver<bool>,
     live: Option<LiveHooks>,
+    extra_prompt: Option<&str>,
 ) -> Result<RoundEnd> {
     let issue = item.number;
     let (command, prompt_tpl, timeout_secs) = match item.kind {
@@ -680,7 +694,12 @@ async fn executor_round(
     // Sem as envs o argv fica idêntico; nada do conteúdo é logado.
     let argv = crate::config::apply_mcp_env(crate::config::split_command(
         &crate::config::render_template(command, issue))?);
-    let prompt = crate::config::render_template(prompt_tpl, issue);
+    // O extra (contexto de CI reprovado) entra DEPOIS do render: log de CI é
+    // texto alheio, e um "{issue}" dentro dele não é placeholder.
+    let mut prompt = crate::config::render_template(prompt_tpl, issue);
+    if let Some(extra) = extra_prompt {
+        prompt.push_str(extra);
+    }
 
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..])
@@ -805,12 +824,22 @@ pub async fn run_item_with_tap(
     shutdown: watch::Receiver<bool>,
     live: Option<LiveHooks>,
 ) -> Result<RunEnd> {
+    run_rounds(cfg, ws, item, lease_lost, shutdown, live, None).await
+}
+
+async fn run_rounds(
+    cfg: &Config, ws: &Path, item: QueueItem,
+    lease_lost: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
+    live: Option<LiveHooks>,
+    extra_prompt: Option<&str>,
+) -> Result<RunEnd> {
     let issue = item.number;
     let mut no_progress = 0u32;
     for round in 1..=cfg.max_executor_rounds {
         let head_before = head_sha(ws).await;
-        let end = executor_round(cfg, ws, item,
-                                 lease_lost.clone(), shutdown.clone(), live.clone()).await?;
+        let end = executor_round(cfg, ws, item, lease_lost.clone(), shutdown.clone(),
+                                 live.clone(), extra_prompt).await?;
         match end {
             RoundEnd::Success(r) => return Ok(RunEnd::Success(r)),
             RoundEnd::Failed(r) => return Ok(RunEnd::Failed(r)),
@@ -837,6 +866,137 @@ pub async fn run_item_with_tap(
     Ok(RunEnd::Failed(format!(
         "max_executor_rounds ({}) atingido sem marker de conclusão",
         cfg.max_executor_rounds)))
+}
+
+async fn all_heads(workspace: &Workspace) -> Vec<String> {
+    let mut heads = vec![head_sha(&workspace.hub).await];
+    for cr in &workspace.code_repos {
+        heads.push(head_sha(&cr.dir).await);
+    }
+    heads
+}
+
+/// Desfecho de `run_item_gated`: o do executor + os PRs que o gate abriu.
+///
+/// Os PRs vêm junto em QUALQUER desfecho: com o gate o PR nasce antes do
+/// veredito, então uma execução que falha por CI vermelho deixa um PR aberto
+/// — e quem reporta precisa poder dizer qual.
+#[derive(Debug)]
+pub struct Gated {
+    pub end: RunEnd,
+    pub prs: Vec<String>,
+}
+
+/// `run_item_with_tap` + desfecho de sucesso (checkpoint e PR) + GATE DE CI:
+/// o marker "ok" do executor só vira sucesso depois que os checks do PR
+/// confirmam.
+///
+/// A cada "ok": checkpoint, PR (idempotente) e espera pelos checks do commit
+/// de cabeça de cada PR. Check vermelho relança o executor com os checks
+/// reprovados e o log resumido no prompt — até `max_ci_fix_rounds` vezes;
+/// depois disso (ou se a rodada de correção não produzir commit) a execução
+/// FALHA, com o PR aberto e o motivo dizendo o que reprovou.
+///
+/// Roda com o lease ainda nas mãos (o heartbeat de quem chama continua vivo):
+/// perda de lease ou interrupção durante a espera saem pelos mesmos desfechos
+/// do executor. CI que não dá para consultar, sem checks ou lento demais NÃO
+/// reprova — o gate confere o que o repositório diz, não inventa veredito.
+///
+/// O `ExecResult` devolvido é o do PRIMEIRO "ok": num bug é ele que carrega a
+/// causa raiz, e o marker de uma rodada de correção de CI fala de outra coisa.
+pub async fn run_item_gated(
+    cfg: &Config, workspace: &Workspace, item: QueueItem,
+    lease_lost: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
+    live: Option<LiveHooks>,
+    pr_command: &[String],
+) -> Result<Gated> {
+    use crate::ci::{self, CiWait, RedPr};
+    let issue = item.number;
+    let mut extra: Option<String> = None;
+    let mut fixes = 0u32;
+    let mut kept: Option<ExecResult> = None;
+    let mut urls: Vec<String> = Vec::new();
+    loop {
+        let heads_before = all_heads(workspace).await;
+        let end = run_rounds(cfg, &workspace.hub, item, lease_lost.clone(), shutdown.clone(),
+                             live.clone(), extra.as_deref()).await?;
+        match end {
+            RunEnd::Success(r) => if kept.is_none() { kept = r; },
+            other => return Ok(Gated { end: other, prs: urls }),
+        }
+        // Cinto de segurança: garante push de qualquer resto que o executor
+        // não tenha commitado — os checks rodam sobre o que está no remoto.
+        checkpoint_all(workspace, issue, "success").await;
+        if extra.is_some() && all_heads(workspace).await == heads_before {
+            return Ok(Gated {
+                end: RunEnd::Failed(
+                    "CI do PR reprovado e a rodada de correção terminou sem commit novo".into()),
+                prs: urls,
+            });
+        }
+        let prs = open_pull_requests_with_dirs(workspace, pr_command, &cfg.repo, issue, cfg.pr_draft).await;
+        urls = prs.iter().map(|(url, _)| url.clone()).collect();
+        if !cfg.ci_gate {
+            return Ok(Gated { end: RunEnd::Success(kept), prs: urls });
+        }
+        // Um relógio só para todos os PRs da issue (multi-repo).
+        let started = std::time::Instant::now();
+        let mut red: Vec<RedPr> = Vec::new();
+        for (url, dir) in &prs {
+            let failed = match ci::wait_checks(cfg, dir, url, started,
+                                               lease_lost.clone(), shutdown.clone()).await {
+                CiWait::Green => {
+                    info!(target: "ci", "#{issue}: checks verdes em {url}");
+                    continue;
+                }
+                CiWait::NoChecks => {
+                    info!(target: "ci", "#{issue}: {url} não tem checks — nada a conferir");
+                    continue;
+                }
+                CiWait::TimedOut => {
+                    warn!(target: "ci",
+                        "#{issue}: checks de {url} ainda em andamento após {}s — seguindo sem veredito",
+                        cfg.ci_timeout_secs);
+                    continue;
+                }
+                CiWait::Unavailable(why) => {
+                    warn!(target: "ci",
+                        "#{issue}: não foi possível consultar os checks de {url} ({why}) — gate pulado");
+                    continue;
+                }
+                CiWait::LeaseLost => return Ok(Gated { end: RunEnd::LeaseLost, prs: urls }),
+                CiWait::Interrupted => return Ok(Gated { end: RunEnd::Interrupted, prs: urls }),
+                CiWait::Red(failed) => failed,
+            };
+            let mut checks = Vec::with_capacity(failed.len());
+            for check in failed {
+                let log = match ci::failure_log(dir, &check, lease_lost.clone(), shutdown.clone()).await {
+                    Ok(log) => log,
+                    Err(CiWait::LeaseLost) => return Ok(Gated { end: RunEnd::LeaseLost, prs: urls }),
+                    Err(_) => return Ok(Gated { end: RunEnd::Interrupted, prs: urls }),
+                };
+                checks.push((check, log));
+            }
+            red.push(RedPr { url: url.clone(), checks });
+        }
+        if red.is_empty() {
+            return Ok(Gated { end: RunEnd::Success(kept), prs: urls });
+        }
+        let summary = ci::summarize(&red);
+        if fixes >= cfg.max_ci_fix_rounds {
+            return Ok(Gated {
+                end: RunEnd::Failed(format!(
+                    "CI do PR reprovado após {fixes} rodada(s) de correção — {summary}")),
+                prs: urls,
+            });
+        }
+        fixes += 1;
+        warn!(target: "ci",
+              "#{issue}: CI reprovado ({summary}); relançando o executor para corrigir \
+               (correção {fixes}/{})", cfg.max_ci_fix_rounds);
+        extra = Some(ci::fix_prompt(&red));
+    }
 }
 
 #[cfg(test)]

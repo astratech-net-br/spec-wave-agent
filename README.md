@@ -82,11 +82,39 @@ lançado como **líder de grupo de processos** e recebe o `feature_prompt` pelo
 
 | Desfecho | O que o agente faz |
 |---|---|
-| **Sucesso** (marker `{"status":"ok"}`) | checkpoint de segurança, **abre o PR** do branch, remove a label da fila, libera o lease |
+| **Sucesso** (marker `{"status":"ok"}` **e CI do PR verde**) | checkpoint de segurança, **abre o PR** do branch, **espera os checks**, remove a label da fila, libera o lease |
+| **CI vermelho** (marker "ok", check do PR reprovado) | relança o executor com os checks reprovados e o log resumido no prompt, até `max_ci_fix_rounds`; estourou ⇒ **Falha** |
 | **Rodada incompleta** (exit 0 sem marker) | relança o executor, que retoma pelo `git log` + `spec-wave order` |
 | **Falha** (exit ≠ 0, timeout, marker `partial`) | checkpoint (commit+push do WIP), comentário na issue, **mantém a label** (segue na fila), libera o lease |
 | **SIGTERM** (desligar a máquina) | checkpoint + release imediato ⇒ takeover instantâneo por outro agente |
 | **Lease perdido** | mata a árvore de processos e **não faz nada** — o novo dono manda no branch |
+
+**Gate de CI.** O marker é a palavra do executor, e o CI só roda depois que o
+PR abre — sem conferir, uma feature saía como concluída com o PR vermelho. Por
+isso, a cada marker "ok" o agente faz checkpoint, abre o PR (idempotente) e
+consulta os checks do **commit de cabeça** (`checks_command`, default
+`gh pr view <url> --json headRefOid,statusCheckRollup`) a cada `ci_poll_secs`,
+ainda com o lease nas mãos:
+
+- **verde** em duas consultas seguidas ⇒ sucesso;
+- **vermelho** ⇒ espera os checks que ainda rodam (o log do job só existe
+  quando o run termina) e então abre nova rodada do executor, com o PR, os checks reprovados e o
+  trecho do log que falhou (jobs do GitHub Actions, via `gh run view
+  --log-failed`) acrescentados ao prompt. Rodada de correção sem commit novo,
+  ou `max_ci_fix_rounds` (default 3) esgotado ⇒ falha, com o PR aberto e o
+  motivo dizendo o que reprovou;
+- **sem checks** após `ci_no_checks_grace_secs` (repositório sem CI, PR em
+  rascunho que pula CI), **checks em andamento** além de `ci_timeout_secs` ou
+  **consulta indisponível** (sem `gh`, outro SCM, 3 falhas seguidas) ⇒ segue
+  como sucesso, com aviso no log. O gate confere o que o repositório diz; não inventa veredito.
+
+Check **cancelado** reprova (job que estoura o tempo sai como cancelado, e
+testes que nunca terminaram não são verde); pulado e neutro passam. O PR nasce
+antes do veredito — é nele que o CI roda —, então uma execução que falha por
+CI vermelho deixa o PR aberto, citado no comentário da issue e no `pr_urls`
+do desfecho `failed` do `--once`. Outro SCM: aponte
+`checks_command` para um comando que devolva o mesmo JSON. `ci_gate = false`
+volta ao comportamento anterior (o marker basta).
 
 **Um PR por issue, não por story.** O trabalho inteiro vive num branch só
 (`agent/issue-<n>`), então é dele que sai o PR — aberto no sucesso, com o título
@@ -422,7 +450,8 @@ Crate lib + bin: `src/lib.rs` expõe os módulos (para os testes de integração
 | `src/config.rs` | Config, validação, `split_command`, `render_template` |
 | `src/lease.rs` | **o módulo dos invariantes** — CAS, renew/steal, `RenewError` |
 | `src/queue.rs` | `poll_queue` + `parse_queue` (pura) |
-| `src/runner.rs` | workspace, checkpoint, rodadas do executor, streaming, `kill_tree` |
+| `src/runner.rs` | workspace, checkpoint, rodadas do executor, streaming, `kill_tree`, `run_item_gated` |
+| `src/ci.rs` | gate de CI: consulta e espera dos checks do PR, resumo do log da falha, prompt da rodada de correção |
 | `src/shell.rs` | `run`/`run_ok` + `retry_backoff` |
 
 ```bash

@@ -29,7 +29,7 @@ use spec_wave_agent::config::{load_config_from, split_command, Config, Source};
 use spec_wave_agent::lease::{Lease, LeaseRepo, RenewError};
 use spec_wave_agent::queue::{self, QueueItem, QueueKind};
 use spec_wave_agent::runner::{
-    checkpoint_all, ensure_workspace, open_pull_requests_all, run_item_with_tap, RunEnd,
+    checkpoint_all, ensure_workspace, run_item_gated, Gated, RunEnd,
 };
 use spec_wave_agent::shell::run;
 use std::collections::HashMap;
@@ -220,8 +220,10 @@ async fn process_issue(
 
     let outcome = async {
         let workspace = ensure_workspace(cfg, issue).await?;
-        let end = run_item_with_tap(cfg, &workspace.hub, item, lost_rx.clone(), stop_rx, hooks).await?;
-        Ok::<_, anyhow::Error>((workspace, end))
+        // Com gate de CI: o "ok" do executor só vale depois dos checks do PR.
+        let gated = run_item_gated(cfg, &workspace, item, lost_rx.clone(), stop_rx, hooks,
+                                   &pr_command(cfg)).await?;
+        Ok::<_, anyhow::Error>((workspace, gated))
     }.await;
     if let Some(l) = live { l.finish().await; }
     // Mesmo sem transmissão (o Gateway não abriu), o diretório pode ter sido criado.
@@ -230,7 +232,7 @@ async fn process_issue(
     forward.abort();
     if let Some(h) = api_hb { h.abort(); }
 
-    let (workspace, end) = match outcome {
+    let (workspace, Gated { end, prs }) = match outcome {
         Ok(v) => v,
         Err(e) => {
             // Falha de infra (workspace/spawn): devolve o lease para não
@@ -247,10 +249,9 @@ async fn process_issue(
     let mut failed = false;
     match end {
         RunEnd::Success(result) => {
-            // Cinto de segurança: garante push de qualquer resto que o
-            // executor não tenha commitado, antes de sair da fila — no hub E
-            // em cada repositório de código que a issue tocou.
-            checkpoint_all(&workspace, issue, "success").await;
+            // Checkpoint e PR já foram feitos pelo gate (run_item_gated), no
+            // hub e em cada repositório de código que a issue tocou — o PR
+            // precisa existir ANTES do veredito, é nele que o CI roda.
             // Num bug, o VALOR do trabalho está na causa raiz: sem publicá-la
             // na issue, ela morre no marker (que nem é commitado) e a próxima
             // pessoa reinvestiga o mesmo defeito.
@@ -261,12 +262,10 @@ async fn process_issue(
                           "--repo", &cfg.repo, "--body", &body]).await;
                 }
             }
-            // O PR vem DEPOIS do checkpoint (todo o trabalho já está pushado) e
-            // ANTES de sair da fila: é ele que dá conteúdo à etapa 👀 Code
-            // Review. Sem isso, as Stories chegavam lá e a fila do Tech Leader
-            // mostrava "sem PR" em todas. Um PR por repositório efetivamente
-            // tocado (hub sempre; código de acordo com o que a issue declarou).
-            let prs = open_pull_requests_all(&workspace, &pr_command(cfg), &cfg.repo, issue, cfg.pr_draft).await;
+            // O PR é o que dá conteúdo à etapa 👀 Code Review. Sem ele, as
+            // Stories chegavam lá e a fila do Tech Leader mostrava "sem PR" em
+            // todas. Um PR por repositório efetivamente tocado (hub sempre;
+            // código de acordo com o que a issue declarou).
             if api.is_some() {
                 // Pela API, "sair da fila" é o card ir para Review (com os PRs).
                 report(api, Outcome::Succeeded(prs)).await;
@@ -287,7 +286,9 @@ async fn process_issue(
                             pushado no branch — outro agente (ou humano) \
                             pode retomar; rode `npx spec-wave order {issue}` \
                             para ver o estado das stories. Item permanece \
-                            na fila.")]).await;
+                            na fila.{}",
+                           if prs.is_empty() { String::new() }
+                           else { format!(" PR aberto: {}", prs.join(", ")) })]).await;
             leases.release(issue).await?; // devolve p/ fila: label continua
             report(api, Outcome::Failed(reason.clone())).await;
             failed = true;
@@ -868,14 +869,15 @@ async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
     let item = QueueItem { kind: job.kind, number: issue };
     let outcome = async {
         let workspace = ensure_workspace(&cfg, issue).await?;
-        let end = run_item_with_tap(&cfg, &workspace.hub, item, lost_rx.clone(), stop_rx, Some(hooks)).await?;
-        Ok::<_, anyhow::Error>((workspace, end))
+        let gated = run_item_gated(&cfg, &workspace, item, lost_rx.clone(), stop_rx, Some(hooks),
+                                   &pr_command(&cfg)).await?;
+        Ok::<_, anyhow::Error>((workspace, gated))
     }.await;
     stories.finish().await;
     let _ = forward.await;
     hb.abort();
 
-    let (workspace, end) = match outcome {
+    let (workspace, Gated { end, prs }) = match outcome {
         Ok(v) => v,
         Err(e) => {
             if !*lost_rx.borrow() {
@@ -886,21 +888,22 @@ async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
     };
     match end {
         RunEnd::Success(result) => {
-            checkpoint_all(&workspace, issue, "success").await;
+            // Checkpoint e PR já saíram pelo gate (run_item_gated).
             if item.kind == QueueKind::Bug {
                 if let Some(body) = render_bug_report(&result, &me) {
                     let _ = run(&workspace.hub, "gh",
                         &["issue", "comment", &issue.to_string(), "--repo", &cfg.repo, "--body", &body]).await;
                 }
             }
-            let prs = open_pull_requests_all(&workspace, &pr_command(&cfg), &cfg.repo, issue, cfg.pr_draft).await;
             leases.release(issue).await?;
             events.outcome("succeeded", None, &prs);
         }
         RunEnd::Failed(reason) => {
             checkpoint_all(&workspace, issue, "failed").await;
             leases.release(issue).await?;
-            events.outcome("failed", Some(&reason), &[]);
+            // Com o gate o PR pode existir numa execução que falhou (CI
+            // vermelho): o desfecho diz qual.
+            events.outcome("failed", Some(&reason), &prs);
         }
         RunEnd::Interrupted => {
             checkpoint_all(&workspace, issue, "interrupted").await;

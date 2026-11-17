@@ -124,6 +124,39 @@ pub struct Config {
     /// MESMO prefixo, senão o lease deixa de ser exclusivo.
     #[serde(default = "d_lease_prefix")]
     pub lease_ref_prefix: String,
+    /// Gate de CI: depois do marker "ok" o agente abre o PR, ESPERA os checks
+    /// do commit de cabeça e só então declara sucesso. Check vermelho relança
+    /// o executor com o log da falha (até `max_ci_fix_rounds` vezes).
+    ///
+    /// Existe porque o marker é a palavra do executor, e ela não basta: sem o
+    /// gate, uma feature saía como concluída com o CI do PR vermelho — o CI só
+    /// roda depois que o PR abre, quando o agente já tinha ido embora.
+    #[serde(default = "d_ci_gate")]
+    pub ci_gate: bool,
+    /// Comando que consulta os checks de um PR — o agente acrescenta
+    /// `<url-do-pr> --json headRefOid,statusCheckRollup`. Mesmo formato do
+    /// feature_command (sem shell). Outro SCM: aponte para um comando que
+    /// devolva o mesmo JSON. Comando ausente ou falhando NÃO reprova a
+    /// execução: o gate é pulado com aviso, como o PR é best-effort.
+    #[serde(default = "d_checks_command")]
+    pub checks_command: String,
+    /// Intervalo entre consultas aos checks.
+    #[serde(default = "d_ci_poll")]
+    pub ci_poll_secs: u64,
+    /// Teto de espera por checks EM ANDAMENTO. Estourou: o agente segue como
+    /// sucesso, com aviso — CI lento ou fila de runner parada não é defeito do
+    /// trabalho, e o PR fica aberto mostrando o estado real.
+    #[serde(default = "d_ci_timeout")]
+    pub ci_timeout_secs: u64,
+    /// Quanto esperar o PRIMEIRO check aparecer no commit de cabeça. Passou
+    /// disso sem nenhum, o repositório não tem CI para este PR (ou pula
+    /// rascunho) e o gate libera.
+    #[serde(default = "d_ci_grace")]
+    pub ci_no_checks_grace_secs: u64,
+    /// Quantas vezes o executor é relançado para corrigir CI vermelho antes
+    /// de a execução falhar.
+    #[serde(default = "d_max_ci_fix_rounds")]
+    pub max_ci_fix_rounds: u32,
 }
 
 fn d_lease_prefix() -> String { crate::lease::DEFAULT_LEASE_PREFIX.into() }
@@ -150,6 +183,12 @@ fn d_cooldown() -> u64 { 900 }
 fn d_max_rounds() -> u32 { 8 }
 fn d_max_failures() -> u32 { 3 }
 fn d_pr_draft() -> bool { false }
+fn d_ci_gate() -> bool { true }
+fn d_checks_command() -> String { "gh pr view".into() }
+fn d_ci_poll() -> u64 { 30 }
+fn d_ci_timeout() -> u64 { 1800 }
+fn d_ci_grace() -> u64 { 120 }
+fn d_max_ci_fix_rounds() -> u32 { 3 }
 fn d_feature_prompt() -> String {
     "Você está no clone do repositório, no branch de trabalho da Feature #{issue}.\n\
      Implemente a feature completa usando o spec-wave:\n\
@@ -160,9 +199,12 @@ fn d_feature_prompt() -> String {
      dependências estiverem concluídas.\n\
      3. Stories independentes entre si podem ser implementadas em paralelo \
      com sub-agentes.\n\
-     4. Ao concluir cada story: rode os testes relevantes, commite neste \
-     branch (assunto livre; inclua no RODAPÉ os `git trailer` que o \
-     contexto de `npx spec-wave implement <número>` pedir — \
+     4. Ao concluir cada story: rode a suíte de testes COMPLETA do projeto \
+     (o comando que o repositório documenta — não só os testes novos da \
+     story) e só commite com ela verde. Teste que falha é trabalho \
+     pendente: corrija antes do commit. Commite neste branch (assunto \
+     livre; inclua no RODAPÉ os `git trailer` que o contexto de \
+     `npx spec-wave implement <número>` pedir — \
      Spec-Wave-Story/Spec-Wave-Tasks/Spec-Wave-Agent, copiados literalmente) \
      e faça push.\n\
      5. Se uma story falhar, pule as que dependem dela e continue as \
@@ -174,6 +216,14 @@ fn d_feature_prompt() -> String {
      verifique o que já foi feito (`git log --oneline -20` e \
      `npx spec-wave order {issue}`) e continue de onde parou — não refaça \
      stories já commitadas.\n\
+     - Commit NÃO prova que os testes passam. Antes de escrever o marker — \
+     inclusive numa rodada em que todas as stories já estavam commitadas — \
+     rode a suíte COMPLETA nesta rodada. Falhou: corrija, commite, pushe e \
+     rode de novo. Se não for possível rodá-la (permissão, ambiente), diga \
+     isso no marker em vez de presumir que passa.\n\
+     - Depois do marker \"ok\" o agente abre o PR e ESPERA o CI. Se o CI \
+     ficar vermelho, você é reinvocado com o log da falha para corrigir — \
+     marker \"ok\" com teste quebrado só adia o trabalho.\n\
      - Processos em background que você deixar ao encerrar o turno são \
      MORTOS. Prefira executar cada implement em foreground e aguardar; se \
      usar background, aguarde a conclusão AINDA NESTE turno antes de \
@@ -193,9 +243,12 @@ fn d_feature_prompt() -> String {
      ./.spec-wave-agent-result.json (NÃO commite este arquivo) com \
      exatamente:\n\
      {\"status\": \"ok\"} se todas as stories foram implementadas, \
-     commitadas e pushadas; ou\n\
+     commitadas e pushadas E a suíte completa passou nesta rodada; ou\n\
+     {\"status\": \"ok\", \"detalhe\": \"suíte não executada: <motivo>\"} \
+     se tudo foi implementado mas você não conseguiu rodar a suíte; ou\n\
      {\"status\": \"partial\", \"detalhe\": \"<o que falhou>\"} se alguma \
-     story falhou definitivamente.\n\
+     story falhou definitivamente ou sobrou teste falhando que você não \
+     conseguiu corrigir.\n\
      - NÃO escreva o marker se ainda houver stories pendentes que você \
      pretende continuar na próxima rodada.\n"
         .into()
@@ -227,7 +280,11 @@ fn d_bug_prompt() -> String {
      Regras OBRIGATÓRIAS:\n\
      - Você roda em RODADAS: se o seu turno terminar sem o marker de \
      conclusão, você será REINVOCADO. Ao iniciar, verifique o que já foi \
-     feito (`git log --oneline -20`) e continue de onde parou.\n\
+     feito (`git log --oneline -20`) e continue de onde parou. Commit não \
+     prova que os testes passam: rode a suíte inteira NESTA rodada antes \
+     do marker.\n\
+     - Depois do marker \"ok\" o agente abre o PR e ESPERA o CI. Se o CI \
+     ficar vermelho, você é reinvocado com o log da falha para corrigir.\n\
      - Processos em background que você deixar ao encerrar o turno são \
      MORTOS. Execute em foreground e aguarde.\n\
      - Commite neste branch com a CAUSA RAIZ na mensagem: \
@@ -468,6 +525,12 @@ impl Config {
         }
         if self.max_executor_rounds == 0 {
             bail!("config: max_executor_rounds deve ser >= 1");
+        }
+        split_command(&self.checks_command)
+            .map_err(|e| anyhow::anyhow!("config: checks_command inválido: {e}"))?;
+        if self.ci_gate && (self.ci_poll_secs == 0 || self.ci_timeout_secs == 0) {
+            bail!("config: ci_poll_secs e ci_timeout_secs devem ser > 0 \
+                   (para desligar o gate use ci_gate = false)");
         }
         Ok(())
     }
@@ -731,6 +794,28 @@ mod tests {
         }
         let cfg = parse("repo = \"a/b\"\nlease_ttl_secs = 0");
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn gate_de_ci_ligado_por_default_e_validado() {
+        let cfg = parse(r#"repo = "org/repo""#);
+        assert!(cfg.ci_gate);
+        assert_eq!(cfg.checks_command, "gh pr view");
+        assert_eq!((cfg.ci_poll_secs, cfg.ci_timeout_secs, cfg.ci_no_checks_grace_secs), (30, 1800, 120));
+        assert_eq!(cfg.max_ci_fix_rounds, 3);
+        assert!(parse("repo = \"a/b\"\nci_poll_secs = 0").validate().is_err());
+        assert!(parse("repo = \"a/b\"\nci_poll_secs = 0\nci_gate = false").validate().is_ok());
+        assert!(parse("repo = \"a/b\"\nchecks_command = \"\"").validate().is_err());
+    }
+
+    #[test]
+    fn prompts_exigem_suite_completa_antes_do_marker() {
+        let cfg = parse(r#"repo = "org/repo""#);
+        for p in [&cfg.feature_prompt, &cfg.bug_prompt] {
+            assert!(p.contains("ESPERA o CI"), "prompt sem o aviso do gate: {p}");
+        }
+        assert!(cfg.feature_prompt.contains("suíte de testes COMPLETA"));
+        assert!(cfg.feature_prompt.contains("Commit NÃO prova que os testes passam"));
     }
 
     #[test]

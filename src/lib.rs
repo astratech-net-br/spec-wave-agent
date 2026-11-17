@@ -2,6 +2,7 @@
 //! o binário (main.rs) é só orquestração sobre estes módulos.
 
 pub mod api;
+pub mod ci;
 pub mod config;
 pub mod lease;
 pub mod live;

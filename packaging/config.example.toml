@@ -126,3 +126,28 @@ implement_timeout_secs = 14400
 # Override da URL do remoto (git self-hosted / testes).
 # Default: https://github.com/{repo}.git
 #remote_url = ""
+
+# Gate de CI. Depois do marker "ok" do executor, o agente abre o PR e ESPERA
+# os checks do commit de cabeça antes de declarar sucesso. Check vermelho
+# relança o executor com os checks reprovados e o log da falha no prompt.
+# Check cancelado conta como reprovado. Sem checks, CI lento demais ou
+# consulta indisponível NÃO reprovam — seguem como sucesso, com aviso no log. `false` = o marker basta (como era antes).
+#ci_gate = true
+
+# Comando que consulta os checks de um PR. O agente acrescenta
+# `<url-do-pr> --json headRefOid,statusCheckRollup` e espera o JSON do
+# `gh pr view`. Outro SCM: um comando que devolva o mesmo formato.
+#checks_command = "gh pr view"
+
+# Intervalo entre consultas aos checks (segundos)
+#ci_poll_secs = 30
+
+# Teto de espera por checks em andamento (segundos)
+#ci_timeout_secs = 1800
+
+# Quanto esperar o primeiro check aparecer. Passou disso sem nenhum, o
+# repositório não tem CI para este PR e o gate libera (segundos)
+#ci_no_checks_grace_secs = 120
+
+# Quantas vezes relançar o executor para corrigir CI vermelho antes de falhar
+#max_ci_fix_rounds = 3
