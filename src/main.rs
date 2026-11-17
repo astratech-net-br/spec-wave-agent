@@ -29,7 +29,7 @@ use spec_wave_agent::config::{load_config_from, split_command, Config, Source};
 use spec_wave_agent::lease::{Lease, LeaseRepo, RenewError};
 use spec_wave_agent::queue::{self, QueueItem, QueueKind};
 use spec_wave_agent::runner::{
-    checkpoint_all, ensure_workspace, open_pull_requests_all, run_item_with_tap, RunEnd,
+    checkpoint_all, ensure_workspace, open_pull_requests_all, run_item_gated, RunEnd,
 };
 use spec_wave_agent::shell::run;
 use std::collections::HashMap;
@@ -220,7 +220,9 @@ async fn process_issue(
 
     let outcome = async {
         let workspace = ensure_workspace(cfg, issue).await?;
-        let end = run_item_with_tap(cfg, &workspace.hub, item, lost_rx.clone(), stop_rx, hooks).await?;
+        // Com gate de CI: o "ok" do executor só vale depois dos checks do PR.
+        let end = run_item_gated(cfg, &workspace, item, lost_rx.clone(), stop_rx, hooks,
+                                 &pr_command(cfg)).await?;
         Ok::<_, anyhow::Error>((workspace, end))
     }.await;
     if let Some(l) = live { l.finish().await; }
@@ -868,7 +870,8 @@ async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
     let item = QueueItem { kind: job.kind, number: issue };
     let outcome = async {
         let workspace = ensure_workspace(&cfg, issue).await?;
-        let end = run_item_with_tap(&cfg, &workspace.hub, item, lost_rx.clone(), stop_rx, Some(hooks)).await?;
+        let end = run_item_gated(&cfg, &workspace, item, lost_rx.clone(), stop_rx, Some(hooks),
+                                 &pr_command(&cfg)).await?;
         Ok::<_, anyhow::Error>((workspace, end))
     }.await;
     stories.finish().await;
