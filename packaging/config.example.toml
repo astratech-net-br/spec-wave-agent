@@ -116,6 +116,12 @@ implement_timeout_secs = 14400
 # comando na CLI, o agente cai no gh pr create.
 #pr_command = "npx spec-wave pr open"
 
+# Comando do retrato de progresso da Feature (@spec-wave/cli >= 1.9.0): quantas
+# Tasks ela tem e quais já estão concluídas. Com ele e com os sinais que a CLI
+# grava a cada Task concluída, o card da tela Development mostra uma barra de
+# progresso. "" desliga.
+#progress_command = "npx spec-wave progress {issue} --json"
+
 # Abre o PR do trabalho concluído como rascunho (--draft):
 # o CI de um repo que pula draft no required check só roda quando alguém
 # marca o PR como pronto para revisão. Default: false.

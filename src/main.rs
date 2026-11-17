@@ -25,11 +25,12 @@
 
 use anyhow::{bail, Result};
 use spec_wave_agent::api::{queue_item_of, ApiClient, Outcome, WorkItem};
-use spec_wave_agent::config::{load_config_from, split_command, Config, Source};
+use spec_wave_agent::config::{load_config_from, render_template, split_command, Config, Source};
 use spec_wave_agent::lease::{Lease, LeaseRepo, RenewError};
+use spec_wave_agent::progress::{Progress, ProgressWatch};
 use spec_wave_agent::queue::{self, QueueItem, QueueKind};
 use spec_wave_agent::runner::{
-    checkpoint_all, ensure_workspace, run_item_gated, Gated, RunEnd,
+    checkpoint_all, ensure_workspace, run_item_gated, Gated, LiveHooks, RunEnd,
 };
 use spec_wave_agent::shell::run;
 use std::collections::HashMap;
@@ -132,13 +133,20 @@ struct Attempt { claimed: bool, failed: bool }
 ///
 /// Falha de rede NÃO para o trabalho: a correção está no lease, a API é
 /// informativa — o kanban só mostra "sem sinal" até o próximo heartbeat.
+///
+/// `progress`: o progresso por Task da execução (progress.rs). Cada mudança
+/// sai na hora — é o "uma Task terminou" da barra do kanban —, sem esperar o
+/// próximo intervalo; e todo heartbeat repete o último valor conhecido.
 fn spawn_api_heartbeat(
     api: ApiClient, work: WorkItem, every_secs: u64,
     stop: Arc<watch::Sender<bool>>, cancelled: Arc<AtomicBool>,
+    mut progress: watch::Receiver<Option<Progress>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut progress_open = true;
         loop {
-            match api.heartbeat(&work).await {
+            let current = *progress.borrow_and_update();
+            match api.heartbeat(&work, current).await {
                 Ok(reply) if !reply.keep_going => {
                     let why = reply.reason.unwrap_or_else(|| "o despacho mudou".into());
                     info!(target: "api", "#{}: parando — {why}", work.work_item);
@@ -149,9 +157,32 @@ fn spawn_api_heartbeat(
                 Ok(_) => {}
                 Err(e) => warn!(target: "api", "#{}: heartbeat falhou: {e:#}", work.work_item),
             }
-            sleep(TokioDuration::from_secs(every_secs)).await;
+            tokio::select! {
+                _ = sleep(TokioDuration::from_secs(every_secs)) => {}
+                r = progress.changed(), if progress_open => {
+                    // Canal fechado = a execução acabou; segue só no intervalo.
+                    if r.is_err() { progress_open = false; }
+                }
+            }
         }
     })
+}
+
+/// Liga o acompanhamento do progresso por Task (progress.rs). Só para
+/// Feature — bug não tem Tasks — e só com o comando do retrato configurado.
+fn progress_watch(
+    cfg: &Config, item: QueueItem, ws: &Path, hooks: &LiveHooks,
+    out: Arc<watch::Sender<Option<Progress>>>,
+) -> Option<ProgressWatch> {
+    if item.kind != QueueKind::Feature {
+        return None;
+    }
+    let argv = split_command(&render_template(&cfg.progress_command, item.number)).ok()
+        .filter(|a| !a.is_empty())?;
+    // Na criação do diretório, não na primeira Task: a CLI só escreve se ele
+    // já estiver no ambiente do executor, e ele já está.
+    let _ = std::fs::create_dir_all(&hooks.stream_dir);
+    Some(ProgressWatch::spawn(argv, ws.to_path_buf(), hooks.stream_dir.clone(), hooks.round.clone(), out))
 }
 
 /// Reporta o desfecho à API quando o item veio dela. Best-effort: o trabalho
@@ -203,8 +234,11 @@ async fn process_issue(
             let _ = stop_tx.send(true);
         })
     };
+    let (progress_tx, progress_rx) = watch::channel(None::<Progress>);
+    let progress_tx = Arc::new(progress_tx);
     let api_hb = api.map(|(client, work)| spawn_api_heartbeat(
-        client.clone(), work.clone(), cfg.heartbeat_secs, stop_tx.clone(), cancelled.clone()));
+        client.clone(), work.clone(), cfg.heartbeat_secs, stop_tx.clone(), cancelled.clone(),
+        progress_rx));
 
     // Transmissão ao vivo para a tela Development (fonte api): melhor esforço,
     // nunca bloqueia o executor (live.rs).
@@ -216,14 +250,24 @@ async fn process_issue(
         std::fs::create_dir_all(&stream_dir).ok()?;
         client.start_live(work, stream_dir.clone())
     });
-    let hooks = live.as_ref().map(|l| l.hooks());
+    // Sem transmissão (o Gateway não abriu) o executor ainda recebe o
+    // diretório: é por ele que a CLI sinaliza cada Task concluída
+    // (progress.rs). O canal fica sem leitor — `try_send` descarta.
+    let hooks = api.map(|_| live.as_ref().map(|l| l.hooks()).unwrap_or_else(|| LiveHooks {
+        tap: tokio::sync::mpsc::channel(1).0,
+        stream_dir: stream_dir.clone(),
+        round: Default::default(),
+    }));
 
     let outcome = async {
         let workspace = ensure_workspace(cfg, issue).await?;
+        let watch = hooks.as_ref()
+            .and_then(|h| progress_watch(cfg, item, &workspace.hub, h, progress_tx.clone()));
         // Com gate de CI: o "ok" do executor só vale depois dos checks do PR.
         let gated = run_item_gated(cfg, &workspace, item, lost_rx.clone(), stop_rx, hooks,
-                                   &pr_command(cfg)).await?;
-        Ok::<_, anyhow::Error>((workspace, gated))
+                                   &pr_command(cfg)).await;
+        if let Some(w) = watch { w.finish().await; }
+        Ok::<_, anyhow::Error>((workspace, gated?))
     }.await;
     if let Some(l) = live { l.finish().await; }
     // Mesmo sem transmissão (o Gateway não abriu), o diretório pode ter sido criado.
@@ -863,16 +907,40 @@ async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
         })
     };
     let stories = spec_wave_agent::live::StoryTail::spawn(stream_dir.clone(), tap_tx.clone());
-    let hooks = spec_wave_agent::runner::LiveHooks { tap: tap_tx.clone(), stream_dir: stream_dir.clone() };
+    let hooks = LiveHooks { tap: tap_tx.clone(), stream_dir: stream_dir.clone(), round: Default::default() };
     drop(tap_tx);
+
+    // Progresso por Task → evento `progress` (o fleet-runner repassa no
+    // fleet.run_status). Um evento por mudança.
+    let (progress_tx, mut progress_rx) = watch::channel(None::<Progress>);
+    let progress_tx = Arc::new(progress_tx);
+    let progress_forward = {
+        let events = events.clone();
+        tokio::spawn(async move {
+            while progress_rx.changed().await.is_ok() {
+                if let Some(p) = *progress_rx.borrow_and_update() {
+                    events.emit(serde_json::json!({
+                        "event": "progress", "round": p.round,
+                        "stories_done": p.stories_done, "stories_total": p.stories_total,
+                        "tasks_done": p.tasks_done, "tasks_total": p.tasks_total,
+                    }));
+                }
+            }
+        })
+    };
 
     let item = QueueItem { kind: job.kind, number: issue };
     let outcome = async {
         let workspace = ensure_workspace(&cfg, issue).await?;
+        let watch = progress_watch(&cfg, item, &workspace.hub, &hooks, progress_tx.clone());
         let gated = run_item_gated(&cfg, &workspace, item, lost_rx.clone(), stop_rx, Some(hooks),
-                                   &pr_command(&cfg)).await?;
-        Ok::<_, anyhow::Error>((workspace, gated))
+                                   &pr_command(&cfg)).await;
+        if let Some(w) = watch { w.finish().await; }
+        Ok::<_, anyhow::Error>((workspace, gated?))
     }.await;
+    // O último progresso sai ANTES do desfecho.
+    drop(progress_tx);
+    let _ = progress_forward.await;
     stories.finish().await;
     let _ = forward.await;
     hb.abort();

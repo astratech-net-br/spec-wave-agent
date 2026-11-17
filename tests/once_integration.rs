@@ -190,3 +190,53 @@ echo '{"status":"ok"}' > .spec-wave-agent-result.json"#, &npx, false);
         .current_dir(&origin).output().unwrap();
     assert!(String::from_utf8_lossy(&log.stdout).contains("story 1"));
 }
+
+#[test]
+fn once_emite_progresso_a_cada_task_concluida() {
+    let tmp = TempDir::new().unwrap();
+    // A CLI: o retrato diz 3 Tasks, 1 já pronta de uma execução anterior.
+    let npx = r#"if [ "$1 $2" = "spec-wave progress" ]; then
+  echo 'npm warn exec qualquer'
+  echo '{"feature":42,"stories":[{"number":3,"done":false,"tasks":[{"number":5,"done":true},{"number":6,"done":false},{"number":7,"done":false}]}]}'
+  exit 0
+fi
+echo 10.0.0"#;
+    // O executor: espera o retrato, conclui a Task 6 (`task done`) e depois a
+    // Story inteira (fim do `implement`).
+    let (cfg, path, workdir) = setup_with(&tmp, r#"set -eu
+cat > /dev/null
+sleep 1.5
+echo '{"event":"task_done","task":6}' >> "$SPEC_WAVE_STREAM_DIR/progress.jsonl"
+sleep 1.5
+echo '{"event":"story_done","story":3,"tasks":[5,6,7]}' >> "$SPEC_WAVE_STREAM_DIR/progress.jsonl"
+echo trabalho > feito.txt && git add feito.txt && git commit -qm "story 3"
+echo '{"status":"ok"}' > .spec-wave-agent-result.json"#, npx, true);
+    let out = once(&tmp, &cfg, &path, &workdir).output().unwrap();
+    assert!(out.status.success(), "exit {:?}", out.status);
+    let evs = events(&out.stdout);
+    let progresso: Vec<(u64, u64, u64, u64)> = evs.iter().filter(|e| e["event"] == "progress")
+        .map(|e| (e["tasks_done"].as_u64().unwrap(), e["tasks_total"].as_u64().unwrap(),
+                  e["stories_done"].as_u64().unwrap(), e["stories_total"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(progresso, vec![(1, 3, 0, 1), (2, 3, 0, 1), (3, 3, 1, 1)], "eventos: {evs:?}");
+    assert!(evs.iter().filter(|e| e["event"] == "progress").all(|e| e["round"] == 1));
+    // O último progresso sai antes do desfecho, que continua sendo a última linha.
+    assert_eq!(evs.last().unwrap()["event"], "outcome");
+    assert_eq!(evs.last().unwrap()["state"], "succeeded");
+}
+
+#[test]
+fn once_com_cli_sem_o_comando_de_progresso_segue_sem_barra() {
+    let tmp = TempDir::new().unwrap();
+    // npx padrão ("echo 10.0.0"): não devolve retrato. Sem retrato não há
+    // total, logo não há barra — nem que cheguem eventos.
+    let (cfg, path, workdir) = setup(&tmp, r#"set -eu
+cat > /dev/null
+echo trabalho > feito.txt && git add feito.txt && git commit -qm "story 3"
+echo '{"status":"ok"}' > .spec-wave-agent-result.json"#);
+    let out = once(&tmp, &cfg, &path, &workdir).output().unwrap();
+    assert!(out.status.success(), "exit {:?}", out.status);
+    let evs = events(&out.stdout);
+    assert!(evs.iter().all(|e| e["event"] != "progress"), "sem Task conhecida não há evento: {evs:?}");
+    assert_eq!(evs.last().unwrap()["state"], "succeeded");
+}

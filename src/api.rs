@@ -6,6 +6,7 @@
 //! lease em git ref — a API decide O QUE fazer, o lease garante UM dono.
 
 use crate::config::{hostname, Config};
+use crate::progress::Progress;
 use crate::queue::{QueueItem, QueueKind};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -66,6 +67,10 @@ struct OutcomeBody<'a> {
 struct HeartbeatBody<'a> {
     run_id: &'a str,
     host: &'a str,
+    /// Sempre o último progresso conhecido: a API grava o que vier, e um
+    /// heartbeat sem ele apagaria a barra.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress: Option<Progress>,
 }
 
 /// Converte um item da API para o item da fila local. `None` para o que o
@@ -149,10 +154,10 @@ impl ApiClient {
 
     /// Heartbeat da tentativa. `keep_going = false` = o despacho foi
     /// cancelado, refeito ou redirecionado: o agente para.
-    pub async fn heartbeat(&self, w: &WorkItem) -> Result<HeartbeatReply> {
+    pub async fn heartbeat(&self, w: &WorkItem, progress: Option<Progress>) -> Result<HeartbeatReply> {
         let res = self.http.post(self.dispatch_url(w, "heartbeat"))
             .bearer_auth(&self.token)
-            .json(&HeartbeatBody { run_id: &w.run_id, host: &self.host })
+            .json(&HeartbeatBody { run_id: &w.run_id, host: &self.host, progress })
             .send().await?;
         let status = res.status();
         if !status.is_success() {
@@ -229,6 +234,16 @@ mod tests {
                                            "prUrls": ["https://github.com/acme/hub/pull/9"] }));
         let bl = serde_json::to_value(outcome_body("R1", &Outcome::Blocked("3 falhas".into()))).unwrap();
         assert_eq!(bl, serde_json::json!({ "runId": "R1", "outcome": "blocked", "reason": "3 falhas" }));
+    }
+
+    #[test]
+    fn corpo_do_heartbeat_leva_o_progresso_quando_ha() {
+        let sem = serde_json::to_value(HeartbeatBody { run_id: "R1", host: "ana@pc", progress: None }).unwrap();
+        assert_eq!(sem, serde_json::json!({ "runId": "R1", "host": "ana@pc" }));
+        let p = Progress { round: 2, stories_done: 1, stories_total: 3, tasks_done: 4, tasks_total: 9 };
+        let com = serde_json::to_value(HeartbeatBody { run_id: "R1", host: "ana@pc", progress: Some(p) }).unwrap();
+        assert_eq!(com["progress"], serde_json::json!({
+            "round": 2, "storiesDone": 1, "storiesTotal": 3, "tasksDone": 4, "tasksTotal": 9 }));
     }
 
     #[test]
