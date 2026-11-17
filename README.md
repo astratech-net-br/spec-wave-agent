@@ -97,17 +97,22 @@ consulta os checks do **commit de cabeça** (`checks_command`, default
 ainda com o lease nas mãos:
 
 - **verde** em duas consultas seguidas ⇒ sucesso;
-- **vermelho** ⇒ nova rodada do executor, com o PR, os checks reprovados e o
+- **vermelho** ⇒ espera os checks que ainda rodam (o log do job só existe
+  quando o run termina) e então abre nova rodada do executor, com o PR, os checks reprovados e o
   trecho do log que falhou (jobs do GitHub Actions, via `gh run view
   --log-failed`) acrescentados ao prompt. Rodada de correção sem commit novo,
   ou `max_ci_fix_rounds` (default 3) esgotado ⇒ falha, com o PR aberto e o
   motivo dizendo o que reprovou;
 - **sem checks** após `ci_no_checks_grace_secs` (repositório sem CI, PR em
   rascunho que pula CI), **checks em andamento** além de `ci_timeout_secs` ou
-  **consulta indisponível** (sem `gh`, outro SCM) ⇒ segue como sucesso, com
-  aviso no log. O gate confere o que o repositório diz; não inventa veredito.
+  **consulta indisponível** (sem `gh`, outro SCM, 3 falhas seguidas) ⇒ segue
+  como sucesso, com aviso no log. O gate confere o que o repositório diz; não inventa veredito.
 
-Check cancelado, pulado ou neutro não reprova. Outro SCM: aponte
+Check **cancelado** reprova (job que estoura o tempo sai como cancelado, e
+testes que nunca terminaram não são verde); pulado e neutro passam. O PR nasce
+antes do veredito — é nele que o CI roda —, então uma execução que falha por
+CI vermelho deixa o PR aberto, citado no comentário da issue e no `pr_urls`
+do desfecho `failed` do `--once`. Outro SCM: aponte
 `checks_command` para um comando que devolva o mesmo JSON. `ci_gate = false`
 volta ao comportamento anterior (o marker basta).
 

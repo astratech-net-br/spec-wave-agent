@@ -25,7 +25,9 @@ pub struct FailedCheck {
 pub enum Verdict {
     Green,
     Pending,
-    Red(Vec<FailedCheck>),
+    /// Checks reprovados; `true` = ainda há outros em andamento (o log de um
+    /// job só fica disponível quando o run inteiro termina).
+    Red(Vec<FailedCheck>, bool),
     /// Nenhum check registrado (ainda, ou o repositório não tem CI).
     NoChecks,
 }
@@ -60,15 +62,19 @@ fn text<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 /// Classifica um item do `statusCheckRollup`: CheckRun (`status` +
-/// `conclusion`) ou StatusContext (`state`). Cancelado/pulado/neutro não
-/// reprovam — não há nada que o executor possa corrigir neles.
+/// `conclusion`) ou StatusContext (`state`).
+///
+/// CANCELLED e STALE REPROVAM: um job que estoura o tempo máximo sai como
+/// cancelado, e um commit cujos testes nunca terminaram não pode passar por
+/// verde. Pulado e neutro passam — é o repositório dizendo que não se aplica.
 fn classify(item: &Value) -> State {
     if let Some(status) = text(item, "status") {
         if !status.eq_ignore_ascii_case("COMPLETED") {
             return State::Pending;
         }
         return match text(item, "conclusion").unwrap_or("").to_ascii_uppercase().as_str() {
-            "FAILURE" | "TIMED_OUT" | "STARTUP_FAILURE" | "ACTION_REQUIRED" => State::Fail,
+            "FAILURE" | "TIMED_OUT" | "STARTUP_FAILURE" | "ACTION_REQUIRED"
+            | "CANCELLED" | "STALE" => State::Fail,
             _ => State::Pass,
         };
     }
@@ -90,8 +96,8 @@ fn check_name(item: &Value) -> String {
 /// Interpreta `{"headRefOid": "...", "statusCheckRollup": [...]}` (o JSON do
 /// `gh pr view --json headRefOid,statusCheckRollup`). Pura, para os testes.
 ///
-/// Vermelho vence pendente: um check reprovado já basta para agir, sem
-/// esperar os outros terminarem. `headRefOid` ausente (comando customizado
+/// Vermelho vence pendente no veredito, mas leva junto se ainda há checks
+/// rodando — quem espera decide se aguarda o log. `headRefOid` ausente (comando customizado
 /// que não o informa) não é tratado como divergência.
 pub fn parse_checks(stdout: &str, head: &str) -> Option<Probe> {
     let v: Value = serde_json::from_str(stdout.trim()).ok()?;
@@ -120,7 +126,7 @@ pub fn parse_checks(stdout: &str, head: &str) -> Option<Probe> {
         }
     }
     Some(Probe::Verdict(if !failed.is_empty() {
-        Verdict::Red(failed)
+        Verdict::Red(failed, pending)
     } else if pending {
         Verdict::Pending
     } else {
@@ -134,62 +140,119 @@ async fn head_sha(dir: &Path) -> String {
         .unwrap_or_default()
 }
 
-async fn probe(dir: &Path, argv: &[String], url: &str) -> Result<Probe, String> {
+/// Falha de uma consulta: `Spawn` = o comando nem existe (não adianta
+/// repetir); `Run` = rodou e falhou (rede, credencial, PR ainda não indexado).
+enum ProbeErr { Spawn(String), Run(String) }
+
+/// Por que uma chamada externa do gate não devolveu resultado.
+enum Cut { Timeout, LeaseLost, Interrupted }
+
+/// Roda `fut` com teto de tempo, abortando se o lease cair ou o agente for
+/// interrompido. As chamadas externas do gate (gh) podem travar numa conexão
+/// meio aberta; sem isto o SIGTERM e a perda de lease só seriam vistos no
+/// sleep entre consultas.
+async fn guarded<T>(
+    fut: impl std::future::Future<Output = T>, cap: Duration,
+    lease_lost: &mut watch::Receiver<bool>, shutdown: &mut watch::Receiver<bool>,
+) -> Result<T, Cut> {
+    if *lease_lost.borrow() { return Err(Cut::LeaseLost); }
+    if *shutdown.borrow() { return Err(Cut::Interrupted); }
+    tokio::select! {
+        r = tokio::time::timeout(cap, fut) => r.map_err(|_| Cut::Timeout),
+        _ = lease_lost.changed() => Err(Cut::LeaseLost),
+        _ = shutdown.changed() => Err(Cut::Interrupted),
+    }
+}
+
+/// `shell::run` com `kill_on_drop`: quando `guarded` desiste da chamada, o
+/// processo morre junto em vez de ficar órfão.
+async fn run_killable(cwd: &Path, program: &str, args: &[&str]) -> std::io::Result<crate::shell::Out> {
+    let output = tokio::process::Command::new(program)
+        .args(args).current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output().await?;
+    Ok(crate::shell::Out {
+        ok: output.status.success(),
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
+const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+const LOG_TIMEOUT: Duration = Duration::from_secs(120);
+
+async fn probe(dir: &Path, argv: &[String], url: &str) -> Result<Probe, ProbeErr> {
     let Some((program, base)) = argv.split_first() else {
-        return Err("checks_command vazio".into());
+        return Err(ProbeErr::Spawn("checks_command vazio".into()));
     };
     let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
     args.extend([url, "--json", "headRefOid,statusCheckRollup"]);
-    let out = run(dir, program, &args).await.map_err(|e| format!("{e:#}"))?;
+    let out = run_killable(dir, program, &args).await
+        .map_err(|e| ProbeErr::Spawn(format!("falha ao executar {program}: {e}")))?;
     if !out.ok {
         let why = out.stderr.trim().lines().last().unwrap_or("").to_string();
-        return Err(if why.is_empty() { format!("código {:?}", out.code) } else { why });
+        return Err(ProbeErr::Run(if why.is_empty() { format!("código {:?}", out.code) } else { why }));
     }
     parse_checks(&out.stdout, &head_sha(dir).await)
-        .ok_or_else(|| format!("saída inesperada: {}", trunc(out.stdout.trim(), 200)))
+        .ok_or_else(|| ProbeErr::Run(format!("saída inesperada: {}", trunc(out.stdout.trim(), 200))))
 }
 
 /// Dorme `d`, acordando antes se o lease cair ou o agente for interrompido.
 async fn pause(
     d: Duration, lease_lost: &mut watch::Receiver<bool>, shutdown: &mut watch::Receiver<bool>,
 ) -> Option<CiWait> {
-    if *lease_lost.borrow() { return Some(CiWait::LeaseLost); }
-    if *shutdown.borrow() { return Some(CiWait::Interrupted); }
-    tokio::select! {
-        _ = tokio::time::sleep(d) => None,
-        _ = lease_lost.changed() => Some(CiWait::LeaseLost),
-        _ = shutdown.changed() => Some(CiWait::Interrupted),
+    match guarded(tokio::time::sleep(d), d + Duration::from_secs(1), lease_lost, shutdown).await {
+        Err(Cut::LeaseLost) => Some(CiWait::LeaseLost),
+        Err(Cut::Interrupted) => Some(CiWait::Interrupted),
+        _ => None,
     }
 }
 
 /// Espera o veredito dos checks do PR `url` para o HEAD de `dir`.
 ///
+/// `started` é o início do gate, compartilhado entre os PRs de uma issue
+/// multi-repo: tolerância e teto contam dali, então N PRs não custam N vezes
+/// `ci_timeout_secs` com o lease preso.
+///
 /// - Verde só vale em DUAS consultas seguidas: workflows registram seus checks
 ///   em momentos diferentes, e um que termina rápido não pode liberar o gate
 ///   antes de o mais lento sequer aparecer.
+/// - Vermelho com checks ainda rodando continua esperando (até o teto): o log
+///   do job reprovado só existe quando o run termina.
 /// - Sem checks (ou PR ainda no commit antigo) além de
 ///   `ci_no_checks_grace_secs`: o repositório não tem CI para este PR.
-/// - Falha na PRIMEIRA consulta desiste na hora (comando ausente/sem
-///   credencial é o caso comum); depois, tolera 3 falhas seguidas (rede).
+/// - Comando inexistente desiste na hora; consulta que falha é repetida, e só
+///   3 falhas SEGUIDAS desistem — um 502 na primeira consulta não pode
+///   desligar o gate da execução inteira.
 pub async fn wait_checks(
-    cfg: &Config, dir: &Path, url: &str,
+    cfg: &Config, dir: &Path, url: &str, started: Instant,
     mut lease_lost: watch::Receiver<bool>, mut shutdown: watch::Receiver<bool>,
 ) -> CiWait {
     let argv = match crate::config::split_command(&cfg.checks_command) {
         Ok(a) => a,
         Err(e) => return CiWait::Unavailable(format!("{e:#}")),
     };
-    let start = Instant::now();
     let poll = Duration::from_secs(cfg.ci_poll_secs.max(1));
     let grace = Duration::from_secs(cfg.ci_no_checks_grace_secs);
     let cap = Duration::from_secs(cfg.ci_timeout_secs);
-    let (mut greens, mut errors, mut first) = (0u32, 0u32, true);
+    let (mut greens, mut errors) = (0u32, 0u32);
     info!(target: "ci", "aguardando os checks de {url}");
     loop {
-        match probe(dir, &argv, url).await {
-            Err(why) => {
+        let res = match guarded(probe(dir, &argv, url), PROBE_TIMEOUT, &mut lease_lost, &mut shutdown).await {
+            Ok(r) => r,
+            Err(Cut::LeaseLost) => return CiWait::LeaseLost,
+            Err(Cut::Interrupted) => return CiWait::Interrupted,
+            Err(Cut::Timeout) => Err(ProbeErr::Run(format!(
+                "consulta sem resposta em {}s", PROBE_TIMEOUT.as_secs()))),
+        };
+        let timed_out = started.elapsed() >= cap;
+        match res {
+            Err(ProbeErr::Spawn(why)) => return CiWait::Unavailable(why),
+            Err(ProbeErr::Run(why)) => {
                 errors += 1;
-                if first || errors >= 3 {
+                if errors >= 3 {
                     return CiWait::Unavailable(why);
                 }
                 warn!(target: "ci", "consulta aos checks falhou ({why}); nova tentativa");
@@ -197,27 +260,32 @@ pub async fn wait_checks(
             Ok(p) => {
                 errors = 0;
                 match p {
-                    Probe::Verdict(Verdict::Red(failed)) => return CiWait::Red(failed),
+                    Probe::Verdict(Verdict::Red(failed, running)) => {
+                        if !running || timed_out {
+                            return CiWait::Red(failed);
+                        }
+                        greens = 0;
+                    }
                     Probe::Verdict(Verdict::Green) => {
                         greens += 1;
                         if greens >= 2 { return CiWait::Green; }
                     }
                     Probe::Verdict(Verdict::Pending) => greens = 0,
-                    Probe::Verdict(Verdict::NoChecks) | Probe::Stale => {
+                    Probe::Verdict(Verdict::NoChecks) => {
                         greens = 0;
-                        if start.elapsed() >= grace {
-                            return match p {
-                                Probe::Stale => CiWait::Unavailable(
-                                    "o PR não aponta para o commit de cabeça local".into()),
-                                _ => CiWait::NoChecks,
-                            };
+                        if started.elapsed() >= grace { return CiWait::NoChecks; }
+                    }
+                    Probe::Stale => {
+                        greens = 0;
+                        if started.elapsed() >= grace {
+                            return CiWait::Unavailable(
+                                "o PR não aponta para o commit de cabeça local".into());
                         }
                     }
                 }
             }
         }
-        first = false;
-        if start.elapsed() >= cap {
+        if timed_out {
             return CiWait::TimedOut;
         }
         if let Some(end) = pause(poll, &mut lease_lost, &mut shutdown).await {
@@ -250,7 +318,25 @@ pub fn actions_job(link: &str) -> Option<(String, String)> {
 const MAX_SIGN_LINES: usize = 60;
 const CONTEXT: usize = 6;
 const TAIL: usize = 60;
-const MAX_LOG_CHARS: usize = 8000;
+/// Orçamento do resumo: trechos de falha e fim do log têm cada um o seu, para
+/// que um não expulse o outro.
+const MAX_SIGN_CHARS: usize = 5000;
+const MAX_TAIL_CHARS: usize = 3000;
+#[cfg(test)]
+const MAX_LOG_CHARS: usize = MAX_SIGN_CHARS + MAX_TAIL_CHARS + 64;
+/// Quantos logs entram no prompt de correção (uma matriz de 12 jobs falha
+/// 12 vezes pelo mesmo motivo).
+const MAX_LOGS_IN_PROMPT: usize = 3;
+
+/// Os últimos `max` caracteres, em fronteira de char.
+fn keep_end(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().skip(n - max).collect();
+    format!("…{cut}")
+}
 
 /// A linha ABRE um relato de falha? Só marcas de início de linha: procurar
 /// "error"/"failed" em qualquer posição casa com título de teste verde
@@ -267,7 +353,9 @@ fn is_failure_line(line: &str) -> bool {
 /// log. Tira o prefixo `job<TAB>step<TAB>` e o timestamp de cada linha.
 pub fn digest_log(raw: &str) -> String {
     let lines: Vec<&str> = raw.lines().map(|l| {
-        let msg = l.rsplit('\t').next().unwrap_or(l);
+        // Só os DOIS primeiros tabs são do prefixo; a mensagem pode ter os
+        // seus (saída de Go, Make, diff).
+        let msg = l.splitn(3, '\t').nth(2).unwrap_or(l);
         match msg.split_once(' ') {
             Some((ts, rest)) if ts.ends_with('Z') && ts.starts_with(|c: char| c.is_ascii_digit()) => rest,
             _ => msg,
@@ -288,30 +376,34 @@ pub fn digest_log(raw: &str) -> String {
             if signs.len() >= MAX_SIGN_LINES { break; }
         }
     }
-    let mut out = String::new();
-    if !signs.is_empty() {
-        out.push_str("Trechos com falha:\n");
-        for l in signs {
-            out.push_str(&trunc(l.trim_end(), 300));
-            out.push('\n');
-        }
-        out.push_str("\nFim do log:\n");
+    let join = |ls: &[&str]| ls.iter().map(|l| trunc(l.trim_end(), 300)).collect::<Vec<_>>().join("\n");
+    let tail = keep_end(&join(&lines[tail_from..]), MAX_TAIL_CHARS);
+    if signs.is_empty() {
+        return tail;
     }
-    for l in &lines[tail_from..] {
-        out.push_str(&trunc(l.trim_end(), 300));
-        out.push('\n');
-    }
-    trunc(out.trim_end(), MAX_LOG_CHARS)
+    format!("Trechos com falha:\n{}\n\nFim do log:\n{tail}", trunc(&join(&signs), MAX_SIGN_CHARS))
 }
 
 /// Log resumido de um check reprovado — só para jobs do GitHub Actions, via
 /// `gh`. Outro provedor de CI (ou falha ao baixar) fica só com o nome e o link.
-pub async fn failure_log(dir: &Path, check: &FailedCheck) -> Option<String> {
-    let (repo, job) = actions_job(check.link.as_deref()?)?;
-    let out = run(dir, "gh", &["run", "view", "--repo", &repo, "--job", &job, "--log-failed"])
-        .await.ok()?;
-    let log = digest_log(&out.stdout);
-    (out.ok && !log.is_empty()).then_some(log)
+/// `Err` = lease perdido ou interrupção durante o download.
+pub async fn failure_log(
+    dir: &Path, check: &FailedCheck,
+    mut lease_lost: watch::Receiver<bool>, mut shutdown: watch::Receiver<bool>,
+) -> Result<Option<String>, CiWait> {
+    let Some((repo, job)) = check.link.as_deref().and_then(actions_job) else {
+        return Ok(None);
+    };
+    let args = ["run", "view", "--repo", &repo, "--job", &job, "--log-failed"];
+    match guarded(run_killable(dir, "gh", &args), LOG_TIMEOUT, &mut lease_lost, &mut shutdown).await {
+        Err(Cut::LeaseLost) => Err(CiWait::LeaseLost),
+        Err(Cut::Interrupted) => Err(CiWait::Interrupted),
+        Err(Cut::Timeout) | Ok(Err(_)) => Ok(None),
+        Ok(Ok(out)) => {
+            let log = digest_log(&out.stdout);
+            Ok((out.ok && !log.is_empty()).then_some(log))
+        }
+    }
 }
 
 /// PR reprovado: URL, e cada check com o log resumido (quando há).
@@ -345,9 +437,10 @@ pub fn fix_prompt(red: &[RedPr]) -> String {
          do commit da story dona do código corrigido) e faça push.\n\
          5. Só então escreva o marker de conclusão. O agente vai esperar o CI \
          de novo; sem commit novo o CI não muda e a execução falha.\n\
-         Se a falha não tiver relação com este trabalho (infra do CI, teste \
-         instável que já falhava na base) e você não puder corrigi-la, escreva \
+         Se a falha não tiver relação com este trabalho (infra do CI, run \
+         cancelado, teste instável que já falhava na base) e você não puder corrigi-la, escreva \
          o marker com {\"status\": \"partial\", \"detalhe\": \"<por quê>\"}.\n");
+    let mut shown: Vec<&str> = Vec::new();
     for pr in red {
         p.push_str(&format!("\nPR: {}\n", pr.url));
         for (check, log) in &pr.checks {
@@ -355,8 +448,15 @@ pub fn fix_prompt(red: &[RedPr]) -> String {
             if let Some(link) = &check.link {
                 p.push_str(&format!("Link: {link}\n"));
             }
-            match log {
-                Some(log) => p.push_str(&format!("Log (resumido):\n{log}\n")),
+            match log.as_deref() {
+                Some(log) if shown.contains(&log) =>
+                    p.push_str("Log idêntico ao de um check anterior.\n"),
+                Some(_) if shown.len() >= MAX_LOGS_IN_PROMPT =>
+                    p.push_str("Log omitido (limite de logs por rodada) — veja os anteriores.\n"),
+                Some(log) => {
+                    shown.push(log);
+                    p.push_str(&format!("Log (resumido):\n{log}\n"));
+                }
                 None => p.push_str("Log indisponível — reproduza rodando a suíte localmente.\n"),
             }
         }
@@ -382,7 +482,7 @@ mod tests {
         assert_eq!(probe_of(json), Probe::Verdict(Verdict::Red(vec![FailedCheck {
             name: "ci".into(),
             link: Some("https://github.com/o/r/actions/runs/3/job/4".into()),
-        }])));
+        }], false)));
     }
 
     #[test]
@@ -393,9 +493,15 @@ mod tests {
             Probe::Verdict(Verdict::Pending));
         assert_eq!(probe_of(r#"{"headRefOid":"abc","statusCheckRollup":[
             {"name":"a","status":"COMPLETED","conclusion":"SUCCESS"},
-            {"name":"b","status":"COMPLETED","conclusion":"CANCELLED"},
+            {"name":"b","status":"COMPLETED","conclusion":"SKIPPED"},
+            {"name":"c","status":"COMPLETED","conclusion":"NEUTRAL"},
             {"context":"deploy/preview","state":"SUCCESS"}]}"#),
             Probe::Verdict(Verdict::Green));
+        // Cancelado (job que estourou o tempo) não é verde.
+        assert!(matches!(probe_of(r#"{"headRefOid":"abc","statusCheckRollup":[
+            {"name":"a","status":"COMPLETED","conclusion":"SUCCESS"},
+            {"name":"b","status":"COMPLETED","conclusion":"CANCELLED"}]}"#),
+            Probe::Verdict(Verdict::Red(f, false)) if f.len() == 1 && f[0].name == "b"));
         assert_eq!(probe_of(r#"{"headRefOid":"abc","statusCheckRollup":[]}"#),
             Probe::Verdict(Verdict::NoChecks));
         assert_eq!(probe_of(r#"{"headRefOid":"abc"}"#), Probe::Verdict(Verdict::NoChecks));
@@ -408,7 +514,7 @@ mod tests {
             {"context":"ci/externo","state":"ERROR","targetUrl":"https://ci.example/9"}]}"#);
         assert_eq!(p, Probe::Verdict(Verdict::Red(vec![FailedCheck {
             name: "ci/externo".into(), link: Some("https://ci.example/9".into()),
-        }])));
+        }], true)));
     }
 
     #[test]
@@ -418,7 +524,7 @@ mod tests {
             {"name":"ci","status":"COMPLETED","conclusion":"FAILURE"}]}"#;
         assert_eq!(probe_of(json), Probe::Stale);
         // Sem HEAD local conhecido não há como comparar.
-        assert!(matches!(parse_checks(json, ""), Some(Probe::Verdict(Verdict::Red(_)))));
+        assert!(matches!(parse_checks(json, ""), Some(Probe::Verdict(Verdict::Red(_, false)))));
     }
 
     #[test]
@@ -458,7 +564,26 @@ mod tests {
         // Título de teste VERDE com "error"/"falhou" no nome não é falha.
         let verde = "ci\tT\t2026-11-17T22:00:18.70Z ok 3 - run: CLI sai com error e failed\n".repeat(200);
         assert!(!digest_log(&verde).contains("Trechos com falha"));
-        assert!(d.chars().count() <= MAX_LOG_CHARS + 1);
+        assert!(d.chars().count() <= MAX_LOG_CHARS);
+    }
+
+    #[test]
+    fn digest_preserva_tabs_da_mensagem_e_o_fim_do_log() {
+        // Só os dois primeiros tabs são prefixo (saída de Go/Make tem os seus).
+        let d = digest_log("ci\tTest\t2026-11-17T22:00:18Z --- FAIL: TestX\tfoo_test.go:42: expected 1\tgot 2\n");
+        assert!(d.contains("--- FAIL: TestX\tfoo_test.go:42: expected 1\tgot 2"), "{d}");
+        // Muitas falhas longas não podem expulsar o fim do log.
+        let mut raw = String::new();
+        for i in 0..200 {
+            raw.push_str(&format!("j\ts\t2026-11-17T22:00:18Z not ok {i} - {}\n", "x".repeat(280)));
+        }
+        for i in 0..80 {
+            raw.push_str(&format!("j\ts\t2026-11-17T22:00:19Z linha final {i}\n"));
+        }
+        let d = digest_log(&raw);
+        assert!(d.contains("Fim do log:"), "{d}");
+        assert!(d.ends_with("linha final 79"), "o fim do log precisa sobreviver");
+        assert!(d.chars().count() <= MAX_LOG_CHARS);
     }
 
     #[test]
@@ -476,5 +601,20 @@ mod tests {
             assert!(p.contains(needle), "faltou {needle:?} em: {p}");
         }
         assert_eq!(summarize(&red), "https://github.com/o/r/pull/9: ci, lint");
+    }
+
+    #[test]
+    fn prompt_de_correcao_limita_e_nao_repete_logs() {
+        let check = |n: &str, log: &str| (FailedCheck { name: n.into(), link: None }, Some(log.to_string()));
+        let red = vec![RedPr {
+            url: "u".into(),
+            checks: vec![check("a", "log-1"), check("b", "log-1"), check("c", "log-2"),
+                         check("d", "log-3"), check("e", "log-4")],
+        }];
+        let p = fix_prompt(&red);
+        assert_eq!(p.matches("log-1").count(), 1, "log repetido entra uma vez");
+        assert!(p.contains("Log idêntico ao de um check anterior"));
+        assert!(p.contains("log-3") && !p.contains("log-4"), "no máximo {MAX_LOGS_IN_PROMPT} logs");
+        assert!(p.contains("Log omitido"));
     }
 }

@@ -130,8 +130,8 @@ implement_timeout_secs = 14400
 # Gate de CI. Depois do marker "ok" do executor, o agente abre o PR e ESPERA
 # os checks do commit de cabeça antes de declarar sucesso. Check vermelho
 # relança o executor com os checks reprovados e o log da falha no prompt.
-# Sem checks, CI lento demais ou consulta indisponível NÃO reprovam — seguem
-# como sucesso, com aviso no log. `false` = o marker basta (como era antes).
+# Check cancelado conta como reprovado. Sem checks, CI lento demais ou
+# consulta indisponível NÃO reprovam — seguem como sucesso, com aviso no log. `false` = o marker basta (como era antes).
 #ci_gate = true
 
 # Comando que consulta os checks de um PR. O agente acrescenta

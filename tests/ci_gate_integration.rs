@@ -6,7 +6,7 @@
 
 use spec_wave_agent::config::Config;
 use spec_wave_agent::queue::{QueueItem, QueueKind};
-use spec_wave_agent::runner::{ensure_workspace, run_item_gated, RunEnd};
+use spec_wave_agent::runner::{ensure_workspace, run_item_gated, Gated, RunEnd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -81,13 +81,18 @@ fn setup(tmp: &TempDir, executor_body: &str, checks_body: &str, extra_toml: &str
 }
 
 async fn run(tmp: &TempDir, cfg: &Config) -> (RunEnd, PathBuf) {
+    let (gated, hub) = run_gated(tmp, cfg, QueueKind::Feature).await;
+    (gated.end, hub)
+}
+
+async fn run_gated(tmp: &TempDir, cfg: &Config, kind: QueueKind) -> (Gated, PathBuf) {
     let (_lt, lr) = watch::channel(false);
     let (_st, sr) = watch::channel(false);
     let ws = ensure_workspace(cfg, 7).await.unwrap();
     let pr = vec![tmp.path().join("pr.sh").to_string_lossy().into_owned()];
-    let end = run_item_gated(cfg, &ws, QueueItem { kind: QueueKind::Feature, number: 7 },
-                             lr, sr, None, &pr).await.unwrap();
-    (end, ws.hub)
+    let gated = run_item_gated(cfg, &ws, QueueItem { kind, number: 7 },
+                               lr, sr, None, &pr).await.unwrap();
+    (gated, ws.hub)
 }
 
 fn prompts(hub: &Path) -> Vec<String> {
@@ -160,11 +165,84 @@ async fn sem_checks_ou_sem_como_consultar_nao_reprova() {
     assert!(matches!(end, RunEnd::Success(_)), "sem checks: {end:?}");
     assert_eq!(prompts(&hub).len(), 1);
 
-    // Comando de checks que falha (gh ausente, SCM sem suporte): gate pulado.
+    // Comando de checks que falha sempre (sem credencial, SCM sem suporte):
+    // gate pulado — mas só depois de 3 tentativas.
     let tmp = TempDir::new().unwrap();
-    let cfg = setup(&tmp, &executor("true"), "echo 'sem credencial' >&2; exit 1", "");
+    let cfg = setup(&tmp, &executor("true"),
+        r#"echo x >> "$(dirname "$0")/tentativas"; echo 'sem credencial' >&2; exit 1"#, "");
     let (end, _) = run(&tmp, &cfg).await;
     assert!(matches!(end, RunEnd::Success(_)), "checks indisponíveis: {end:?}");
+    assert_eq!(std::fs::read_to_string(tmp.path().join("tentativas")).unwrap().lines().count(), 3);
+}
+
+#[tokio::test]
+async fn falha_transitoria_na_primeira_consulta_nao_desliga_o_gate() {
+    // Um 502 logo depois de abrir o PR: a consulta seguinte vê o CI vermelho.
+    let tmp = TempDir::new().unwrap();
+    let checks = format!(r#"
+        if [ ! -f "$(dirname "$0")/ja-falhou" ]; then
+            touch "$(dirname "$0")/ja-falhou"; echo 'HTTP 502' >&2; exit 1
+        fi
+        {CHECKS_BY_COMMIT}"#);
+    let cfg = setup(&tmp, &executor(
+        r#"git rm -q ci-red.txt && git commit -qm "fix(ci): corrige" && git push -q"#), &checks, "");
+    let (end, hub) = run(&tmp, &cfg).await;
+    assert!(matches!(end, RunEnd::Success(_)), "{end:?}");
+    assert_eq!(prompts(&hub).len(), 2, "o vermelho foi visto e corrigido");
+}
+
+#[tokio::test]
+async fn vermelho_espera_os_checks_em_andamento_antes_de_agir() {
+    // Um job reprovou e outro ainda roda: o log só existe quando o run
+    // termina, então o gate não relança o executor antes disso.
+    let tmp = TempDir::new().unwrap();
+    let cfg = setup(&tmp, &executor(
+        r#"git rm -q ci-red.txt && git commit -qm "fix(ci): corrige" && git push -q"#), r#"
+        head=$(git rev-parse HEAD)
+        if [ ! -f ci-red.txt ]; then
+            printf '{"headRefOid":"%s","statusCheckRollup":[{"name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]}' "$head"; exit 0
+        fi
+        n=$(cat "$(dirname "$0")/n" 2>/dev/null || echo 0); echo $((n+1)) > "$(dirname "$0")/n"
+        lint=IN_PROGRESS; [ "$n" -ge 2 ] && lint=COMPLETED
+        printf '{"headRefOid":"%s","statusCheckRollup":[{"name":"test","status":"COMPLETED","conclusion":"FAILURE"},{"name":"lint","status":"%s","conclusion":"SUCCESS"}]}' "$head" "$lint"
+    "#, "");
+    let (end, hub) = run(&tmp, &cfg).await;
+    assert!(matches!(end, RunEnd::Success(_)), "{end:?}");
+    let n: u32 = std::fs::read_to_string(tmp.path().join("n")).unwrap().trim().parse().unwrap();
+    assert_eq!(n, 3, "esperou o lint terminar antes de relançar o executor");
+    assert!(prompts(&hub)[1].contains("Check reprovado: test"));
+}
+
+#[tokio::test]
+async fn desfecho_leva_os_prs_e_o_resultado_do_primeiro_ok() {
+    // Bug: a causa raiz vem do PRIMEIRO marker; o da rodada de correção de CI
+    // não pode apagá-la.
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = setup(&tmp, r#"
+        n=$(ls ../prompts 2>/dev/null | wc -l); mkdir -p ../prompts
+        cat > ../prompts/rodada-$n.txt
+        git config user.name t; git config user.email t@t
+        if grep -q "CORREÇÃO DE CI" ../prompts/rodada-$n.txt; then
+            git rm -q ci-red.txt && git commit -qm "fix(ci): corrige" && git push -q
+            printf '{"status": "ok"}' > .spec-wave-agent-result.json
+        else
+            echo quebrado > ci-red.txt
+            git add -A && git commit -qm "fix: bug" && git push -q
+            printf '{"status": "ok", "causa_raiz": "off-by-one em parse()"}' > .spec-wave-agent-result.json
+        fi
+    "#, CHECKS_BY_COMMIT, "");
+    cfg.bug_command = cfg.feature_command.clone();
+    let (gated, _) = run_gated(&tmp, &cfg, QueueKind::Bug).await;
+    assert_eq!(gated.prs, vec!["https://scm.example/t/t/pull/1".to_string()]);
+    let RunEnd::Success(Some(result)) = gated.end else { panic!("esperava Success com marker") };
+    assert_eq!(result.causa_raiz.as_deref(), Some("off-by-one em parse()"));
+
+    // Falha por CI vermelho também devolve o PR que ficou aberto.
+    let tmp = TempDir::new().unwrap();
+    let cfg = setup(&tmp, &executor("true"), CHECKS_BY_COMMIT, "max_ci_fix_rounds = 0");
+    let (gated, _) = run_gated(&tmp, &cfg, QueueKind::Feature).await;
+    assert!(matches!(gated.end, RunEnd::Failed(_)), "{:?}", gated.end);
+    assert_eq!(gated.prs.len(), 1);
 }
 
 #[tokio::test]
@@ -192,7 +270,10 @@ async fn checks_do_commit_antigo_nao_valem_e_pendente_espera() {
 async fn gate_desligado_aceita_o_marker_sem_consultar_nada() {
     let tmp = TempDir::new().unwrap();
     let cfg = setup(&tmp, &executor("true"), CHECKS_BY_COMMIT, "ci_gate = false");
-    let (end, hub) = run(&tmp, &cfg).await;
+    let (gated, hub) = run_gated(&tmp, &cfg, QueueKind::Feature).await;
+    // O PR continua sendo aberto — só a espera pelos checks é que some.
+    assert_eq!(gated.prs.len(), 1);
+    let end = gated.end;
     assert!(matches!(end, RunEnd::Success(_)), "{end:?}");
     assert_eq!(prompts(&hub).len(), 1);
     assert!(!tmp.path().join("checks-chamadas.txt").exists());
