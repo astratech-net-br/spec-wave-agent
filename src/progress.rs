@@ -82,6 +82,9 @@ struct Event {
 pub struct Tally {
     stories: BTreeMap<u64, bool>,
     tasks: BTreeMap<u64, bool>,
+    /// Já houve um retrato com Stories: só ele dá o TOTAL. Sem ele os eventos
+    /// conhecem apenas o que terminou, e a barra nasceria em 100%.
+    snapshot: bool,
 }
 
 fn mark(map: &mut BTreeMap<u64, bool>, n: u64, done: bool) -> bool {
@@ -105,6 +108,7 @@ impl Tally {
             .filter(|l| l.trim_start().starts_with('{'))
             .find_map(|l| serde_json::from_str::<Snapshot>(l).ok()) else { return false };
         let mut changed = false;
+        self.snapshot |= !snap.stories.is_empty();
         for s in snap.stories {
             changed |= mark(&mut self.stories, s.number, s.done);
             for t in s.tasks {
@@ -138,10 +142,11 @@ impl Tally {
         changed
     }
 
-    /// `None` enquanto não se conhece Task nenhuma: barra sem denominador não
-    /// é barra.
+    /// `None` enquanto não se conhece Task nenhuma ou não houve retrato: barra
+    /// sem denominador não é barra — só com eventos, o total seria o que já
+    /// terminou (1/1 na primeira Task concluída).
     pub fn progress(&self, round: u32) -> Option<Progress> {
-        if self.tasks.is_empty() {
+        if !self.snapshot || self.tasks.is_empty() {
             return None;
         }
         let done = |m: &BTreeMap<u64, bool>| m.values().filter(|d| **d).count() as u32;
@@ -209,7 +214,9 @@ pub struct ProgressWatch {
 impl ProgressWatch {
     /// `command`: argv do retrato, já com a issue. `round`: a rodada corrente
     /// do executor (`LiveHooks::round`) — a cada rodada nova o retrato é
-    /// relido, porque o executor recomeçou e o tracker é a verdade.
+    /// relido, porque o executor recomeçou e o tracker é a verdade. Retrato
+    /// que falhou é tentado de novo quando chega um evento (uma tentativa por
+    /// leva de eventos): sem ele não há total, logo não há barra.
     pub fn spawn(
         command: Vec<String>, ws: PathBuf, stream_dir: PathBuf,
         round: Arc<AtomicU32>, out: Arc<watch::Sender<Option<Progress>>>,
@@ -220,25 +227,30 @@ impl ProgressWatch {
             let mut tally = Tally::default();
             let mut offset = 0u64;
             let mut seen_round = 0u32;
+            let mut retry_snapshot = false;
             let mut tick = tokio::time::interval(Duration::from_millis(500));
+            // O retrato pode levar minutos: os ticks perdidos não são repostos
+            // em rajada.
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let publish = |tally: &Tally, round: u32| {
-                let now = tally.progress(round.max(1));
-                out.send_if_modified(|cur| {
-                    if *cur == now || now.is_none() {
+                let Some(p) = tally.progress(round.max(1)) else { return };
+                let modified = out.send_if_modified(|cur| {
+                    if *cur == Some(p) {
                         return false;
                     }
-                    *cur = now;
+                    *cur = Some(p);
                     true
                 });
-                if let Some(p) = now {
+                if modified {
                     debug!(target: "agent", "progresso: tasks {}/{} · stories {}/{}",
                            p.tasks_done, p.tasks_total, p.stories_done, p.stories_total);
                 }
             };
             loop {
                 let current = round.load(Ordering::SeqCst);
-                if seen_round == 0 || current > seen_round {
+                if seen_round == 0 || current > seen_round || retry_snapshot {
                     seen_round = current.max(1);
+                    retry_snapshot = false;
                     tokio::select! {
                         snap = snapshot(&command, &ws) => {
                             if let Some(s) = snap {
@@ -252,7 +264,9 @@ impl ProgressWatch {
                         _ = stop_rx.changed() => {}
                     }
                 }
-                for line in read_new_events(&file, &mut offset) {
+                let events = read_new_events(&file, &mut offset);
+                retry_snapshot = !tally.snapshot && !events.is_empty();
+                for line in events {
                     tally.apply_event(&line);
                 }
                 publish(&tally, seen_round);
@@ -334,6 +348,15 @@ mod tests {
         t.apply_event(r#"{"event":"task_done","task":42}"#);
         t.apply_snapshot(SNAP); // tirado antes: ainda diz 42 pendente
         assert_eq!(t.progress(1).unwrap().tasks_done, 3);
+    }
+
+    #[test]
+    fn so_com_eventos_nao_ha_barra_ate_o_retrato_dar_o_total() {
+        let mut t = Tally::default();
+        assert!(t.apply_event(r#"{"event":"task_done","task":42}"#));
+        assert_eq!(t.progress(1), None, "1/1 seria uma barra em 100% na primeira Task");
+        t.apply_snapshot(SNAP);
+        assert_eq!(t.progress(1).unwrap().tasks_total, 5);
     }
 
     #[test]

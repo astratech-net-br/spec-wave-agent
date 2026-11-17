@@ -116,7 +116,7 @@ pub struct Config {
     /// quantas Tasks ela tem e quais já estão concluídas — a base da barra de
     /// progresso da tela Development (progress.rs). Mesmo formato do
     /// feature_command (sem shell). Vazio desliga o progresso por Task; CLI
-    /// sem o comando (anterior à 1.9.0) só deixa a barra sem o total inicial.
+    /// sem o comando (anterior à 1.9.0) deixa o card sem a barra por Task.
     #[serde(default = "d_progress_command")]
     pub progress_command: String,
     /// Identidade do agente (default: usuario@hostname)

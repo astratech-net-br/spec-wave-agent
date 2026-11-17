@@ -226,8 +226,8 @@ echo '{"status":"ok"}' > .spec-wave-agent-result.json"#, npx, true);
 #[test]
 fn once_com_cli_sem_o_comando_de_progresso_segue_sem_barra() {
     let tmp = TempDir::new().unwrap();
-    // npx padrão ("echo 10.0.0"): não devolve retrato. Os eventos sozinhos
-    // ainda dão progresso — o total cresce com o que a CLI sinaliza.
+    // npx padrão ("echo 10.0.0"): não devolve retrato. Sem retrato não há
+    // total, logo não há barra — nem que cheguem eventos.
     let (cfg, path, workdir) = setup(&tmp, r#"set -eu
 cat > /dev/null
 echo trabalho > feito.txt && git add feito.txt && git commit -qm "story 3"
