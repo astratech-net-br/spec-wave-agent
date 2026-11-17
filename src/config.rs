@@ -112,6 +112,13 @@ pub struct Config {
     /// 1.7.0) ou falhar, o agente cai no `gh pr create` de antes.
     #[serde(default = "d_pr_command")]
     pub pr_command: String,
+    /// Comando do retrato de progresso da Feature (`{issue}` vira o número):
+    /// quantas Tasks ela tem e quais já estão concluídas — a base da barra de
+    /// progresso da tela Development (progress.rs). Mesmo formato do
+    /// feature_command (sem shell). Vazio desliga o progresso por Task; CLI
+    /// sem o comando (anterior à 1.9.0) só deixa a barra sem o total inicial.
+    #[serde(default = "d_progress_command")]
+    pub progress_command: String,
     /// Identidade do agente (default: usuario@hostname)
     pub agent_id: Option<String>,
     /// Override da URL do remoto (testes / git self-hosted). Default: GitHub.
@@ -130,6 +137,7 @@ fn d_lease_prefix() -> String { crate::lease::DEFAULT_LEASE_PREFIX.into() }
 
 fn d_queue_label() -> String { "spec-wave:dev-agent".into() }
 fn d_pr_command() -> String { "npx spec-wave pr open".into() }
+fn d_progress_command() -> String { "npx spec-wave progress {issue} --json".into() }
 fn d_poll() -> u64 { 60 }
 fn d_poll_backoff_max() -> u64 { 480 } // 8x o d_poll() default — ver next_poll_delay em queue.rs
 fn d_heartbeat() -> u64 { 120 }
@@ -602,6 +610,7 @@ mod tests {
     fn defaults_com_apenas_repo() {
         let cfg = parse(r#"repo = "org/repo""#);
         assert_eq!(cfg.pr_command, "npx spec-wave pr open");
+        assert_eq!(cfg.progress_command, "npx spec-wave progress {issue} --json");
         assert_eq!(cfg.queue_label, "spec-wave:dev-agent");
         assert_eq!(cfg.poll_interval_secs, 60);
         assert_eq!(cfg.heartbeat_secs, 120);

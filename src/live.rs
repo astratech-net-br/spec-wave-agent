@@ -240,7 +240,7 @@ impl LiveStream {
 
     /// Ganchos para o runner. `try_send`: cheio = descarta, nunca espera.
     pub fn hooks(&self) -> LiveHooks {
-        LiveHooks { tap: self.tx.clone(), stream_dir: self.stream_dir.clone() }
+        LiveHooks { tap: self.tx.clone(), stream_dir: self.stream_dir.clone(), round: Default::default() }
     }
 
     /// Lê o fim das stories, fecha o canal e dá um instante para o resto sair;

@@ -502,6 +502,9 @@ pub type LineTap = tokio::sync::mpsc::Sender<LiveLine>;
 pub struct LiveHooks {
     pub tap: LineTap,
     pub stream_dir: PathBuf,
+    /// Rodada corrente do executor (1, 2, …) — quem acompanha o progresso
+    /// (progress.rs) lê daqui.
+    pub round: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 async fn stream_lines<R>(reader: R, issue: u64, stream: &'static str, tap: Option<LineTap>)
@@ -809,6 +812,9 @@ pub async fn run_item_with_tap(
     let mut no_progress = 0u32;
     for round in 1..=cfg.max_executor_rounds {
         let head_before = head_sha(ws).await;
+        if let Some(h) = &live {
+            h.round.store(round, std::sync::atomic::Ordering::SeqCst);
+        }
         let end = executor_round(cfg, ws, item,
                                  lease_lost.clone(), shutdown.clone(), live.clone()).await?;
         match end {
