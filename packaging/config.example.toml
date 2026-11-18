@@ -57,7 +57,10 @@ implement_timeout_secs = 14400
 
 # Comando do executor da feature. Argv separado por espaço (aspas simples/
 # duplas agrupam; SEM shell — sem pipes/expansões). Placeholder: {issue}
-#feature_command = "claude -p --output-format stream-json --verbose --permission-mode acceptEdits --allowedTools \"Bash(npx:*),Bash(git:*),Edit,Write,Read,Glob,Grep,Task\""
+# O default libera `Bash` inteiro: o executor precisa rodar a suíte de testes do
+# repositório (npm, cargo, make…), e em `claude -p` comando fora da lista é
+# negado. Para restringir, troque por prefixos — ex.: "Bash(npm:*),Bash(git:*)".
+#feature_command = "claude -p --output-format stream-json --verbose --permission-mode acceptEdits --allowedTools \"Bash,Edit,Write,Read,Glob,Grep,Task\""
 #
 # Para fixar o modelo (ex.: cota do default esgotada), acrescente --model:
 #   claude -p --model opus --output-format stream-json ...
@@ -95,7 +98,7 @@ implement_timeout_secs = 14400
 # Comando do executor de bug. Mesmo formato do feature_command; separado para
 # permitir modelo ou ferramentas diferentes numa correção (ex.: um modelo mais
 # forte, já que investigar causa raiz é mais difícil que seguir um plano).
-#bug_command = "claude -p --output-format stream-json --verbose --permission-mode acceptEdits --allowedTools \"Bash(npx:*),Bash(git:*),Edit,Write,Read,Glob,Grep,Task\""
+#bug_command = "claude -p --output-format stream-json --verbose --permission-mode acceptEdits --allowedTools \"Bash,Edit,Write,Read,Glob,Grep,Task\""
 
 # Prompt de correção enviado via stdin. Placeholder: {issue}. O default impõe
 # QUATRO FASES, nesta ordem — e diz explicitamente para NÃO começar pelo fix:
