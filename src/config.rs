@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// De onde o agente recebe trabalho.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -119,6 +119,11 @@ pub struct Config {
     /// sem o comando (anterior à 1.9.0) deixa o card sem a barra por Task.
     #[serde(default = "d_progress_command")]
     pub progress_command: String,
+    /// Como chamar a CLI do spec-wave — o que entra no lugar de `{cli}` nos
+    /// prompts e comandos (feature/bug, pr_command, progress_command) e vai
+    /// para o executor em SPEC_WAVE_CLI. Ausente: o `spec-wave` do PATH pelo
+    /// caminho absoluto e, sem ele, `npx spec-wave` (ver `detect_cli`).
+    pub cli_command: Option<String>,
     /// Identidade do agente (default: usuario@hostname)
     pub agent_id: Option<String>,
     /// Override da URL do remoto (testes / git self-hosted). Default: GitHub.
@@ -169,8 +174,8 @@ pub struct Config {
 fn d_lease_prefix() -> String { crate::lease::DEFAULT_LEASE_PREFIX.into() }
 
 fn d_queue_label() -> String { "spec-wave:dev-agent".into() }
-fn d_pr_command() -> String { "npx spec-wave pr open".into() }
-fn d_progress_command() -> String { "npx spec-wave progress {issue} --json".into() }
+fn d_pr_command() -> String { "{cli} pr open".into() }
+fn d_progress_command() -> String { "{cli} progress {issue} --json".into() }
 fn d_poll() -> u64 { 60 }
 fn d_poll_backoff_max() -> u64 { 480 } // 8x o d_poll() default — ver next_poll_delay em queue.rs
 fn d_heartbeat() -> u64 { 120 }
@@ -181,7 +186,7 @@ fn d_executor_command() -> String {
     // JSON no stdout, que o runner formata para o console (ver runner.rs).
     "claude -p --output-format stream-json --verbose \
      --permission-mode acceptEdits \
-     --allowedTools \"Bash(npx:*),Bash(git:*),Edit,Write,Read,Glob,Grep,Task\""
+     --allowedTools \"Bash(npx:*),Bash({cli}:*),Bash(git:*),Edit,Write,Read,Glob,Grep,Task\""
         .into()
 }
 fn d_feature_command() -> String { d_executor_command() }
@@ -200,9 +205,9 @@ fn d_max_ci_fix_rounds() -> u32 { 3 }
 fn d_feature_prompt() -> String {
     "Você está no clone do repositório, no branch de trabalho da Feature #{issue}.\n\
      Implemente a feature completa usando o spec-wave:\n\
-     1. Rode `npx spec-wave order {issue}` para obter as user stories e a \
+     1. Rode `{cli} order {issue}` para obter as user stories e a \
      ordem de dependência.\n\
-     2. Implemente cada story rodando `npx spec-wave implement <número>`, \
+     2. Implemente cada story rodando `{cli} implement <número>`, \
      respeitando a ordem: uma story só pode começar depois que TODAS as suas \
      dependências estiverem concluídas.\n\
      3. Stories independentes entre si podem ser implementadas em paralelo \
@@ -212,7 +217,7 @@ fn d_feature_prompt() -> String {
      story) e só commite com ela verde. Teste que falha é trabalho \
      pendente: corrija antes do commit. Commite neste branch (assunto \
      livre; inclua no RODAPÉ os `git trailer` que o contexto de \
-     `npx spec-wave implement <número>` pedir — \
+     `{cli} implement <número>` pedir — \
      Spec-Wave-Story/Spec-Wave-Tasks/Spec-Wave-Agent, copiados literalmente) \
      e faça push.\n\
      5. Se uma story falhar, pule as que dependem dela e continue as \
@@ -222,7 +227,7 @@ fn d_feature_prompt() -> String {
      - Você roda em RODADAS: se o seu turno terminar sem o marker de \
      conclusão (abaixo), você será REINVOCADO para continuar. Ao iniciar, \
      verifique o que já foi feito (`git log --oneline -20` e \
-     `npx spec-wave order {issue}`) e continue de onde parou — não refaça \
+     `{cli} order {issue}`) e continue de onde parou — não refaça \
      stories já commitadas.\n\
      - Commit NÃO prova que os testes passam. Antes de escrever o marker — \
      inclusive numa rodada em que todas as stories já estavam commitadas — \
@@ -237,7 +242,7 @@ fn d_feature_prompt() -> String {
      usar background, aguarde a conclusão AINDA NESTE turno antes de \
      encerrar.\n\
      - Commite e pushe cada story assim que concluída, com o rodapé de \
-     trailers que `npx spec-wave implement <número>` pedir no contexto — \
+     trailers que `{cli} implement <número>` pedir no contexto — \
      não invente formato de assunto, é o rodapé que é conferido.\n\
      - Se o contexto de `spec-wave order`/`implement` trouxer a seção \
      \"Workspace multi-repo\" (a Feature toca mais de um repositório de \
@@ -270,7 +275,7 @@ fn d_bug_prompt() -> String {
      onde o sintoma aparece, remendar ali, e o defeito voltar na próxima \
      entrada. As fases 1 e 2 existem para impedir isso.\n\
      \n\
-     1. REPRODUZIR — rode `npx spec-wave implement {issue}` para obter o \
+     1. REPRODUZIR — rode `{cli} implement {issue}` para obter o \
      contexto (relato, comentários e o bug.md, se existir). Escreva um teste \
      que FALHA por causa deste defeito e confirme que ele falha pelo motivo \
      certo. Se não conseguir reproduzir, PARE e relate no marker: sem \
@@ -401,6 +406,47 @@ pub fn apply_mcp_env(argv: Vec<String>) -> Vec<String> {
 pub fn render_template(t: &str, issue: u64) -> String {
     t.replace("{issue}", &issue.to_string())
 }
+
+/// Como chamar a CLI do spec-wave quando a config não diz (`cli_command`).
+///
+/// `npx spec-wave` resolve PRIMEIRO o `node_modules/.bin` do diretório
+/// corrente — e o diretório corrente é o clone do produto. Num produto que
+/// tem a CLI como dependência (o spec-wave-ui fixa a 1.0.6 no lockfile),
+/// bastava o executor rodar `npm install` para todo `npx spec-wave` seguinte
+/// virar essa cópia antiga: sem stream por story, sem progresso por Task, sem
+/// os comandos novos. A CLI que conduz o fluxo é a da MÁQUINA (a da imagem do
+/// Fleet Job, a instalada pelo dev), nunca a que o produto usa como
+/// biblioteca. Por isso: o `spec-wave` do PATH, pelo caminho absoluto; só sem
+/// ele, o `npx spec-wave` de sempre.
+pub fn detect_cli(path_var: Option<&std::ffi::OsStr>) -> String {
+    let found = path_var.into_iter().flat_map(std::env::split_paths)
+        // Um PATH com o .bin de um projeto (npm run) cairia no mesmo problema.
+        .filter(|dir| dir.is_absolute() && !dir.components().any(|c| c.as_os_str() == "node_modules"))
+        .map(|dir| dir.join("spec-wave"))
+        .find(|bin| is_executable(bin));
+    match found.and_then(|p| p.to_str().map(str::to_string)) {
+        // Caminho com espaço ou aspas não sobrevive ao split_command do
+        // comando nem ao prompt: melhor o npx do que um argv quebrado.
+        Some(p) if !p.contains(|c: char| c.is_whitespace() || c == '"' || c == '\'') => p,
+        _ => "npx spec-wave".into(),
+    }
+}
+
+fn is_executable(p: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(p) else { return false };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
 fn d_workdir() -> String {
     dirs_home().join(".spec-wave-agent").to_string_lossy().into_owned()
 }
@@ -447,9 +493,21 @@ impl Config {
         toml::from_str("").expect("os defaults da Config são válidos")
     }
 
+    /// Como chamar a CLI do spec-wave (ver `cli_command` e `detect_cli`).
+    pub fn cli(&self) -> String {
+        self.cli_command.as_deref().map(str::trim).filter(|c| !c.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| detect_cli(std::env::var_os("PATH").as_deref()))
+    }
+
+    /// `render_template` com o `{cli}` resolvido.
+    pub fn render(&self, t: &str, issue: u64) -> String {
+        render_template(&t.replace("{cli}", &self.cli()), issue)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if split_command(&self.pr_command)?.is_empty() {
-            bail!("pr_command vazio (default: \"npx spec-wave pr open\")");
+            bail!("pr_command vazio (default: \"{{cli}} pr open\")");
         }
         if !crate::lease::valid_lease_prefix(&self.lease_ref_prefix) {
             bail!("lease_ref_prefix inválido: {:?} (esperado refs/…, ex.: refs/spec-wave/claims)",
@@ -672,8 +730,8 @@ mod tests {
     #[test]
     fn defaults_com_apenas_repo() {
         let cfg = parse(r#"repo = "org/repo""#);
-        assert_eq!(cfg.pr_command, "npx spec-wave pr open");
-        assert_eq!(cfg.progress_command, "npx spec-wave progress {issue} --json");
+        assert_eq!(cfg.pr_command, "{cli} pr open");
+        assert_eq!(cfg.progress_command, "{cli} progress {issue} --json");
         assert_eq!(cfg.queue_label, "spec-wave:dev-agent");
         assert_eq!(cfg.poll_interval_secs, 60);
         assert_eq!(cfg.heartbeat_secs, 120);
@@ -726,6 +784,43 @@ mod tests {
         assert!(cfg.validate().is_err());
         let cfg = parse("repo = \"a/b\"\nheartbeat_secs = 120\nlease_ttl_secs = 480");
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn cli_e_o_spec_wave_do_path_fora_de_node_modules() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = |dir: &str, mode: u32| {
+            let d = tmp.path().join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            let f = d.join("spec-wave");
+            std::fs::write(&f, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(mode)).unwrap();
+            d
+        };
+        let produto = exe("clone/node_modules/.bin", 0o755); // a cópia do produto
+        let sem_x = exe("sem-x", 0o644);
+        let global = exe("global/bin", 0o755);
+        let path = std::env::join_paths([&produto, &sem_x, &global]).unwrap();
+        assert_eq!(detect_cli(Some(&path)), global.join("spec-wave").to_str().unwrap());
+        // Só a do produto no PATH, ou PATH nenhum: o npx de sempre.
+        let so_produto = std::env::join_paths([&produto]).unwrap();
+        assert_eq!(detect_cli(Some(&so_produto)), "npx spec-wave");
+        assert_eq!(detect_cli(None), "npx spec-wave");
+    }
+
+    #[test]
+    fn cli_command_vence_a_deteccao_e_entra_no_lugar_de_cli() {
+        let cfg = parse(r#"repo = "org/repo"
+            cli_command = "npx @spec-wave/cli@1.9.0""#);
+        assert_eq!(cfg.cli(), "npx @spec-wave/cli@1.9.0");
+        assert_eq!(cfg.render(&cfg.progress_command, 7), "npx @spec-wave/cli@1.9.0 progress 7 --json");
+        assert!(cfg.render(&cfg.feature_prompt, 7).contains("`npx @spec-wave/cli@1.9.0 order 7`"));
+        assert!(!cfg.render(&cfg.feature_prompt, 7).contains("{cli}"));
+        assert!(!cfg.render(&cfg.bug_prompt, 7).contains("{cli}"));
+        // O executor default libera o Bash da CLI escolhida.
+        let argv = split_command(&cfg.render(&cfg.feature_command, 7)).unwrap();
+        assert!(argv.iter().any(|a| a.contains("Bash(npx @spec-wave/cli@1.9.0:*)")), "{argv:?}");
     }
 
     #[test]

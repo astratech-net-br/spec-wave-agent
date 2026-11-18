@@ -39,6 +39,7 @@ fn setup(tmp: &TempDir, stub_body: &str, timeout_secs: u64) -> Config {
     let toml_str = format!(r#"
         repo = "test/test"
         remote_url = "{origin}"
+        cli_command = "npx spec-wave"
         workdir = "{workdir}"
         implement_timeout_secs = {timeout_secs}
         feature_command = "{stub} {{issue}}"
