@@ -195,21 +195,25 @@ fn d_impl_timeout() -> u64 { 14400 }
 fn d_executor_command() -> String {
     // stream-json: cada evento (texto, tool calls, resultado) vira uma linha
     // JSON no stdout, que o runner formata para o console (ver runner.rs).
+    //
+    // `Bash` inteiro, sem lista de prefixos: o prompt manda rodar a suíte do
+    // repositório ("o comando que o repositório documenta" — npm, cargo, go,
+    // make…), e em `-p` um comando fora da lista é NEGADO, não perguntado. A
+    // lista antiga (npx/CLI/git) deixava o executor sem como validar o
+    // próprio trabalho e não protegia nada: `npx` já roda qualquer coisa, e o
+    // agente interno do `spec-wave implement` sempre teve Bash liberado.
     "claude -p --output-format stream-json --verbose \
      --permission-mode acceptEdits \
-     --allowedTools \"Bash(npx:*),Bash({cli}:*),Bash(git:*),Edit,Write,Read,Glob,Grep,Task\""
+     --allowedTools \"Bash,Edit,Write,Read,Glob,Grep,Task\""
         .into()
 }
 fn d_feature_command() -> String { d_executor_command() }
 fn d_bug_command() -> String { d_executor_command() }
 fn d_bug_timeout() -> u64 { 3600 }
 fn d_review_timeout() -> u64 { 3600 }
-fn d_review_command() -> String {
-    "claude -p --output-format stream-json --verbose \
-     --permission-mode acceptEdits \
-     --allowedTools \"Bash(npx:*),Bash({cli}:*),Bash(git:*),Bash(gh:*),Edit,Write,Read,Glob,Grep,Task\""
-        .into()
-}
+// Mesmo comando do executor: com `Bash` inteiro, o `gh` de que a revisão
+// precisa (ler o PR, publicar o review) já está liberado.
+fn d_review_command() -> String { d_executor_command() }
 fn d_review_prompt() -> String {
     "Você está no clone do repositório hub da Feature #{issue}. Os repositórios \
      de código que ela toca, quando existem, estão em `.spec-wave/repos/<slug>/`.\n\
@@ -898,9 +902,6 @@ mod tests {
         assert!(cfg.render(&cfg.feature_prompt, 7).contains("`npx @spec-wave/cli@1.9.0 order 7`"));
         assert!(!cfg.render(&cfg.feature_prompt, 7).contains("{cli}"));
         assert!(!cfg.render(&cfg.bug_prompt, 7).contains("{cli}"));
-        // O executor default libera o Bash da CLI escolhida.
-        let argv = split_command(&cfg.render(&cfg.feature_command, 7)).unwrap();
-        assert!(argv.iter().any(|a| a.contains("Bash(npx @spec-wave/cli@1.9.0:*)")), "{argv:?}");
     }
 
     #[test]
@@ -911,7 +912,16 @@ mod tests {
         assert_eq!(argv[0], "claude");
         assert!(argv.contains(&"acceptEdits".to_string()));
         // allowedTools com vírgulas fica em UM token (estava entre aspas)
-        assert!(argv.iter().any(|a| a.starts_with("Bash(npx:*),")));
+        assert!(argv.iter().any(|a| a.starts_with("Bash,")));
+        // Bash inteiro: o executor precisa rodar a suíte do repositório, seja
+        // qual for a stack. Lista de prefixos volta a negar `npm test`.
+        for cmd in [&cfg.feature_command, &cfg.bug_command, &cfg.review_command] {
+            let argv = split_command(cmd).unwrap();
+            let at = argv.iter().position(|a| a == "--allowedTools").unwrap();
+            let tools = &argv[at + 1];
+            assert!(tools.split(',').any(|t| t == "Bash"), "{tools}");
+            assert!(!tools.contains("Bash("), "{tools}");
+        }
         assert!(cfg.feature_prompt.contains("{issue}"));
         assert!(cfg.validate().is_ok());
     }
@@ -998,15 +1008,13 @@ mod tests {
         assert!(cfg.review_prompt.contains("{issue}"));
         assert!(cfg.review_prompt.contains("NUNCA aprove"));
         assert!(cfg.review_prompt.contains("<!-- spec-wave:auto-review -->"));
-        // A revisão usa o gh (ler o PR, publicar o review); o executor de
-        // implementação continua sem ele.
-        assert!(cfg.review_command.contains("Bash(gh:*)"));
-        assert!(!cfg.feature_command.contains("Bash(gh:*)"));
+        // A revisão usa o gh (ler o PR, publicar o review): coberto pelo
+        // `Bash` inteiro do executor default.
+        assert_eq!(cfg.review_command, cfg.feature_command);
         assert_eq!(cfg.review_timeout_secs, 3600);
         // A CLI que conduz o fluxo é a da máquina (`{cli}`), como nos outros prompts.
         assert!(cfg.review_prompt.contains("{cli} order {issue}"));
         assert!(!cfg.render(&cfg.review_prompt, 7).contains("{cli}"));
-        assert!(cfg.review_command.contains("Bash({cli}:*)"));
     }
 
     #[test]
