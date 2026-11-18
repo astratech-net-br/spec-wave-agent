@@ -114,13 +114,20 @@ implement_timeout_secs = 14400
 # Identidade do agente nos leases e comentários (default: usuario@hostname)
 # Comando que abre o PR pela porta de SCM da CLI (@spec-wave/cli >= 1.7.0). Sem o
 # comando na CLI, o agente cai no gh pr create.
-#pr_command = "npx spec-wave pr open"
+#pr_command = "{cli} pr open"
+
+# Como chamar a CLI do spec-wave: o que entra no lugar de {cli} nos prompts e
+# comandos e vai para o executor em SPEC_WAVE_CLI. Default: o `spec-wave` do
+# PATH, pelo caminho absoluto; sem ele, "npx spec-wave". O npx cru resolve
+# primeiro o node_modules do clone — num produto que tem a CLI como dependência,
+# uma versão antiga passaria a conduzir o fluxo depois de um `npm install`.
+#cli_command = "npx spec-wave"
 
 # Comando do retrato de progresso da Feature (@spec-wave/cli >= 1.9.0): quantas
 # Tasks ela tem e quais já estão concluídas. Com ele e com os sinais que a CLI
 # grava a cada Task concluída, o card da tela Development mostra uma barra de
 # progresso. "" desliga.
-#progress_command = "npx spec-wave progress {issue} --json"
+#progress_command = "{cli} progress {issue} --json"
 
 # Abre o PR do trabalho concluído como rascunho (--draft):
 # o CI de um repo que pula draft no required check só roda quando alguém

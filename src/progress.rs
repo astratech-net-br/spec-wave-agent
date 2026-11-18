@@ -250,7 +250,6 @@ impl ProgressWatch {
                 let current = round.load(Ordering::SeqCst);
                 if seen_round == 0 || current > seen_round || retry_snapshot {
                     seen_round = current.max(1);
-                    retry_snapshot = false;
                     tokio::select! {
                         snap = snapshot(&command, &ws) => {
                             if let Some(s) = snap {
