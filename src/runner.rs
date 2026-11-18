@@ -193,6 +193,22 @@ pub fn work_branch(issue: u64) -> String {
     format!("agent/issue-{issue}")
 }
 
+/// Corpo do PR de trabalho.
+///
+/// A primeira linha é o VÍNCULO que a CLI lê (`spec-wave code-review` / `qa`,
+/// lib/pr-link.mjs): verbo `Implements` + `owner/repo#N`. O verbo em português
+/// ("Implementa a issue …") não casa com a régua de lá, e o merge do PR deixava
+/// a Feature parada no board ("PR sem vínculo explícito"). `Implements` não é
+/// palavra-chave de fechamento do GitHub — o merge segue sem encerrar a issue.
+fn pr_body(hub_repo: &str, issue: u64) -> String {
+    format!(
+        "Implements {hub_repo}#{issue}.\n\n\
+         Branch de trabalho do `spec-wave-agent`, com um commit por Story.\n\n\
+         O merge **não** encerra a issue: ela segue por QA, Homologação e Deploy \
+         no board."
+    )
+}
+
 /// Abre o Pull Request do trabalho concluído, se ainda não houver um.
 ///
 /// UM PR por issue, não por story: o agente trabalha num branch único
@@ -220,12 +236,7 @@ pub async fn open_pull_request(
     ws: &Path, pr_command: &[String], pr_repo: &str, hub_repo: &str, issue: u64, draft: bool,
 ) -> Option<String> {
     let branch = work_branch(issue);
-    let body = format!(
-        "Implementa a issue {hub_repo}#{issue}.\n\n\
-         Branch de trabalho do `spec-wave-agent`, com um commit por Story.\n\n\
-         O merge **não** encerra a issue: ela segue por QA, Homologação e Deploy \
-         no board."
-    );
+    let body = pr_body(hub_repo, issue);
     match open_pull_request_via_cli(ws, pr_command, pr_repo, hub_repo, issue, &branch, &body, draft).await {
         CliPr::Opened(url) => {
             info!(target: "agent", "PR em {pr_repo}: {url}");
@@ -1089,6 +1100,20 @@ mod tests {
         let antigo: ExecResult = serde_json::from_str(r#"{"status":"ok"}"#).unwrap();
         assert!(super::review_prs(&Some(antigo)).is_empty());
         assert!(super::review_prs(&None).is_empty());
+    }
+
+    /// A régua é a EXPLICIT_LINK_RE da CLI (lib/pr-link.mjs): verbo
+    /// `implement(s|ed)` + espaço + `owner/repo#N`. Em português
+    /// ("Implementa a issue") não casa e o board não anda no merge.
+    #[test]
+    fn corpo_do_pr_abre_com_vinculo_que_a_cli_reconhece() {
+        let body = super::pr_body("acme/hub", 386);
+        assert!(body.starts_with("Implements acme/hub#386."), "{body}");
+        // Nada de palavra-chave de fechamento: o merge não encerra a issue.
+        let lower = body.to_lowercase();
+        for kw in ["closes", "fixes", "resolves"] {
+            assert!(!lower.contains(kw), "{kw} fecharia a issue no merge");
+        }
     }
 
     use super::{parse_cli_pr, CliPr};
