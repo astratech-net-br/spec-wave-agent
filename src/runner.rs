@@ -424,6 +424,9 @@ pub struct ExecResult {
     pub teste_regressao: Option<String>,
     #[serde(default)]
     pub arquivos: Option<Vec<String>>,
+    /// Revisão de PR: URL de cada PR revisado. Vazio = nenhum PR elegível.
+    #[serde(default)]
+    pub prs: Option<Vec<String>>,
 }
 
 /// Lê e REMOVE o marker (não pode sobrar para o checkpoint commitar).
@@ -700,6 +703,8 @@ async fn executor_round(
         QueueKind::Bug => (&cfg.bug_command, &cfg.bug_prompt, cfg.bug_timeout_secs),
         QueueKind::Feature =>
             (&cfg.feature_command, &cfg.feature_prompt, cfg.implement_timeout_secs),
+        QueueKind::Review =>
+            (&cfg.review_command, &cfg.review_prompt, cfg.review_timeout_secs),
     };
     // Frota: MCP configurável (SPECWAVE_MCP_CONFIG / SPECWAVE_MCP_ALLOWED_TOOLS).
     // Sem as envs o argv fica idêntico; nada do conteúdo é logado.
@@ -863,7 +868,11 @@ async fn run_rounds(
             RoundEnd::LeaseLost => return Ok(RunEnd::LeaseLost),
             RoundEnd::Interrupted => return Ok(RunEnd::Interrupted),
             RoundEnd::Incomplete => {
-                let progressed = head_sha(ws).await != head_before;
+                // Numa revisão o HEAD do hub não mede progresso: o trabalho é
+                // comentar no PR e commitar na branch dele, muitas vezes num
+                // clone de `.spec-wave/repos/`. O teto de rodadas ainda vale.
+                let progressed = item.kind == QueueKind::Review
+                    || head_sha(ws).await != head_before;
                 if progressed {
                     no_progress = 0;
                 } else {
@@ -902,6 +911,57 @@ async fn all_heads(workspace: &Workspace) -> Vec<String> {
 pub struct Gated {
     pub end: RunEnd,
     pub prs: Vec<String>,
+}
+
+/// Revisão dos PRs de uma Feature (`QueueKind::Review`): as mesmas rodadas do
+/// executor, com o prompt de revisão — e NADA do desfecho de implementação.
+///
+/// Não abre PR (a revisão trabalha nos que já existem) e não passa pelo gate
+/// de CI (uma rodada só: o que o CI disser das correções é assunto do humano
+/// que vai aprovar). No sucesso faz o checkpoint — cinto de segurança para uma
+/// correção que o executor commitou e não pushou (`push_all`, sem commit de
+/// sobras) — e devolve os PRs que o
+/// executor declarou ter revisado no marker. Lista vazia = não havia PR
+/// elegível; quem chama decide o desfecho.
+pub async fn run_item_review(
+    cfg: &Config, workspace: &Workspace, item: QueueItem,
+    lease_lost: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
+    live: Option<LiveHooks>,
+) -> Result<Gated> {
+    let end = run_item_with_tap(cfg, &workspace.hub, item, lease_lost, shutdown, live).await?;
+    let mut prs = Vec::new();
+    if let RunEnd::Success(result) = &end {
+        prs = review_prs(result);
+        push_all(workspace).await;
+    }
+    Ok(Gated { end, prs })
+}
+
+/// Pusha o que já está COMMITADO em cada clone — sem `add`/`commit`.
+///
+/// A revisão trabalha na branch de um Pull Request que um humano vai aprovar:
+/// o cinto de segurança dela é só garantir o push dos commits de correção que
+/// o executor fez (um por achado, testados). Um checkpoint "wip" com o que
+/// sobrou sem commit empurraria edição pela metade para dentro do PR.
+pub async fn push_all(workspace: &Workspace) {
+    let _ = run(&workspace.hub, "git", &["push", "--quiet"]).await;
+    for cr in &workspace.code_repos {
+        let _ = run(&cr.dir, "git", &["push", "--quiet"]).await;
+    }
+}
+
+/// PRs que o executor de revisão declarou no marker — só URLs http(s), sem
+/// repetição (o texto vem de um modelo).
+pub fn review_prs(result: &Option<ExecResult>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for url in result.as_ref().and_then(|r| r.prs.clone()).unwrap_or_default() {
+        let url = url.trim().to_string();
+        if (url.starts_with("https://") || url.starts_with("http://")) && !out.contains(&url) {
+            out.push(url);
+        }
+    }
+    out
 }
 
 /// `run_item_with_tap` + desfecho de sucesso (checkpoint e PR) + GATE DE CI:
@@ -1018,6 +1078,19 @@ pub async fn run_item_gated(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn review_prs_so_urls_sem_repeticao() {
+        let r: ExecResult = serde_json::from_str(
+            r#"{"status":"ok","prs":[" https://github.com/a/b/pull/1 ","nenhum","https://github.com/a/b/pull/1","http://ghe.local/a/b/pull/2"]}"#,
+        ).unwrap();
+        assert_eq!(super::review_prs(&Some(r)),
+                   vec!["https://github.com/a/b/pull/1".to_string(), "http://ghe.local/a/b/pull/2".to_string()]);
+        // Marker antigo (sem o campo) e ausência de marker: lista vazia.
+        let antigo: ExecResult = serde_json::from_str(r#"{"status":"ok"}"#).unwrap();
+        assert!(super::review_prs(&Some(antigo)).is_empty());
+        assert!(super::review_prs(&None).is_empty());
+    }
+
     use super::{parse_cli_pr, CliPr};
 
     #[test]

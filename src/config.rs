@@ -75,6 +75,17 @@ pub struct Config {
     /// para o agente devolver a issue à fila em vez de queimar o dia nela.
     #[serde(default = "d_bug_timeout")]
     pub bug_timeout_secs: u64,
+    /// Comando do executor de REVISÃO de PR (modo frota, `SPECWAVE_KIND=review`).
+    /// Mesmo formato do feature_command; o default libera também o `gh`, que a
+    /// revisão usa para ler o PR e publicar o review.
+    #[serde(default = "d_review_command")]
+    pub review_command: String,
+    /// Prompt de revisão enviado ao executor via stdin. Placeholder: {issue}
+    #[serde(default = "d_review_prompt")]
+    pub review_prompt: String,
+    /// Tempo máximo de UMA revisão de PR (uma rodada de review + correções).
+    #[serde(default = "d_review_timeout")]
+    pub review_timeout_secs: u64,
     /// Depois de processar uma issue (qualquer desfecho), ela fica fora da
     /// fila deste agente por este tempo — evita re-claim imediato por atraso
     /// do índice de busca do GitHub e loop de retry em falha.
@@ -192,6 +203,67 @@ fn d_executor_command() -> String {
 fn d_feature_command() -> String { d_executor_command() }
 fn d_bug_command() -> String { d_executor_command() }
 fn d_bug_timeout() -> u64 { 3600 }
+fn d_review_timeout() -> u64 { 3600 }
+fn d_review_command() -> String {
+    "claude -p --output-format stream-json --verbose \
+     --permission-mode acceptEdits \
+     --allowedTools \"Bash(npx:*),Bash({cli}:*),Bash(git:*),Bash(gh:*),Edit,Write,Read,Glob,Grep,Task\""
+        .into()
+}
+fn d_review_prompt() -> String {
+    "Você está no clone do repositório hub da Feature #{issue}. Os repositórios \
+     de código que ela toca, quando existem, estão em `.spec-wave/repos/<slug>/`.\n\
+     Sua tarefa é REVISAR os Pull Requests abertos desta Feature e CORRIGIR o \
+     que a revisão encontrar — UMA rodada, sem aprovar e sem mergear.\n\
+     \n\
+     1. ACHAR OS PRs — em cada repositório (o hub e cada um em \
+     `.spec-wave/repos/`), liste os PRs abertos com \
+     `gh pr list --state open --json number,url,headRefName,isDraft,body,isCrossRepository`. \
+     É elegível o PR cuja branch é `agent/issue-{issue}` ou cujo corpo fecha a \
+     Feature #{issue} ou uma Story dela (`Closes <hub>#N` — confira as Stories \
+     com `{cli} order {issue}`). NÃO são elegíveis: rascunho (draft), \
+     branch `spec-wave/...` (PR de documento) e PR de fork. Se não houver \
+     nenhum PR elegível, escreva o marker com `\"prs\": []` e PARE.\n\
+     2. ENTENDER — leia a spec e o plan da Feature (`docs/features/<slug>/`) e \
+     o diff de cada PR (`gh pr diff <n>`). A régua da revisão é: o código faz \
+     o que a spec e o plan pedem, sem defeito e sem quebrar o que existia.\n\
+     3. REVISAR — procure defeitos reais: erro de lógica, requisito da spec não \
+     atendido ou atendido errado, caso de borda sem tratamento, falha de \
+     segurança, teste que não testa o que diz. Não aponte gosto pessoal nem \
+     estilo que o projeto já aceita. Publique UM review por PR com os achados: \
+     `gh pr review <n> --comment --body \"...\"` — cada achado com arquivo, \
+     linha e o porquê. Se não houver achado, o review diz isso em uma linha.\n\
+     4. CORRIGIR — para cada achado que você mesmo apontou, faça a correção na \
+     branch do PR (`gh pr checkout <n>` no clone daquele repositório). UM \
+     commit por correção: \"fix: <o que estava errado> (#{issue}) \
+     [spec-wave-agent]\". Rode a suíte de testes do repositório antes de dar \
+     push. Achado que você não conseguir corrigir com segurança fica no review \
+     como pendente — não force uma correção duvidosa.\n\
+     5. FECHAR — comente em cada PR o resumo final, começando EXATAMENTE por \
+     `<!-- spec-wave:auto-review -->` na primeira linha: o que foi revisado, \
+     quantos achados, quais foram corrigidos (com o hash do commit) e quais \
+     ficaram pendentes para o humano. Use `gh pr comment <n> --body-file`.\n\
+     \n\
+     Regras OBRIGATÓRIAS:\n\
+     - NUNCA aprove (`gh pr review --approve`), NUNCA mergeie, NUNCA feche e \
+     NUNCA abra um PR novo. Aprovação e merge são de um humano.\n\
+     - NUNCA use `git push --force` nem reescreva o histórico da branch do PR.\n\
+     - Não mexa em nada fora do diff do PR além do necessário para corrigir um \
+     achado. Nada de refatoração de oportunidade.\n\
+     - PR que já tem um comentário começando por `<!-- spec-wave:auto-review -->` \
+     já foi revisado: não revise de novo, só o inclua em `prs`.\n\
+     - Você roda em RODADAS: se o seu turno terminar sem o marker de \
+     conclusão, você será REINVOCADO. Ao iniciar, verifique o que já foi feito \
+     (`git log --oneline -20` e os comentários do PR) e continue de onde parou.\n\
+     - Processos em background que você deixar ao encerrar o turno são \
+     MORTOS. Execute em foreground e aguarde.\n\
+     - Ao terminar, volte o clone do hub para a branch em que ele estava e \
+     escreva o arquivo `.spec-wave-agent-result.json` na raiz do clone do hub \
+     com: {\"status\": \"ok\", \"prs\": [\"<url de cada PR revisado>\"], \
+     \"detalhe\": \"<achados e correções em uma frase>\"}. NÃO commite esse \
+     arquivo.\n"
+        .into()
+}
 fn d_cooldown() -> u64 { 900 }
 fn d_max_rounds() -> u32 { 8 }
 fn d_max_failures() -> u32 { 3 }
@@ -586,6 +658,14 @@ impl Config {
         if self.bug_prompt.trim().is_empty() {
             bail!("config: bug_prompt vazio");
         }
+        if self.review_timeout_secs == 0 {
+            bail!("config: review_timeout_secs deve ser > 0");
+        }
+        split_command(&self.review_command)
+            .map_err(|e| anyhow::anyhow!("config: review_command inválido: {e}"))?;
+        if self.review_prompt.trim().is_empty() {
+            bail!("config: review_prompt vazio");
+        }
         if self.feature_prompt.trim().is_empty() {
             bail!("config: feature_prompt vazio");
         }
@@ -910,6 +990,23 @@ mod tests {
         assert!(parse("repo = \"a/b\"\nci_poll_secs = 0").validate().is_err());
         assert!(parse("repo = \"a/b\"\nci_poll_secs = 0\nci_gate = false").validate().is_ok());
         assert!(parse("repo = \"a/b\"\nchecks_command = \"\"").validate().is_err());
+    }
+
+    #[test]
+    fn review_tem_defaults_proprios() {
+        let cfg = parse("repo = \"a/b\"");
+        assert!(cfg.review_prompt.contains("{issue}"));
+        assert!(cfg.review_prompt.contains("NUNCA aprove"));
+        assert!(cfg.review_prompt.contains("<!-- spec-wave:auto-review -->"));
+        // A revisão usa o gh (ler o PR, publicar o review); o executor de
+        // implementação continua sem ele.
+        assert!(cfg.review_command.contains("Bash(gh:*)"));
+        assert!(!cfg.feature_command.contains("Bash(gh:*)"));
+        assert_eq!(cfg.review_timeout_secs, 3600);
+        // A CLI que conduz o fluxo é a da máquina (`{cli}`), como nos outros prompts.
+        assert!(cfg.review_prompt.contains("{cli} order {issue}"));
+        assert!(!cfg.render(&cfg.review_prompt, 7).contains("{cli}"));
+        assert!(cfg.review_command.contains("Bash({cli}:*)"));
     }
 
     #[test]
