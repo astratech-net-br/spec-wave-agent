@@ -30,7 +30,7 @@ use spec_wave_agent::lease::{Lease, LeaseRepo, RenewError};
 use spec_wave_agent::progress::{Progress, ProgressWatch};
 use spec_wave_agent::queue::{self, QueueItem, QueueKind};
 use spec_wave_agent::runner::{
-    checkpoint_all, ensure_workspace, run_item_gated, Gated, LiveHooks, RunEnd,
+    checkpoint_all, ensure_workspace, run_item_gated, run_item_review, Gated, LiveHooks, RunEnd,
 };
 use spec_wave_agent::shell::run;
 use std::collections::HashMap;
@@ -208,7 +208,11 @@ async fn process_issue(
     let issue = item.number;
     // "bug"/"feature" nas mensagens: com dois tipos na fila, um log que diz só
     // "issue #42" obriga a abrir o GitHub para saber o que o agente está fazendo.
-    let que = match item.kind { QueueKind::Bug => "bug", QueueKind::Feature => "feature" };
+    let que = match item.kind {
+        QueueKind::Bug => "bug",
+        QueueKind::Feature => "feature",
+        QueueKind::Review => "review",
+    };
     let Some(lease) = leases
         .try_acquire(issue, me, cfg.lease_ttl_secs).await? else {
         return Ok(Attempt { claimed: false, failed: false }); // outro agente pegou
@@ -794,6 +798,7 @@ fn fleet_run_from_env() -> Result<FleetRun> {
     let kind = match var("SPECWAVE_KIND").as_str() {
         "bug" => QueueKind::Bug,
         "feature" | "" => QueueKind::Feature,
+        "review" => QueueKind::Review,
         k => bail!("SPECWAVE_KIND desconhecido: {k}"),
     };
     let run_id = var("RUN_ID");
@@ -933,8 +938,13 @@ async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
     let outcome = async {
         let workspace = ensure_workspace(&cfg, issue).await?;
         let watch = progress_watch(&cfg, item, &workspace.hub, &hooks, progress_tx.clone());
-        let gated = run_item_gated(&cfg, &workspace, item, lost_rx.clone(), stop_rx, Some(hooks),
-                                   &pr_command(&cfg)).await;
+        // Revisão de PR não abre PR nem espera CI: caminho próprio.
+        let gated = if item.kind == QueueKind::Review {
+            run_item_review(&cfg, &workspace, item, lost_rx.clone(), stop_rx, Some(hooks)).await
+        } else {
+            run_item_gated(&cfg, &workspace, item, lost_rx.clone(), stop_rx, Some(hooks),
+                           &pr_command(&cfg)).await
+        };
         if let Some(w) = watch { w.finish().await; }
         Ok::<_, anyhow::Error>((workspace, gated?))
     }.await;
@@ -964,7 +974,13 @@ async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
                 }
             }
             leases.release(issue).await?;
-            events.outcome("succeeded", None, &prs);
+            if item.kind == QueueKind::Review && prs.is_empty() {
+                // Nada foi revisado: não é sucesso nem falha do agente.
+                events.outcome("blocked",
+                    Some("nenhum Pull Request aberto e elegível para revisão nesta Feature"), &[]);
+            } else {
+                events.outcome("succeeded", None, &prs);
+            }
         }
         RunEnd::Failed(reason) => {
             checkpoint_all(&workspace, issue, "failed").await;

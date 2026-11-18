@@ -23,6 +23,10 @@ pub enum QueueKind {
     /// esperar atrás de feature nova numa FIFO por número.
     Bug,
     Feature,
+    /// Revisão do PR de uma Feature (esteira automática do spec-wave). Só chega
+    /// pelo modo frota (`--once`, `SPECWAVE_KIND=review`): nenhuma fila por
+    /// label nem a API de trabalho produzem este tipo.
+    Review,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

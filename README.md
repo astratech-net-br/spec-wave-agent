@@ -223,6 +223,9 @@ repo = "sua-org/seu-repo"
 | `bug_timeout_secs` | `3600` | teto de **um bug** (1h) |
 | `bug_command` | `claude -p …` | executor de bug; mesmo formato do `feature_command` |
 | `bug_prompt` | (prompt das 4 fases) | reproduzir → causa raiz → fix mínimo → teste de regressão |
+| `review_timeout_secs` | `3600` | teto de **uma revisão de PR** (modo frota, `SPECWAVE_KIND=review`) |
+| `review_command` | `claude -p …` + `Bash(gh:*)` | executor da revisão; libera o `gh` para ler o PR e publicar o review |
+| `review_prompt` | (prompt de revisão) | acha os PRs da Feature → revisa → corrige na branch do PR → comenta o resumo; nunca aprova nem mergeia |
 | `feature_command` | `claude -p …` | executor; argv por espaço, aspas agrupam, **sem shell**. `{issue}` |
 | `feature_prompt` | (prompt de orquestração) | enviado via stdin. `{issue}` |
 | `cooldown_secs` | `900` | issue processada sai da fila local por este tempo |

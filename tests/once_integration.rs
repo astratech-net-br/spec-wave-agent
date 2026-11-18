@@ -240,3 +240,82 @@ echo '{"status":"ok"}' > .spec-wave-agent-result.json"#);
     assert!(evs.iter().all(|e| e["event"] != "progress"), "sem Task conhecida não há evento: {evs:?}");
     assert_eq!(evs.last().unwrap()["state"], "succeeded");
 }
+
+/// Setup da revisão de PR: o executor entra pelo `review_command`, e o stub do
+/// `gh` REGISTRA cada chamada — a revisão não pode abrir PR.
+fn setup_review(tmp: &TempDir, executor_body: &str) -> (PathBuf, String, PathBuf) {
+    let (cfg, path, workdir) = setup(tmp, "echo 'feature_command não deveria rodar' >&2; exit 1");
+    exe(&tmp.path().join("review.sh"), executor_body);
+    exe(&tmp.path().join("bin/gh"), &format!(r#"echo "$*" >> {log}
+case "$1 $2" in
+  "pr create") echo "https://github.com/test/test/pull/99";;
+esac
+exit 0"#, log = tmp.path().join("gh.log").display()));
+    let mut toml = std::fs::read_to_string(&cfg).unwrap();
+    toml.push_str(&format!("\n        review_command = \"{} {{issue}}\"\n",
+                           tmp.path().join("review.sh").display()));
+    std::fs::write(&cfg, toml).unwrap();
+    (cfg, path, workdir)
+}
+
+#[test]
+fn once_review_reporta_os_prs_revisados_sem_abrir_pr() {
+    let tmp = TempDir::new().unwrap();
+    // O executor recebe o prompt de REVISÃO pelo stdin, commita uma correção e
+    // declara no marker o PR que revisou.
+    let (cfg, path, workdir) = setup_review(&tmp, &format!(r#"set -eu
+cat > {prompt}
+echo corrigido > fix.txt && git add fix.txt && git commit -qm "fix: achado do review (#42)"
+echo '{{"status":"ok","prs":["https://github.com/test/test/pull/7"],"detalhe":"1 achado corrigido"}}' > .spec-wave-agent-result.json"#,
+        prompt = tmp.path().join("prompt.txt").display()));
+    let out = once(&tmp, &cfg, &path, &workdir).env("SPECWAVE_KIND", "review").output().unwrap();
+    assert!(out.status.success(), "exit {:?}", out.status);
+    let evs = events(&out.stdout);
+    let last = evs.last().unwrap();
+    assert_eq!(last["event"], "outcome");
+    assert_eq!(last["state"], "succeeded", "eventos: {evs:?}");
+    assert_eq!(last["pr_urls"], serde_json::json!(["https://github.com/test/test/pull/7"]));
+
+    // O prompt é o de revisão, com a issue renderizada.
+    let prompt = std::fs::read_to_string(tmp.path().join("prompt.txt")).unwrap();
+    assert!(prompt.contains("Feature #42"), "prompt: {prompt}");
+    assert!(prompt.contains("spec-wave:auto-review"));
+    assert!(prompt.contains("NUNCA aprove"));
+
+    // A correção foi pushada para o branch de trabalho.
+    let log = Command::new("git").args(["log", "--oneline", "agent/issue-42"])
+        .current_dir(tmp.path().join("origin.git")).output().unwrap();
+    assert!(String::from_utf8_lossy(&log.stdout).contains("achado do review"));
+
+    // Revisão NÃO abre PR nem consulta checks: o `gh` do agente não é chamado
+    // para isso (o executor de verdade usa o gh por conta própria).
+    let gh = std::fs::read_to_string(tmp.path().join("gh.log")).unwrap_or_default();
+    assert!(!gh.contains("pr create"), "revisão abriu PR: {gh}");
+    assert!(!gh.contains("pr view"), "revisão esperou CI: {gh}");
+}
+
+#[test]
+fn once_review_sem_pr_elegivel_termina_blocked() {
+    let tmp = TempDir::new().unwrap();
+    let (cfg, path, workdir) = setup_review(&tmp, r#"set -eu
+cat > /dev/null
+echo '{"status":"ok","prs":[]}' > .spec-wave-agent-result.json"#);
+    let out = once(&tmp, &cfg, &path, &workdir).env("SPECWAVE_KIND", "review").output().unwrap();
+    assert!(out.status.success(), "exit {:?}", out.status);
+    let evs = events(&out.stdout);
+    let last = evs.last().unwrap();
+    assert_eq!(last["state"], "blocked", "eventos: {evs:?}");
+    assert!(last["reason"].as_str().unwrap().contains("nenhum Pull Request"));
+    assert_eq!(last["pr_urls"], serde_json::json!([]));
+}
+
+#[test]
+fn once_kind_desconhecido_continua_recusado() {
+    let tmp = TempDir::new().unwrap();
+    let (cfg, path, workdir) = setup(&tmp, "exit 0");
+    let out = once(&tmp, &cfg, &path, &workdir).env("SPECWAVE_KIND", "deploy").output().unwrap();
+    let evs = events(&out.stdout);
+    let last = evs.last().unwrap();
+    assert_eq!(last["state"], "failed");
+    assert!(last["reason"].as_str().unwrap().contains("SPECWAVE_KIND desconhecido"));
+}
