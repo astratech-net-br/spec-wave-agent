@@ -28,6 +28,15 @@ fn setup(tmp: &TempDir, executor_body: &str) -> (PathBuf, String, PathBuf) {
 fn setup_with(tmp: &TempDir, executor_body: &str, npx_body: &str, remote_in_config: bool)
     -> (PathBuf, String, PathBuf)
 {
+    // Hermético: sem isto, um `spec-wave` instalado na máquina de quem roda os
+    // testes seria usado no lugar do stub do npx.
+    setup_cli(tmp, executor_body, npx_body, remote_in_config, "cli_command = \"npx spec-wave\"")
+}
+
+/// `cli`: a linha `cli_command = …` da config ("" = detectar pelo PATH).
+fn setup_cli(tmp: &TempDir, executor_body: &str, npx_body: &str, remote_in_config: bool, cli: &str)
+    -> (PathBuf, String, PathBuf)
+{
     let origin = tmp.path().join("origin.git");
     sh(tmp.path(), &format!(
         "git init -q --bare -b main {o}
@@ -52,6 +61,7 @@ exit 0"#);
     let remote = if remote_in_config { format!("remote_url = \"{}\"", origin.display()) } else { String::new() };
     std::fs::write(&cfg, format!(r#"
         {remote}
+        {cli}
         implement_timeout_secs = 60
         ci_poll_secs = 1
         ci_no_checks_grace_secs = 1
@@ -359,4 +369,35 @@ echo '{"status":"ok","prs":["https://github.com/test/test/pull/7"]}' > .spec-wav
     let files = String::from_utf8_lossy(&files.stdout);
     assert!(files.contains("fix.txt"), "o commit de correção não foi pushado: {files}");
     assert!(!files.contains("sem-commit.txt"), "sobra sem commit virou checkpoint: {files}");
+}
+
+#[test]
+fn once_usa_o_spec_wave_do_path_e_nao_o_npx_do_clone() {
+    let tmp = TempDir::new().unwrap();
+    // O npx (que resolveria a CLI antiga do node_modules do produto) só
+    // responde ao preflight e falha no resto; a CLI da máquina é um
+    // `spec-wave` no PATH. Sem `cli_command`.
+    let (cfg, path, workdir) = setup_cli(&tmp, r#"set -eu
+cat > /dev/null
+echo "cli=$SPEC_WAVE_CLI" > cli.txt
+echo trabalho > feito.txt && git add -A && git commit -qm "story 3"
+echo '{"status":"ok"}' > .spec-wave-agent-result.json
+sleep 1.5"#, r#"[ "$1" = "--version" ] && { echo 10.0.0; exit 0; }
+exit 1"#, true, "");
+    exe(&tmp.path().join("bin/spec-wave"), r#"if [ "$1" = "progress" ]; then
+  echo '{"feature":42,"stories":[{"number":3,"done":false,"tasks":[{"number":5,"done":false},{"number":6,"done":false}]}]}'
+  exit 0
+fi
+exit 1"#);
+    let out = once(&tmp, &cfg, &path, &workdir).output().unwrap();
+    assert!(out.status.success(), "exit {:?}", out.status);
+    let evs = events(&out.stdout);
+    // O retrato veio do `spec-wave` do PATH, pelo caminho absoluto.
+    assert!(evs.iter().any(|e| e["event"] == "progress" && e["tasks_total"] == 2), "eventos: {evs:?}");
+    assert_eq!(evs.last().unwrap()["state"], "succeeded");
+    // E o executor recebeu o mesmo caminho para repassar ao agente interno.
+    let log = Command::new("git").args(["show", "agent/issue-42:cli.txt"])
+        .current_dir(tmp.path().join("origin.git")).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&log.stdout).trim(),
+               format!("cli={}", tmp.path().join("bin/spec-wave").display()));
 }

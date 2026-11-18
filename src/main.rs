@@ -25,7 +25,7 @@
 
 use anyhow::{bail, Result};
 use spec_wave_agent::api::{queue_item_of, ApiClient, Outcome, WorkItem};
-use spec_wave_agent::config::{load_config_from, render_template, split_command, Config, Source};
+use spec_wave_agent::config::{load_config_from, split_command, Config, Source};
 use spec_wave_agent::lease::{Lease, LeaseRepo, RenewError};
 use spec_wave_agent::progress::{Progress, ProgressWatch};
 use spec_wave_agent::queue::{self, QueueItem, QueueKind};
@@ -55,7 +55,7 @@ fn init_tracing() {
 
 /// argv do comando que abre o PR (validado no boot por `Config::validate`).
 fn pr_command(cfg: &Config) -> Vec<String> {
-    split_command(&cfg.pr_command).unwrap_or_default()
+    split_command(&cfg.render(&cfg.pr_command, 0)).unwrap_or_default()
 }
 
 /// Checagens fail-fast dos pré-requisitos da máquina.
@@ -177,7 +177,7 @@ fn progress_watch(
     if item.kind != QueueKind::Feature {
         return None;
     }
-    let argv = split_command(&render_template(&cfg.progress_command, item.number)).ok()
+    let argv = split_command(&cfg.render(&cfg.progress_command, item.number)).ok()
         .filter(|a| !a.is_empty())?;
     // Na criação do diretório, não na primeira Task: a CLI só escreve se ele
     // já estiver no ambiente do executor, e ele já está.

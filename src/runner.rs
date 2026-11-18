@@ -56,7 +56,7 @@ pub async fn ensure_workspace(cfg: &Config, issue: u64) -> Result<Workspace> {
     // a convenção de clone já estão lá, testadas; reimplementar em Rust
     // duplicaria a mesma lógica em duas linguagens, com risco real de
     // divergir (achado da migração RFC-005 do lado spec-wave-ui/sandbox).
-    let code_repos = prepare_code_repos(&ws, issue).await?;
+    let code_repos = prepare_code_repos(&ws, issue, &cfg.cli()).await?;
 
     Ok(Workspace { hub: ws, code_repos })
 }
@@ -144,12 +144,20 @@ struct WorkspacePrepareRepo {
 /// qualquer jeito ("rode dentro do hub"). Com `.spec-wave.json` presente, uma
 /// falha de verdade (rede, repo declarado inacessível) SOBE — silenciar ali
 /// esconderia a issue chegando com código faltando, sem aviso nenhum.
-async fn prepare_code_repos(hub: &Path, issue: u64) -> Result<Vec<CodeRepoWorkspace>> {
+async fn prepare_code_repos(hub: &Path, issue: u64, cli: &str) -> Result<Vec<CodeRepoWorkspace>> {
     if !hub.join(".spec-wave.json").exists() {
         return Ok(Vec::new());
     }
-    let out = run_ok(hub, "npx",
-        &["spec-wave", "workspace", "prepare", "--issue", &issue.to_string(), "--json"])
+    // `cli` = como chamar a CLI (config::detect_cli) — nunca o `npx` cru: o
+    // hub pode ter uma cópia antiga dela no próprio node_modules.
+    let mut argv = crate::config::split_command(cli)?;
+    if argv.is_empty() {
+        anyhow::bail!("cli_command vazio");
+    }
+    let issue_arg = issue.to_string();
+    argv.extend(["workspace", "prepare", "--issue", &issue_arg, "--json"].map(String::from));
+    let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
+    let out = run_ok(hub, &argv[0], &args)
         .await
         .context("`spec-wave workspace prepare` falhou")?;
     let parsed: WorkspacePrepareOutput = serde_json::from_str(out.trim())
@@ -701,10 +709,10 @@ async fn executor_round(
     // Frota: MCP configurável (SPECWAVE_MCP_CONFIG / SPECWAVE_MCP_ALLOWED_TOOLS).
     // Sem as envs o argv fica idêntico; nada do conteúdo é logado.
     let argv = crate::config::apply_mcp_env(crate::config::split_command(
-        &crate::config::render_template(command, issue))?);
+        &cfg.render(command, issue))?);
     // O extra (contexto de CI reprovado) entra DEPOIS do render: log de CI é
     // texto alheio, e um "{issue}" dentro dele não é placeholder.
-    let mut prompt = crate::config::render_template(prompt_tpl, issue);
+    let mut prompt = cfg.render(prompt_tpl, issue);
     if let Some(extra) = extra_prompt {
         prompt.push_str(extra);
     }
@@ -720,6 +728,9 @@ async fn executor_round(
     if let Some(h) = &live {
         cmd.env("SPEC_WAVE_STREAM_DIR", &h.stream_dir);
     }
+    // A CLI que conduz o fluxo (config::detect_cli): o `spec-wave implement`
+    // a repete nas instruções do agente interno, que também roda no clone.
+    cmd.env("SPEC_WAVE_CLI", cfg.cli());
     #[cfg(unix)]
     cmd.process_group(0); // líder de grupo => kill_tree pega a árvore toda
     let mut child = cmd.spawn()

@@ -66,6 +66,7 @@ fn setup(tmp: &TempDir, executor_body: &str, checks_body: &str, extra_toml: &str
     toml::from_str(&format!(r#"
         repo = "test/test"
         remote_url = "{origin}"
+        cli_command = "npx spec-wave"
         workdir = "{workdir}"
         implement_timeout_secs = 60
         feature_command = "{exec}"
