@@ -857,7 +857,11 @@ async fn run_rounds(
             RoundEnd::LeaseLost => return Ok(RunEnd::LeaseLost),
             RoundEnd::Interrupted => return Ok(RunEnd::Interrupted),
             RoundEnd::Incomplete => {
-                let progressed = head_sha(ws).await != head_before;
+                // Numa revisão o HEAD do hub não mede progresso: o trabalho é
+                // comentar no PR e commitar na branch dele, muitas vezes num
+                // clone de `.spec-wave/repos/`. O teto de rodadas ainda vale.
+                let progressed = item.kind == QueueKind::Review
+                    || head_sha(ws).await != head_before;
                 if progressed {
                     no_progress = 0;
                 } else {
@@ -904,7 +908,8 @@ pub struct Gated {
 /// Não abre PR (a revisão trabalha nos que já existem) e não passa pelo gate
 /// de CI (uma rodada só: o que o CI disser das correções é assunto do humano
 /// que vai aprovar). No sucesso faz o checkpoint — cinto de segurança para uma
-/// correção que o executor commitou e não pushou — e devolve os PRs que o
+/// correção que o executor commitou e não pushou (`push_all`, sem commit de
+/// sobras) — e devolve os PRs que o
 /// executor declarou ter revisado no marker. Lista vazia = não havia PR
 /// elegível; quem chama decide o desfecho.
 pub async fn run_item_review(
@@ -917,9 +922,22 @@ pub async fn run_item_review(
     let mut prs = Vec::new();
     if let RunEnd::Success(result) = &end {
         prs = review_prs(result);
-        checkpoint_all(workspace, item.number, "review").await;
+        push_all(workspace).await;
     }
     Ok(Gated { end, prs })
+}
+
+/// Pusha o que já está COMMITADO em cada clone — sem `add`/`commit`.
+///
+/// A revisão trabalha na branch de um Pull Request que um humano vai aprovar:
+/// o cinto de segurança dela é só garantir o push dos commits de correção que
+/// o executor fez (um por achado, testados). Um checkpoint "wip" com o que
+/// sobrou sem commit empurraria edição pela metade para dentro do PR.
+pub async fn push_all(workspace: &Workspace) {
+    let _ = run(&workspace.hub, "git", &["push", "--quiet"]).await;
+    for cr in &workspace.code_repos {
+        let _ = run(&cr.dir, "git", &["push", "--quiet"]).await;
+    }
 }
 
 /// PRs que o executor de revisão declarou no marker — só URLs http(s), sem

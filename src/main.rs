@@ -983,13 +983,23 @@ async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
             }
         }
         RunEnd::Failed(reason) => {
-            checkpoint_all(&workspace, issue, "failed").await;
+            // Revisão de PR não deixa checkpoint: é uma rodada só (ninguém
+            // retoma o WIP) e o clone pode estar na branch do PR — um commit
+            // "wip" ali empurraria edição pela metade para o PR em revisão.
+            if item.kind != QueueKind::Review {
+                checkpoint_all(&workspace, issue, "failed").await;
+            }
             leases.release(issue).await?;
             // Com o gate o PR pode existir numa execução que falhou (CI
             // vermelho): o desfecho diz qual.
             events.outcome("failed", Some(&reason), &prs);
         }
         RunEnd::Interrupted => {
+            if item.kind == QueueKind::Review {
+                leases.release(issue).await?;
+                events.outcome("canceled", Some("revisão interrompida pelo spec-wave: nada foi pushado"), &[]);
+                return Ok(());
+            }
             checkpoint_all(&workspace, issue, "interrupted").await;
             leases.release(issue).await?;
             events.outcome("canceled", Some("interrompido pelo spec-wave: checkpoint pushado no branch"), &[]);

@@ -319,3 +319,44 @@ fn once_kind_desconhecido_continua_recusado() {
     assert_eq!(last["state"], "failed");
     assert!(last["reason"].as_str().unwrap().contains("SPECWAVE_KIND desconhecido"));
 }
+
+#[test]
+fn once_review_que_falha_nao_pusha_trabalho_pela_metade() {
+    let tmp = TempDir::new().unwrap();
+    // O executor deixa uma edição sem commit e termina com status de falha: a
+    // revisão é uma rodada só, e esse resto não pode virar um commit "wip" na
+    // branch do PR.
+    let (cfg, path, workdir) = setup_review(&tmp, r#"set -eu
+cat > /dev/null
+echo metade > pela-metade.txt
+echo '{"status":"erro","detalhe":"suíte quebrou"}' > .spec-wave-agent-result.json"#);
+    let out = once(&tmp, &cfg, &path, &workdir).env("SPECWAVE_KIND", "review").output().unwrap();
+    let evs = events(&out.stdout);
+    let last = evs.last().unwrap();
+    assert_eq!(last["state"], "failed", "eventos: {evs:?}");
+    let files = Command::new("git").args(["ls-tree", "-r", "--name-only", "agent/issue-42"])
+        .current_dir(tmp.path().join("origin.git")).output().unwrap();
+    assert!(!String::from_utf8_lossy(&files.stdout).contains("pela-metade.txt"),
+            "revisão que falhou pushou WIP");
+    let log = Command::new("git").args(["log", "--oneline", "agent/issue-42"])
+        .current_dir(tmp.path().join("origin.git")).output().unwrap();
+    assert!(!String::from_utf8_lossy(&log.stdout).contains("checkpoint"));
+}
+
+#[test]
+fn once_review_sucesso_pusha_commits_mas_nao_sobras() {
+    let tmp = TempDir::new().unwrap();
+    let (cfg, path, workdir) = setup_review(&tmp, r#"set -eu
+cat > /dev/null
+echo corrigido > fix.txt && git add fix.txt && git commit -qm "fix: achado (#42)"
+echo sobra > sem-commit.txt
+echo '{"status":"ok","prs":["https://github.com/test/test/pull/7"]}' > .spec-wave-agent-result.json"#);
+    let out = once(&tmp, &cfg, &path, &workdir).env("SPECWAVE_KIND", "review").output().unwrap();
+    let evs = events(&out.stdout);
+    assert_eq!(evs.last().unwrap()["state"], "succeeded", "eventos: {evs:?}");
+    let files = Command::new("git").args(["ls-tree", "-r", "--name-only", "agent/issue-42"])
+        .current_dir(tmp.path().join("origin.git")).output().unwrap();
+    let files = String::from_utf8_lossy(&files.stdout);
+    assert!(files.contains("fix.txt"), "o commit de correção não foi pushado: {files}");
+    assert!(!files.contains("sem-commit.txt"), "sobra sem commit virou checkpoint: {files}");
+}
