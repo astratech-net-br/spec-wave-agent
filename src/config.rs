@@ -98,6 +98,16 @@ pub struct Config {
     /// Tempo máximo de UMA execução de QA (todos os cenários).
     #[serde(default = "d_qa_timeout")]
     pub qa_timeout_secs: u64,
+    /// Comando de uma etapa do fluxo na frota (`SPECWAVE_KIND=flow:<etapa>`).
+    /// Placeholders: {cli} {issue} {step}. Exit 0 = concluída; 2 = recusa do
+    /// fluxo (já comentada na issue pela CLI); outro = falha.
+    #[serde(default = "d_flow_command")]
+    pub flow_command: String,
+    #[serde(default = "d_flow_timeout")]
+    pub flow_timeout_secs: u64,
+    /// A etapa desta execução (`flow:<etapa>` do ambiente) — só no `--once`.
+    #[serde(skip)]
+    pub flow_step: Option<String>,
     /// Depois de processar uma issue (qualquer desfecho), ela fica fora da
     /// fila deste agente por este tempo — evita re-claim imediato por atraso
     /// do índice de busca do GitHub e loop de retry em falha.
@@ -224,6 +234,13 @@ fn d_bug_command() -> String { d_executor_command() }
 fn d_bug_timeout() -> u64 { 3600 }
 fn d_review_timeout() -> u64 { 3600 }
 fn d_qa_timeout() -> u64 { 5400 }
+fn d_flow_command() -> String { "{cli} step {step} --issue {issue}".into() }
+fn d_flow_timeout() -> u64 { 3600 }
+
+/// Nome de etapa aceito em `flow:<etapa>` (função PURA): minúsculas e hífen.
+pub fn valid_flow_step(step: &str) -> bool {
+    !step.is_empty() && step.len() <= 40 && step.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+}
 /// Arquivo do desfecho do `spec-wave qa --outcome-file` (raiz do clone do hub).
 pub const QA_OUTCOME_FILE: &str = ".spec-wave-agent-qa.json";
 fn d_qa_command() -> String { format!("{{cli}} qa {{issue}} --outcome-file {QA_OUTCOME_FILE}") }
@@ -700,6 +717,11 @@ impl Config {
         }
         split_command(&self.qa_command)
             .map_err(|e| anyhow::anyhow!("config: qa_command inválido: {e}"))?;
+        if self.flow_timeout_secs == 0 {
+            bail!("config: flow_timeout_secs deve ser > 0");
+        }
+        split_command(&self.flow_command)
+            .map_err(|e| anyhow::anyhow!("config: flow_command inválido: {e}"))?;
         if self.feature_prompt.trim().is_empty() {
             bail!("config: feature_prompt vazio");
         }
@@ -1030,6 +1052,18 @@ mod tests {
         assert!(parse("repo = \"a/b\"\nci_poll_secs = 0").validate().is_err());
         assert!(parse("repo = \"a/b\"\nci_poll_secs = 0\nci_gate = false").validate().is_ok());
         assert!(parse("repo = \"a/b\"\nchecks_command = \"\"").validate().is_err());
+    }
+
+    #[test]
+    fn flow_tem_defaults_e_valida_a_etapa() {
+        let mut cfg = Config::defaults();
+        cfg.flow_step = Some("spec".into());
+        assert_eq!(cfg.flow_command, "{cli} step {step} --issue {issue}");
+        assert_eq!(cfg.flow_timeout_secs, 3600);
+        assert!(valid_flow_step("critique-fix"));
+        assert!(!valid_flow_step(""));
+        assert!(!valid_flow_step("spec;rm"));
+        assert!(!valid_flow_step("Spec"));
     }
 
     #[test]

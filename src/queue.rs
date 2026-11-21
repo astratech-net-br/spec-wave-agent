@@ -31,6 +31,10 @@ pub enum QueueKind {
     /// spec-wave). Como a revisão, só chega pelo modo frota (`--once`,
     /// `SPECWAVE_KIND=qa`).
     Qa,
+    /// Uma etapa do fluxo spec-wave (spec, plan, crítica, validação…) rodando
+    /// fora do GitHub Actions, porque o produto a mandou para a frota. Só pelo
+    /// `--once` (`SPECWAVE_KIND=flow:<etapa>`); a etapa vai em `Config.flow_step`.
+    Flow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
