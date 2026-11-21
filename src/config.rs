@@ -86,6 +86,18 @@ pub struct Config {
     /// Tempo máximo de UMA revisão de PR (uma rodada de review + correções).
     #[serde(default = "d_review_timeout")]
     pub review_timeout_secs: u64,
+    /// Comando da execução de QA (modo frota, `SPECWAVE_KIND=qa`): a CLI roda
+    /// o plano de QA e grava o desfecho em JSON. Placeholders: {cli} {issue}.
+    #[serde(default = "d_qa_command")]
+    pub qa_command: String,
+    /// Executor que a CLI chama para rodar os cenários (vai em
+    /// `SPEC_WAVE_QA_CMD`) quando o `.spec-wave.json` do hub não define
+    /// `qa.command`. Os placeholders ({contextFile} etc.) são da CLI.
+    #[serde(default = "d_qa_executor")]
+    pub qa_executor: String,
+    /// Tempo máximo de UMA execução de QA (todos os cenários).
+    #[serde(default = "d_qa_timeout")]
+    pub qa_timeout_secs: u64,
     /// Depois de processar uma issue (qualquer desfecho), ela fica fora da
     /// fila deste agente por este tempo — evita re-claim imediato por atraso
     /// do índice de busca do GitHub e loop de retry em falha.
@@ -211,6 +223,19 @@ fn d_feature_command() -> String { d_executor_command() }
 fn d_bug_command() -> String { d_executor_command() }
 fn d_bug_timeout() -> u64 { 3600 }
 fn d_review_timeout() -> u64 { 3600 }
+fn d_qa_timeout() -> u64 { 5400 }
+/// Arquivo do desfecho do `spec-wave qa --outcome-file` (raiz do clone do hub).
+pub const QA_OUTCOME_FILE: &str = ".spec-wave-agent-qa.json";
+fn d_qa_command() -> String { format!("{{cli}} qa {{issue}} --outcome-file {QA_OUTCOME_FILE}") }
+fn d_qa_executor() -> String {
+    // A CLI renderiza {contextFile} e roda pelo shell: o prompt vai como
+    // argumento. Bash inteiro — o QA sobe a aplicação (qa.setup) e roda
+    // Playwright; Edit/Write para os scripts descartáveis e o resultado.
+    "claude -p --permission-mode acceptEdits --allowedTools \"Bash,Edit,Write,Read,Glob,Grep\" \
+     \"Execute o QA descrito em {contextFile}: siga as instruções do arquivo e grave o \
+     resultado exatamente onde e como ele pede.\""
+        .into()
+}
 // Mesmo comando do executor: com `Bash` inteiro, o `gh` de que a revisão
 // precisa (ler o PR, publicar o review) já está liberado.
 fn d_review_command() -> String { d_executor_command() }
@@ -670,6 +695,11 @@ impl Config {
         if self.review_prompt.trim().is_empty() {
             bail!("config: review_prompt vazio");
         }
+        if self.qa_timeout_secs == 0 {
+            bail!("config: qa_timeout_secs deve ser > 0");
+        }
+        split_command(&self.qa_command)
+            .map_err(|e| anyhow::anyhow!("config: qa_command inválido: {e}"))?;
         if self.feature_prompt.trim().is_empty() {
             bail!("config: feature_prompt vazio");
         }
@@ -1000,6 +1030,15 @@ mod tests {
         assert!(parse("repo = \"a/b\"\nci_poll_secs = 0").validate().is_err());
         assert!(parse("repo = \"a/b\"\nci_poll_secs = 0\nci_gate = false").validate().is_ok());
         assert!(parse("repo = \"a/b\"\nchecks_command = \"\"").validate().is_err());
+    }
+
+    #[test]
+    fn qa_tem_defaults_proprios() {
+        let cfg = Config::defaults();
+        assert_eq!(cfg.qa_command, "{cli} qa {issue} --outcome-file .spec-wave-agent-qa.json");
+        assert!(cfg.render(&cfg.qa_command, 7).ends_with(" qa 7 --outcome-file .spec-wave-agent-qa.json"));
+        assert!(cfg.qa_executor.contains("{contextFile}"));
+        assert_eq!(cfg.qa_timeout_secs, 5400);
     }
 
     #[test]

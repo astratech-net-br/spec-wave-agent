@@ -27,6 +27,10 @@ pub enum QueueKind {
     /// pelo modo frota (`--once`, `SPECWAVE_KIND=review`): nenhuma fila por
     /// label nem a API de trabalho produzem este tipo.
     Review,
+    /// Execução do plano de QA de uma Feature (esteira automática do
+    /// spec-wave). Como a revisão, só chega pelo modo frota (`--once`,
+    /// `SPECWAVE_KIND=qa`).
+    Qa,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

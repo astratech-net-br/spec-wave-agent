@@ -30,7 +30,7 @@ use spec_wave_agent::lease::{Lease, LeaseRepo, RenewError};
 use spec_wave_agent::progress::{Progress, ProgressWatch};
 use spec_wave_agent::queue::{self, QueueItem, QueueKind};
 use spec_wave_agent::runner::{
-    checkpoint_all, ensure_workspace, run_item_gated, run_item_review, Gated, LiveHooks, RunEnd,
+    checkpoint_all, ensure_qa_workspace, ensure_workspace, run_item_gated, run_item_review, Gated, LiveHooks, RunEnd,
 };
 use spec_wave_agent::shell::run;
 use std::collections::HashMap;
@@ -212,6 +212,7 @@ async fn process_issue(
         QueueKind::Bug => "bug",
         QueueKind::Feature => "feature",
         QueueKind::Review => "review",
+        QueueKind::Qa => "qa",
     };
     let Some(lease) = leases
         .try_acquire(issue, me, cfg.lease_ttl_secs).await? else {
@@ -799,6 +800,7 @@ fn fleet_run_from_env() -> Result<FleetRun> {
         "bug" => QueueKind::Bug,
         "feature" | "" => QueueKind::Feature,
         "review" => QueueKind::Review,
+        "qa" => QueueKind::Qa,
         k => bail!("SPECWAVE_KIND desconhecido: {k}"),
     };
     let run_id = var("RUN_ID");
@@ -936,11 +938,22 @@ async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
 
     let item = QueueItem { kind: job.kind, number: issue };
     let outcome = async {
-        let workspace = ensure_workspace(&cfg, issue).await?;
+        // QA roda na branch principal, em clone próprio (evidência e bug.md
+        // vão para ela, não para a branch de desenvolvimento).
+        let workspace = if item.kind == QueueKind::Qa {
+            ensure_qa_workspace(&cfg, issue).await?
+        } else {
+            ensure_workspace(&cfg, issue).await?
+        };
         let watch = progress_watch(&cfg, item, &workspace.hub, &hooks, progress_tx.clone());
         // Revisão de PR não abre PR nem espera CI: caminho próprio.
         let gated = if item.kind == QueueKind::Review {
             run_item_review(&cfg, &workspace, item, lost_rx.clone(), stop_rx, Some(hooks)).await
+        } else if item.kind == QueueKind::Qa {
+            // QA não abre PR nem espera CI: a CLI publica relatório, evidência e Bugs.
+            spec_wave_agent::runner::run_item_with_tap(
+                &cfg, &workspace.hub, item, lost_rx.clone(), stop_rx, Some(hooks)).await
+                .map(|end| Gated { end, prs: Vec::new() })
         } else {
             run_item_gated(&cfg, &workspace, item, lost_rx.clone(), stop_rx, Some(hooks),
                            &pr_command(&cfg)).await
@@ -974,7 +987,11 @@ async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
                 }
             }
             leases.release(issue).await?;
-            if item.kind == QueueKind::Review && prs.is_empty() {
+            if item.kind == QueueKind::Qa {
+                let detalhe = result.as_ref().and_then(|r| r.detalhe.clone());
+                let blocked = result.as_ref().is_some_and(|r| r.status == "blocked");
+                events.outcome(if blocked { "blocked" } else { "succeeded" }, detalhe.as_deref(), &[]);
+            } else if item.kind == QueueKind::Review && prs.is_empty() {
                 // Nada foi revisado: não é sucesso nem falha do agente.
                 events.outcome("blocked",
                     Some("nenhum Pull Request aberto e elegível para revisão nesta Feature"), &[]);
@@ -986,7 +1003,7 @@ async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
             // Revisão de PR não deixa checkpoint: é uma rodada só (ninguém
             // retoma o WIP) e o clone pode estar na branch do PR — um commit
             // "wip" ali empurraria edição pela metade para o PR em revisão.
-            if item.kind != QueueKind::Review {
+            if !matches!(item.kind, QueueKind::Review | QueueKind::Qa) {
                 checkpoint_all(&workspace, issue, "failed").await;
             }
             leases.release(issue).await?;
@@ -998,6 +1015,11 @@ async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
             if item.kind == QueueKind::Review {
                 leases.release(issue).await?;
                 events.outcome("canceled", Some("revisão interrompida pelo spec-wave: nada foi pushado"), &[]);
+                return Ok(());
+            }
+            if item.kind == QueueKind::Qa {
+                leases.release(issue).await?;
+                events.outcome("canceled", Some("QA interrompido pelo spec-wave"), &[]);
                 return Ok(());
             }
             checkpoint_all(&workspace, issue, "interrupted").await;
