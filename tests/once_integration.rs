@@ -511,11 +511,36 @@ fn once_flow_recusa_do_fluxo_e_falha() {
 fn once_flow_com_etapa_invalida_e_recusado() {
     let tmp = TempDir::new().unwrap();
     let (cfg, path, workdir) = setup_flow(&tmp, 0);
-    for kind in ["flow:", "flow:Spec", "flow:spec;rm -rf"] {
+    for kind in ["flow:", "flow:Spec", "flow:spec;rm -rf", "flow:--help"] {
         let out = once(&tmp, &cfg, &path, &workdir).env("SPECWAVE_KIND", kind).output().unwrap();
         let last = events(&out.stdout).last().unwrap().clone();
         assert_eq!(last["state"], "failed", "{kind}: {last:?}");
         assert!(last["reason"].as_str().unwrap().contains("SPECWAVE_KIND desconhecido"), "{kind}");
     }
     assert!(!tmp.path().join("step.log").exists(), "nada pode rodar com kind inválido");
+}
+
+#[test]
+fn once_flow_nao_prepara_os_repos_de_codigo_nem_disputa_o_lease_do_dev() {
+    let tmp = TempDir::new().unwrap();
+    // O npx (a CLI) registra cada chamada: a etapa não pode rodar o
+    // `workspace prepare` do agente (que criaria agent/issue-<n> nos repos).
+    let log = tmp.path().join("npx.log");
+    let (cfg, path, workdir) = setup_with(&tmp, "exit 1",
+        &format!("echo \"$*\" >> {}\necho 10.0.0", log.display()), true);
+    exe(&tmp.path().join("step.sh"), "exit 0");
+    let mut toml = std::fs::read_to_string(&cfg).unwrap();
+    toml.push_str(&format!("\n        flow_command = \"{} {{step}} --issue {{issue}}\"\n",
+                           tmp.path().join("step.sh").display()));
+    std::fs::write(&cfg, toml).unwrap();
+    // Um agente de dev segura o lease da issue 42 (ref no namespace padrão).
+    sh(tmp.path(), &format!(
+        "cd seed && git push -q {o} HEAD:refs/heads/spec-wave-agent/claims/42",
+        o = tmp.path().join("origin.git").display()));
+
+    let out = once(&tmp, &cfg, &path, &workdir).env("SPECWAVE_KIND", "flow:spec").output().unwrap();
+    let last = events(&out.stdout).last().unwrap().clone();
+    assert_eq!(last["state"], "succeeded", "{last:?}");
+    let chamadas = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(!chamadas.contains("workspace prepare"), "a etapa preparou os repos de código: {chamadas}");
 }

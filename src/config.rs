@@ -237,9 +237,14 @@ fn d_qa_timeout() -> u64 { 5400 }
 fn d_flow_command() -> String { "{cli} step {step} --issue {issue}".into() }
 fn d_flow_timeout() -> u64 { 3600 }
 
-/// Nome de etapa aceito em `flow:<etapa>` (função PURA): minúsculas e hífen.
+/// Nome de etapa aceito em `flow:<etapa>` (função PURA): começa por letra,
+/// depois minúsculas e hífen. A letra inicial não é estética: `--help` passaria
+/// no charset, viraria `spec-wave step --help`, sairia 0 e o run seria
+/// "succeeded" sem rodar nada.
 pub fn valid_flow_step(step: &str) -> bool {
-    !step.is_empty() && step.len() <= 40 && step.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+    step.len() <= 40
+        && step.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+        && step.chars().all(|c| c.is_ascii_lowercase() || c == '-')
 }
 /// Arquivo do desfecho do `spec-wave qa --outcome-file` (raiz do clone do hub).
 pub const QA_OUTCOME_FILE: &str = ".spec-wave-agent-qa.json";
@@ -1064,6 +1069,8 @@ mod tests {
         assert!(!valid_flow_step(""));
         assert!(!valid_flow_step("spec;rm"));
         assert!(!valid_flow_step("Spec"));
+        assert!(!valid_flow_step("--help"));
+        assert!(!valid_flow_step("-"));
     }
 
     #[test]

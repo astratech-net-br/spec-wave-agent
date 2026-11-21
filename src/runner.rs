@@ -102,6 +102,15 @@ fn exclude_scratch(dir: &Path) {
 /// `bug.md` e faz push na branch atual — na `agent/issue-<n>` do
 /// desenvolvimento isso iria parar num PR (ou numa branch já mergeada).
 pub async fn ensure_qa_workspace(cfg: &Config, issue: u64) -> Result<Workspace> {
+    ensure_main_workspace(cfg, issue, true).await
+}
+
+/// Clone do hub na branch principal. `with_code_repos = false` é da etapa do
+/// fluxo (`QueueKind::Flow`): o `spec-wave step` monta o workspace ele mesmo,
+/// na branch principal, quando a etapa precisa — `prepare_code_repos` daqui
+/// faria checkout (e PUSH) da `agent/issue-<n>` em cada repo de código, e o
+/// modelo leria o WIP do desenvolvimento em vez do código mergeado.
+pub async fn ensure_main_workspace(cfg: &Config, issue: u64, with_code_repos: bool) -> Result<Workspace> {
     let ws = PathBuf::from(&cfg.workdir).join(format!("qa-{issue}"));
     let url = cfg.remote_url();
     if !ws.join(".git").exists() {
@@ -127,7 +136,11 @@ pub async fn ensure_qa_workspace(cfg: &Config, issue: u64) -> Result<Workspace> 
     run_ok(&ws, "git", &["checkout", "--quiet", "-B", &branch, &head]).await?;
     run_ok(&ws, "git", &["reset", "--quiet", "--hard", &head]).await?;
     exclude_scratch(&ws);
-    let code_repos = prepare_code_repos(&ws, issue, &cfg.cli()).await?;
+    let code_repos = if with_code_repos {
+        prepare_code_repos(&ws, issue, &cfg.cli()).await?
+    } else {
+        Vec::new()
+    };
     Ok(Workspace { hub: ws, code_repos })
 }
 

@@ -885,6 +885,13 @@ async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
     cfg.workdir = Path::new(&job.workdir).join("agent").to_string_lossy().into_owned();
     cfg.agent_id = Some(format!("fleet:{}", job.run_id));
     cfg.flow_step = job.flow_step.clone();
+    // Etapa do fluxo: lease em namespace PRÓPRIO. Ela é one-shot como um job do
+    // Actions; disputar o lease da issue com o agente de dev (que o segura por
+    // horas) a faria terminar `skipped` sem rodar — e o workflow dela está
+    // desarmado. O namespace próprio ainda impede duas etapas no mesmo item.
+    if job.kind == QueueKind::Flow {
+        cfg.lease_ref_prefix = format!("{}-flow", cfg.lease_ref_prefix);
+    }
     cfg.validate()?;
     let me = cfg.agent_id();
     std::fs::create_dir_all(&cfg.workdir)?;
@@ -952,7 +959,9 @@ async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
     let outcome = async {
         // QA roda na branch principal, em clone próprio (evidência e bug.md
         // vão para ela, não para a branch de desenvolvimento).
-        let workspace = if matches!(item.kind, QueueKind::Qa | QueueKind::Flow) {
+        let workspace = if item.kind == QueueKind::Flow {
+            spec_wave_agent::runner::ensure_main_workspace(&cfg, issue, false).await?
+        } else if item.kind == QueueKind::Qa {
             ensure_qa_workspace(&cfg, issue).await?
         } else {
             ensure_workspace(&cfg, issue).await?
