@@ -102,6 +102,15 @@ fn exclude_scratch(dir: &Path) {
 /// `bug.md` e faz push na branch atual — na `agent/issue-<n>` do
 /// desenvolvimento isso iria parar num PR (ou numa branch já mergeada).
 pub async fn ensure_qa_workspace(cfg: &Config, issue: u64) -> Result<Workspace> {
+    ensure_main_workspace(cfg, issue, true).await
+}
+
+/// Clone do hub na branch principal. `with_code_repos = false` é da etapa do
+/// fluxo (`QueueKind::Flow`): o `spec-wave step` monta o workspace ele mesmo,
+/// na branch principal, quando a etapa precisa — `prepare_code_repos` daqui
+/// faria checkout (e PUSH) da `agent/issue-<n>` em cada repo de código, e o
+/// modelo leria o WIP do desenvolvimento em vez do código mergeado.
+pub async fn ensure_main_workspace(cfg: &Config, issue: u64, with_code_repos: bool) -> Result<Workspace> {
     let ws = PathBuf::from(&cfg.workdir).join(format!("qa-{issue}"));
     let url = cfg.remote_url();
     if !ws.join(".git").exists() {
@@ -127,7 +136,11 @@ pub async fn ensure_qa_workspace(cfg: &Config, issue: u64) -> Result<Workspace> 
     run_ok(&ws, "git", &["checkout", "--quiet", "-B", &branch, &head]).await?;
     run_ok(&ws, "git", &["reset", "--quiet", "--hard", &head]).await?;
     exclude_scratch(&ws);
-    let code_repos = prepare_code_repos(&ws, issue, &cfg.cli()).await?;
+    let code_repos = if with_code_repos {
+        prepare_code_repos(&ws, issue, &cfg.cli()).await?
+    } else {
+        Vec::new()
+    };
     Ok(Workspace { hub: ws, code_repos })
 }
 
@@ -182,6 +195,24 @@ fn qa_round_end(raw: Option<&str>, process: &str) -> RoundEnd {
         "not-configured" | "refused" =>
             result("blocked", reason.unwrap_or_else(|| format!("QA recusado ({outcome})"))),
         _ => RoundEnd::Failed(reason.unwrap_or_else(|| format!("QA terminou em erro ({outcome})"))),
+    }
+}
+
+/// Desfecho de uma etapa do fluxo pelo exit code do `spec-wave step` (PURA):
+/// 0 = concluída; 2 = recusa do fluxo (validação reprovada — a CLI já comentou
+/// na issue, e a etapa TERMINOU); outro = falha (a CLI já fez o report-failure).
+fn flow_round_end(raw: RoundRaw) -> RoundEnd {
+    let ok = |detalhe: &str| RoundEnd::Success(Some(ExecResult {
+        status: "ok".into(), detalhe: Some(detalhe.into()), causa_raiz: None, fix: None,
+        teste_regressao: None, arquivos: None, prs: None,
+    }));
+    match raw {
+        RoundRaw::Success => ok("etapa concluída"),
+        RoundRaw::Failed(r) if r == "exit code 2" =>
+            ok("etapa concluída com recusa do fluxo — o motivo está comentado na issue"),
+        RoundRaw::Failed(r) => RoundEnd::Failed(r),
+        RoundRaw::LeaseLost => RoundEnd::LeaseLost,
+        RoundRaw::Interrupted => RoundEnd::Interrupted,
     }
 }
 
@@ -807,7 +838,11 @@ async fn executor_round(
         // QA: a CLI conduz tudo (o executor dos cenários é chamado por ela);
         // nada entra no stdin.
         QueueKind::Qa => (&cfg.qa_command, &cfg.qa_command, cfg.qa_timeout_secs),
+        // Etapa do fluxo: a CLI roda o corpo do job (`spec-wave step`); nada no stdin.
+        QueueKind::Flow => (&cfg.flow_command, &cfg.flow_command, cfg.flow_timeout_secs),
     };
+    // `{step}` antes do render: é texto da config, não da issue.
+    let command = &command.replace("{step}", cfg.flow_step.as_deref().unwrap_or(""));
     // Frota: MCP configurável (SPECWAVE_MCP_CONFIG / SPECWAVE_MCP_ALLOWED_TOOLS).
     // Sem as envs o argv fica idêntico; nada do conteúdo é logado.
     let argv = crate::config::apply_mcp_env(crate::config::split_command(
@@ -823,7 +858,11 @@ async fn executor_round(
         }
         let _ = std::fs::remove_file(ws.join(crate::config::QA_OUTCOME_FILE));
     }
-    let mut prompt = if item.kind == QueueKind::Qa { String::new() } else { cfg.render(prompt_tpl, issue) };
+    let mut prompt = if matches!(item.kind, QueueKind::Qa | QueueKind::Flow) {
+        String::new()
+    } else {
+        cfg.render(prompt_tpl, issue)
+    };
     if let Some(extra) = extra_prompt {
         prompt.push_str(extra);
     }
@@ -905,6 +944,9 @@ async fn executor_round(
         let _ = timeout(TokioDuration::from_secs(2), t).await;
     }
 
+    if item.kind == QueueKind::Flow {
+        return Ok(flow_round_end(end));
+    }
     if item.kind == QueueKind::Qa {
         let outcome_path = ws.join(crate::config::QA_OUTCOME_FILE);
         let raw = std::fs::read_to_string(&outcome_path).ok();
@@ -1000,7 +1042,7 @@ async fn run_rounds(
                 // Numa revisão o HEAD do hub não mede progresso: o trabalho é
                 // comentar no PR e commitar na branch dele, muitas vezes num
                 // clone de `.spec-wave/repos/`. O teto de rodadas ainda vale.
-                let progressed = matches!(item.kind, QueueKind::Review | QueueKind::Qa)
+                let progressed = matches!(item.kind, QueueKind::Review | QueueKind::Qa | QueueKind::Flow)
                     || head_sha(ws).await != head_before;
                 if progressed {
                     no_progress = 0;
@@ -1233,6 +1275,19 @@ mod tests {
         assert_eq!(s, "failed");
         assert!(r.contains("sem desfecho"), "{r}");
         assert_eq!(qa(Some("não é json")).0, "failed");
+    }
+
+    #[test]
+    fn flow_desfecho_pelo_exit_code() {
+        let st = |raw| match super::flow_round_end(raw) {
+            super::RoundEnd::Success(Some(r)) => format!("ok:{}", r.detalhe.unwrap_or_default()),
+            super::RoundEnd::Failed(r) => format!("failed:{r}"),
+            _ => "outro".into(),
+        };
+        assert_eq!(st(super::RoundRaw::Success), "ok:etapa concluída");
+        assert!(st(super::RoundRaw::Failed("exit code 2".into())).starts_with("ok:etapa concluída com recusa"));
+        assert_eq!(st(super::RoundRaw::Failed("exit code 1".into())), "failed:exit code 1");
+        assert_eq!(st(super::RoundRaw::Failed("timeout de 60s".into())), "failed:timeout de 60s");
     }
 
     #[test]

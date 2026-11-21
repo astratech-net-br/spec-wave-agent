@@ -213,6 +213,7 @@ async fn process_issue(
         QueueKind::Feature => "feature",
         QueueKind::Review => "review",
         QueueKind::Qa => "qa",
+        QueueKind::Flow => "flow",
     };
     let Some(lease) = leases
         .try_acquire(issue, me, cfg.lease_ttl_secs).await? else {
@@ -785,6 +786,8 @@ struct FleetRun {
     hub: String,
     issue: u64,
     kind: QueueKind,
+    /// `flow:<etapa>`: a etapa do fluxo spec-wave a rodar.
+    flow_step: Option<String>,
     run_id: String,
     workdir: String,
     /// `SPECWAVE_REMOTE_URL`: URL de clone (pode ter `{repo}`); None = GitHub.
@@ -796,12 +799,20 @@ fn fleet_run_from_env() -> Result<FleetRun> {
     let hub = var("SPECWAVE_HUB_REPO");
     let issue: u64 = var("SPECWAVE_WORK_ITEM").parse().ok().filter(|n| *n > 0)
         .ok_or_else(|| anyhow::anyhow!("SPECWAVE_WORK_ITEM ausente ou não é o número de uma issue"))?;
-    let kind = match var("SPECWAVE_KIND").as_str() {
+    let raw_kind = var("SPECWAVE_KIND");
+    let mut flow_step = None;
+    let kind = match raw_kind.as_str() {
         "bug" => QueueKind::Bug,
         "feature" | "" => QueueKind::Feature,
         "review" => QueueKind::Review,
         "qa" => QueueKind::Qa,
-        k => bail!("SPECWAVE_KIND desconhecido: {k}"),
+        k => match k.strip_prefix("flow:") {
+            Some(step) if spec_wave_agent::config::valid_flow_step(step) => {
+                flow_step = Some(step.to_string());
+                QueueKind::Flow
+            }
+            _ => bail!("SPECWAVE_KIND desconhecido: {k}"),
+        },
     };
     let run_id = var("RUN_ID");
     let workdir = var("FLEET_WORKDIR");
@@ -809,7 +820,7 @@ fn fleet_run_from_env() -> Result<FleetRun> {
         bail!("--once exige SPECWAVE_HUB_REPO, RUN_ID e FLEET_WORKDIR (o spec-wave-sandbox monta)");
     }
     let remote_url = Some(var("SPECWAVE_REMOTE_URL")).filter(|u| !u.is_empty());
-    Ok(FleetRun { hub, issue, kind, run_id, workdir, remote_url })
+    Ok(FleetRun { hub, issue, kind, flow_step, run_id, workdir, remote_url })
 }
 
 /// Eventos para o fleet-runner: uma linha JSON por evento no stdout.
@@ -873,6 +884,14 @@ async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
     }
     cfg.workdir = Path::new(&job.workdir).join("agent").to_string_lossy().into_owned();
     cfg.agent_id = Some(format!("fleet:{}", job.run_id));
+    cfg.flow_step = job.flow_step.clone();
+    // Etapa do fluxo: lease em namespace PRÓPRIO. Ela é one-shot como um job do
+    // Actions; disputar o lease da issue com o agente de dev (que o segura por
+    // horas) a faria terminar `skipped` sem rodar — e o workflow dela está
+    // desarmado. O namespace próprio ainda impede duas etapas no mesmo item.
+    if job.kind == QueueKind::Flow {
+        cfg.lease_ref_prefix = format!("{}-flow", cfg.lease_ref_prefix);
+    }
     cfg.validate()?;
     let me = cfg.agent_id();
     std::fs::create_dir_all(&cfg.workdir)?;
@@ -940,7 +959,9 @@ async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
     let outcome = async {
         // QA roda na branch principal, em clone próprio (evidência e bug.md
         // vão para ela, não para a branch de desenvolvimento).
-        let workspace = if item.kind == QueueKind::Qa {
+        let workspace = if item.kind == QueueKind::Flow {
+            spec_wave_agent::runner::ensure_main_workspace(&cfg, issue, false).await?
+        } else if item.kind == QueueKind::Qa {
             ensure_qa_workspace(&cfg, issue).await?
         } else {
             ensure_workspace(&cfg, issue).await?
@@ -949,7 +970,7 @@ async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
         // Revisão de PR não abre PR nem espera CI: caminho próprio.
         let gated = if item.kind == QueueKind::Review {
             run_item_review(&cfg, &workspace, item, lost_rx.clone(), stop_rx, Some(hooks)).await
-        } else if item.kind == QueueKind::Qa {
+        } else if matches!(item.kind, QueueKind::Qa | QueueKind::Flow) {
             // QA não abre PR nem espera CI: a CLI publica relatório, evidência e Bugs.
             spec_wave_agent::runner::run_item_with_tap(
                 &cfg, &workspace.hub, item, lost_rx.clone(), stop_rx, Some(hooks)).await
@@ -987,7 +1008,7 @@ async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
                 }
             }
             leases.release(issue).await?;
-            if item.kind == QueueKind::Qa {
+            if matches!(item.kind, QueueKind::Qa | QueueKind::Flow) {
                 let detalhe = result.as_ref().and_then(|r| r.detalhe.clone());
                 let blocked = result.as_ref().is_some_and(|r| r.status == "blocked");
                 events.outcome(if blocked { "blocked" } else { "succeeded" }, detalhe.as_deref(), &[]);
@@ -1003,7 +1024,7 @@ async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
             // Revisão de PR não deixa checkpoint: é uma rodada só (ninguém
             // retoma o WIP) e o clone pode estar na branch do PR — um commit
             // "wip" ali empurraria edição pela metade para o PR em revisão.
-            if !matches!(item.kind, QueueKind::Review | QueueKind::Qa) {
+            if !matches!(item.kind, QueueKind::Review | QueueKind::Qa | QueueKind::Flow) {
                 checkpoint_all(&workspace, issue, "failed").await;
             }
             leases.release(issue).await?;
@@ -1017,9 +1038,9 @@ async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
                 events.outcome("canceled", Some("revisão interrompida pelo spec-wave: nada foi pushado"), &[]);
                 return Ok(());
             }
-            if item.kind == QueueKind::Qa {
+            if matches!(item.kind, QueueKind::Qa | QueueKind::Flow) {
                 leases.release(issue).await?;
-                events.outcome("canceled", Some("QA interrompido pelo spec-wave"), &[]);
+                events.outcome("canceled", Some("etapa interrompida pelo spec-wave"), &[]);
                 return Ok(());
             }
             checkpoint_all(&workspace, issue, "interrupted").await;

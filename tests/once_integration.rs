@@ -457,3 +457,90 @@ fn once_qa_inconclusivo_termina_blocked_e_sem_desfecho_falha() {
     assert_eq!(last["state"], "failed");
     assert!(last["reason"].as_str().unwrap().contains("sem desfecho"), "{last:?}");
 }
+
+/// Etapa do fluxo na frota: o `flow_command` é um stub que registra branch e
+/// argumentos e sai com o código pedido.
+fn setup_flow(tmp: &TempDir, exit_code: i32) -> (PathBuf, String, PathBuf) {
+    let (cfg, path, workdir) = setup(tmp, "echo 'feature_command não deveria rodar' >&2; exit 1");
+    exe(&tmp.path().join("step.sh"), &format!(r#"echo "branch=$(git rev-parse --abbrev-ref HEAD) args=$*" > {log}
+exit {exit_code}"#, log = tmp.path().join("step.log").display()));
+    let mut toml = std::fs::read_to_string(&cfg).unwrap();
+    toml.push_str(&format!("\n        flow_command = \"{} {{step}} --issue {{issue}}\"\n",
+                           tmp.path().join("step.sh").display()));
+    std::fs::write(&cfg, toml).unwrap();
+    (cfg, path, workdir)
+}
+
+#[test]
+fn once_flow_roda_a_etapa_na_branch_principal() {
+    let tmp = TempDir::new().unwrap();
+    let (cfg, path, workdir) = setup_flow(&tmp, 0);
+    let out = once(&tmp, &cfg, &path, &workdir).env("SPECWAVE_KIND", "flow:spec").output().unwrap();
+    assert!(out.status.success(), "exit {:?}", out.status);
+    let evs = events(&out.stdout);
+    let last = evs.last().unwrap();
+    assert_eq!(last["state"], "succeeded", "eventos: {evs:?}");
+    assert_eq!(last["reason"], "etapa concluída");
+    let log = std::fs::read_to_string(tmp.path().join("step.log")).unwrap();
+    assert!(log.contains("branch=main"), "{log}");
+    assert!(log.contains("args=spec --issue 42"), "{log}");
+    // Etapa do fluxo não cria a branch de desenvolvimento nem abre PR.
+    let refs = Command::new("git").args(["branch", "--list", "agent/issue-42"])
+        .current_dir(tmp.path().join("origin.git")).output().unwrap();
+    assert!(String::from_utf8_lossy(&refs.stdout).trim().is_empty());
+}
+
+#[test]
+fn once_flow_recusa_do_fluxo_e_falha() {
+    let tmp = TempDir::new().unwrap();
+    let (cfg, path, workdir) = setup_flow(&tmp, 2);
+    let out = once(&tmp, &cfg, &path, &workdir).env("SPECWAVE_KIND", "flow:validate").output().unwrap();
+    let last = events(&out.stdout).last().unwrap().clone();
+    assert_eq!(last["state"], "succeeded", "{last:?}");
+    assert!(last["reason"].as_str().unwrap().contains("recusa do fluxo"));
+
+    let tmp = TempDir::new().unwrap();
+    let (cfg, path, workdir) = setup_flow(&tmp, 1);
+    let out = once(&tmp, &cfg, &path, &workdir).env("SPECWAVE_KIND", "flow:plan").output().unwrap();
+    let last = events(&out.stdout).last().unwrap().clone();
+    assert_eq!(last["state"], "failed", "{last:?}");
+    assert_eq!(last["reason"], "exit code 1");
+}
+
+#[test]
+fn once_flow_com_etapa_invalida_e_recusado() {
+    let tmp = TempDir::new().unwrap();
+    let (cfg, path, workdir) = setup_flow(&tmp, 0);
+    for kind in ["flow:", "flow:Spec", "flow:spec;rm -rf", "flow:--help"] {
+        let out = once(&tmp, &cfg, &path, &workdir).env("SPECWAVE_KIND", kind).output().unwrap();
+        let last = events(&out.stdout).last().unwrap().clone();
+        assert_eq!(last["state"], "failed", "{kind}: {last:?}");
+        assert!(last["reason"].as_str().unwrap().contains("SPECWAVE_KIND desconhecido"), "{kind}");
+    }
+    assert!(!tmp.path().join("step.log").exists(), "nada pode rodar com kind inválido");
+}
+
+#[test]
+fn once_flow_nao_prepara_os_repos_de_codigo_nem_disputa_o_lease_do_dev() {
+    let tmp = TempDir::new().unwrap();
+    // O npx (a CLI) registra cada chamada: a etapa não pode rodar o
+    // `workspace prepare` do agente (que criaria agent/issue-<n> nos repos).
+    let log = tmp.path().join("npx.log");
+    let (cfg, path, workdir) = setup_with(&tmp, "exit 1",
+        &format!("echo \"$*\" >> {}\necho 10.0.0", log.display()), true);
+    exe(&tmp.path().join("step.sh"), "exit 0");
+    let mut toml = std::fs::read_to_string(&cfg).unwrap();
+    toml.push_str(&format!("\n        flow_command = \"{} {{step}} --issue {{issue}}\"\n",
+                           tmp.path().join("step.sh").display()));
+    std::fs::write(&cfg, toml).unwrap();
+    // Um agente de dev segura o lease da issue 42 (ref no namespace padrão).
+    sh(tmp.path(), &format!(
+        "cd seed && git push -q {o} HEAD:refs/heads/spec-wave-agent/claims/42",
+        o = tmp.path().join("origin.git").display()));
+
+    let out = once(&tmp, &cfg, &path, &workdir).env("SPECWAVE_KIND", "flow:spec").output().unwrap();
+    let last = events(&out.stdout).last().unwrap().clone();
+    assert_eq!(last["state"], "succeeded", "{last:?}");
+    let chamadas = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(!chamadas.contains("workspace prepare"), "a etapa preparou os repos de código: {chamadas}");
+}
