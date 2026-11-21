@@ -66,7 +66,7 @@ pub async fn ensure_workspace(cfg: &Config, issue: u64) -> Result<Workspace> {
 /// checkpoint faz `git add -A` — num repositório cujo `.gitignore` não os
 /// cobre, eles iam parar no PR (achado no MVP da frota, RFC-008 fase 7: +1.6k
 /// linhas de contexto no PR de uma Feature de 34 linhas).
-const SCRATCH_EXCLUDES: &[&str] = &[".spec-wave/cache/", ".spec-wave/implement-*.md"];
+const SCRATCH_EXCLUDES: &[&str] = &[".spec-wave/cache/", ".spec-wave/implement-*.md", ".spec-wave-agent-qa.json"];
 
 /// Acrescenta os padrões ao `.git/info/exclude` do clone — local, não mexe no
 /// repositório de ninguém. Idempotente.
@@ -97,6 +97,94 @@ fn exclude_scratch(dir: &Path) {
 /// senão cria a partir do default e empurra na hora — mesma lógica pro hub e
 /// pra cada repositório de código (extraída daqui, ver `ensure_workspace` e
 /// `prepare_code_repos`).
+/// Clone do hub para a EXECUÇÃO DE QA (`QueueKind::Qa`): na branch principal,
+/// em diretório próprio (`qa-<n>`). O `spec-wave qa` commita evidência e
+/// `bug.md` e faz push na branch atual — na `agent/issue-<n>` do
+/// desenvolvimento isso iria parar num PR (ou numa branch já mergeada).
+pub async fn ensure_qa_workspace(cfg: &Config, issue: u64) -> Result<Workspace> {
+    let ws = PathBuf::from(&cfg.workdir).join(format!("qa-{issue}"));
+    let url = cfg.remote_url();
+    if !ws.join(".git").exists() {
+        std::fs::create_dir_all(ws.parent().unwrap())?;
+        retry_backoff("clone do workspace de QA", 3, Duration::from_secs(2), || {
+            let url = url.clone();
+            let ws = ws.clone();
+            async move {
+                run_ok(Path::new("."), "git",
+                       &["clone", "--quiet", &url, ws.to_str().unwrap()]).await
+            }
+        }).await?;
+    } else {
+        retry_backoff("fetch do workspace de QA", 3, Duration::from_secs(2), || {
+            let ws = ws.clone();
+            async move { run_ok(&ws, "git", &["fetch", "--quiet", "origin"]).await }
+        }).await?;
+    }
+    let head = run_ok(&ws, "git", &["symbolic-ref", "refs/remotes/origin/HEAD", "--short"]).await
+        .map(|o| o.trim().to_string())
+        .unwrap_or_else(|_| "origin/main".into());
+    let branch = head.strip_prefix("origin/").unwrap_or(&head).to_string();
+    run_ok(&ws, "git", &["checkout", "--quiet", "-B", &branch, &head]).await?;
+    run_ok(&ws, "git", &["reset", "--quiet", "--hard", &head]).await?;
+    exclude_scratch(&ws);
+    let code_repos = prepare_code_repos(&ws, issue, &cfg.cli()).await?;
+    Ok(Workspace { hub: ws, code_repos })
+}
+
+/// O hub define o executor de QA (`qa.command` no `.spec-wave.json`)?
+fn hub_has_qa_command(ws: &Path) -> bool {
+    std::fs::read_to_string(ws.join(".spec-wave.json")).ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.get("qa")?.get("command")?.as_str().map(|c| !c.trim().is_empty()))
+        .unwrap_or(false)
+}
+
+/// Desfecho de uma execução de QA a partir do JSON do `--outcome-file`
+/// (função PURA). O exit code do `spec-wave qa` não serve: reprova,
+/// inconclusivo e falha do executor saem todos com 1.
+///   pass / skipped / fail → Success "ok" (o QA terminou; na reprova a CLI já
+///                           abriu os Bugs)
+///   blocked / not-configured / refused → Success "blocked" (portão humano)
+///   error / ausente → Failed (a frota tenta de novo)
+fn qa_round_end(raw: Option<&str>, process: &str) -> RoundEnd {
+    let Some(v) = raw.and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok()) else {
+        return RoundEnd::Failed(format!("o spec-wave qa terminou sem desfecho ({process})"));
+    };
+    let outcome = v.get("outcome").and_then(|o| o.as_str()).unwrap_or("");
+    let reason = v.get("reason").and_then(|r| r.as_str()).map(str::to_string);
+    let nums = |key: &str| -> Vec<String> {
+        v.get(key).and_then(|a| a.as_array()).map(|a| a.iter()
+            .filter_map(|n| n.as_u64().map(|n| format!("#{n}")).or_else(|| n.as_str().map(|s| format!("#{s}"))))
+            .collect()).unwrap_or_default()
+    };
+    let result = |status: &str, detalhe: String| RoundEnd::Success(Some(ExecResult {
+        status: status.into(), detalhe: Some(detalhe), causa_raiz: None, fix: None,
+        teste_regressao: None, arquivos: None, prs: None,
+    }));
+    match outcome {
+        "pass" => {
+            let pend = nums("pending");
+            if !pend.is_empty() {
+                result("blocked", format!("QA verde no que rodou, mas cenário(s) {} ainda pendente(s)", pend.join(", ")))
+            } else if v.get("blockedByBugs").and_then(|b| b.as_bool()).unwrap_or(false) {
+                result("ok", "QA verde; Bug aberto ainda segura a Story".into())
+            } else {
+                result("ok", "QA verde".into())
+            }
+        }
+        "skipped" => result("ok", "nada a testar (item já passou de QA)".into()),
+        "fail" => {
+            let bugs = nums("bugs");
+            result("ok", if bugs.is_empty() { "QA reprovou".into() }
+                         else { format!("QA reprovou: Bug(s) {}", bugs.join(", ")) })
+        }
+        "blocked" => result("blocked", "QA inconclusivo: cenário(s) bloqueado(s), nada foi movido".into()),
+        "not-configured" | "refused" =>
+            result("blocked", reason.unwrap_or_else(|| format!("QA recusado ({outcome})"))),
+        _ => RoundEnd::Failed(reason.unwrap_or_else(|| format!("QA terminou em erro ({outcome})"))),
+    }
+}
+
 async fn ensure_branch(dir: &Path, issue: u64) -> Result<()> {
     let branch = work_branch(issue);
     let remote = run(dir, "git",
@@ -716,6 +804,9 @@ async fn executor_round(
             (&cfg.feature_command, &cfg.feature_prompt, cfg.implement_timeout_secs),
         QueueKind::Review =>
             (&cfg.review_command, &cfg.review_prompt, cfg.review_timeout_secs),
+        // QA: a CLI conduz tudo (o executor dos cenários é chamado por ela);
+        // nada entra no stdin.
+        QueueKind::Qa => (&cfg.qa_command, &cfg.qa_command, cfg.qa_timeout_secs),
     };
     // Frota: MCP configurável (SPECWAVE_MCP_CONFIG / SPECWAVE_MCP_ALLOWED_TOOLS).
     // Sem as envs o argv fica idêntico; nada do conteúdo é logado.
@@ -723,7 +814,16 @@ async fn executor_round(
         &cfg.render(command, issue))?);
     // O extra (contexto de CI reprovado) entra DEPOIS do render: log de CI é
     // texto alheio, e um "{issue}" dentro dele não é placeholder.
-    let mut prompt = cfg.render(prompt_tpl, issue);
+    let mut argv = argv;
+    if item.kind == QueueKind::Qa {
+        // Reteste de cenários específicos (ciclo de Bugs): o sandbox manda a
+        // lista em SPECWAVE_QA_ONLY.
+        if let Some(only) = std::env::var("SPECWAVE_QA_ONLY").ok().filter(|o| !o.trim().is_empty()) {
+            argv.extend(["--only".to_string(), only.trim().to_string()]);
+        }
+        let _ = std::fs::remove_file(ws.join(crate::config::QA_OUTCOME_FILE));
+    }
+    let mut prompt = if item.kind == QueueKind::Qa { String::new() } else { cfg.render(prompt_tpl, issue) };
     if let Some(extra) = extra_prompt {
         prompt.push_str(extra);
     }
@@ -742,6 +842,12 @@ async fn executor_round(
     // A CLI que conduz o fluxo (config::detect_cli): o `spec-wave implement`
     // a repete nas instruções do agente interno, que também roda no clone.
     cmd.env("SPEC_WAVE_CLI", cfg.cli());
+    if item.kind == QueueKind::Qa
+        && std::env::var("SPEC_WAVE_QA_CMD").map(|c| c.trim().is_empty()).unwrap_or(true)
+        && !hub_has_qa_command(ws)
+    {
+        cmd.env("SPEC_WAVE_QA_CMD", &cfg.qa_executor);
+    }
     #[cfg(unix)]
     cmd.process_group(0); // líder de grupo => kill_tree pega a árvore toda
     let mut child = cmd.spawn()
@@ -797,6 +903,18 @@ async fn executor_round(
     // Drena o resto do output (após kill/exit os pipes fecham em EOF).
     for t in [out_task, err_task].into_iter().flatten() {
         let _ = timeout(TokioDuration::from_secs(2), t).await;
+    }
+
+    if item.kind == QueueKind::Qa {
+        let outcome_path = ws.join(crate::config::QA_OUTCOME_FILE);
+        let raw = std::fs::read_to_string(&outcome_path).ok();
+        let _ = std::fs::remove_file(&outcome_path);
+        return Ok(match end {
+            RoundRaw::LeaseLost => RoundEnd::LeaseLost,
+            RoundRaw::Interrupted => RoundEnd::Interrupted,
+            RoundRaw::Success => qa_round_end(raw.as_deref(), "exit 0"),
+            RoundRaw::Failed(r) => qa_round_end(raw.as_deref(), &r),
+        });
     }
 
     // Exit 0 só vale como sucesso com o marker "ok" do executor; sem
@@ -882,7 +1000,7 @@ async fn run_rounds(
                 // Numa revisão o HEAD do hub não mede progresso: o trabalho é
                 // comentar no PR e commitar na branch dele, muitas vezes num
                 // clone de `.spec-wave/repos/`. O teto de rodadas ainda vale.
-                let progressed = item.kind == QueueKind::Review
+                let progressed = matches!(item.kind, QueueKind::Review | QueueKind::Qa)
                     || head_sha(ws).await != head_before;
                 if progressed {
                     no_progress = 0;
@@ -1089,6 +1207,46 @@ pub async fn run_item_gated(
 
 #[cfg(test)]
 mod tests {
+    fn qa(raw: Option<&str>) -> (String, String) {
+        match super::qa_round_end(raw, "exit code 1") {
+            super::RoundEnd::Success(Some(r)) => (r.status, r.detalhe.unwrap_or_default()),
+            super::RoundEnd::Failed(r) => ("failed".into(), r),
+            _ => ("outro".into(), String::new()),
+        }
+    }
+
+    #[test]
+    fn qa_desfecho_pelo_arquivo_e_nao_pelo_exit_code() {
+        assert_eq!(qa(Some(r#"{"outcome":"pass","bugs":[],"pending":[]}"#)),
+                   ("ok".into(), "QA verde".into()));
+        // Reprova: o QA TERMINOU (os Bugs já foram abertos) — não é falha da frota.
+        assert_eq!(qa(Some(r#"{"outcome":"fail","bugs":[91,"92"]}"#)),
+                   ("ok".into(), "QA reprovou: Bug(s) #91, #92".into()));
+        assert_eq!(qa(Some(r#"{"outcome":"blocked"}"#)).0, "blocked");
+        assert_eq!(qa(Some(r#"{"outcome":"pass","pending":[3]}"#)).0, "blocked");
+        assert_eq!(qa(Some(r#"{"outcome":"not-configured","reason":"sem executor"}"#)),
+                   ("blocked".into(), "sem executor".into()));
+        assert_eq!(qa(Some(r#"{"outcome":"refused","reason":"sem qa-ready"}"#)).0, "blocked");
+        assert_eq!(qa(Some(r#"{"outcome":"skipped"}"#)).0, "ok");
+        assert_eq!(qa(Some(r#"{"outcome":"error","reason":"boom"}"#)), ("failed".into(), "boom".into()));
+        let (s, r) = qa(None);
+        assert_eq!(s, "failed");
+        assert!(r.contains("sem desfecho"), "{r}");
+        assert_eq!(qa(Some("não é json")).0, "failed");
+    }
+
+    #[test]
+    fn hub_com_e_sem_qa_command() {
+        let dir = std::env::temp_dir().join(format!("swa-qa-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!super::hub_has_qa_command(&dir));
+        std::fs::write(dir.join(".spec-wave.json"), r#"{"qa":{"command":"run-qa {contextFile}"}}"#).unwrap();
+        assert!(super::hub_has_qa_command(&dir));
+        std::fs::write(dir.join(".spec-wave.json"), r#"{"qa":{"command":"  "}}"#).unwrap();
+        assert!(!super::hub_has_qa_command(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn review_prs_so_urls_sem_repeticao() {
         let r: ExecResult = serde_json::from_str(

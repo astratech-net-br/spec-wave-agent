@@ -401,3 +401,59 @@ exit 1"#);
     assert_eq!(String::from_utf8_lossy(&log.stdout).trim(),
                format!("cli={}", tmp.path().join("bin/spec-wave").display()));
 }
+
+/// Setup da execução de QA: o `qa_command` é um stub que registra branch,
+/// argumentos e o SPEC_WAVE_QA_CMD recebido, e grava o desfecho pedido.
+fn setup_qa(tmp: &TempDir, outcome: &str) -> (PathBuf, String, PathBuf) {
+    let (cfg, path, workdir) = setup(tmp, "echo 'feature_command não deveria rodar' >&2; exit 1");
+    exe(&tmp.path().join("qa.sh"), &format!(r#"set -eu
+echo "branch=$(git rev-parse --abbrev-ref HEAD) args=$* cmd=${{SPEC_WAVE_QA_CMD:-}}" > {log}
+echo '{outcome}' > .spec-wave-agent-qa.json
+exit 1"#, log = tmp.path().join("qa.log").display()));
+    let mut toml = std::fs::read_to_string(&cfg).unwrap();
+    toml.push_str(&format!(
+        "\n        qa_command = \"{} {{issue}} --outcome-file .spec-wave-agent-qa.json\"\n        qa_executor = \"meu-executor {{contextFile}}\"\n",
+        tmp.path().join("qa.sh").display()));
+    std::fs::write(&cfg, toml).unwrap();
+    (cfg, path, workdir)
+}
+
+#[test]
+fn once_qa_reprovado_e_desfecho_do_qa_nao_falha_da_frota() {
+    let tmp = TempDir::new().unwrap();
+    // Exit 1 do `spec-wave qa` (reprova) com o desfecho no arquivo: o QA terminou.
+    let (cfg, path, workdir) = setup_qa(&tmp, r#"{"outcome":"fail","bugs":[91]}"#);
+    let out = once(&tmp, &cfg, &path, &workdir)
+        .env("SPECWAVE_KIND", "qa").env("SPECWAVE_QA_ONLY", "2,3").env_remove("SPEC_WAVE_QA_CMD")
+        .output().unwrap();
+    assert!(out.status.success(), "exit {:?}", out.status);
+    let evs = events(&out.stdout);
+    let last = evs.last().unwrap();
+    assert_eq!(last["state"], "succeeded", "eventos: {evs:?}");
+    assert_eq!(last["reason"], "QA reprovou: Bug(s) #91");
+    // Na branch principal (não na agent/issue-42), com --only e o executor
+    // default porque o hub não define qa.command.
+    let log = std::fs::read_to_string(tmp.path().join("qa.log")).unwrap();
+    assert!(log.contains("branch=main"), "{log}");
+    assert!(log.contains("args=42 --outcome-file .spec-wave-agent-qa.json --only 2,3"), "{log}");
+    assert!(log.contains("cmd=meu-executor {contextFile}"), "{log}");
+    // QA não cria a branch de desenvolvimento.
+    let refs = Command::new("git").args(["branch", "--list", "agent/issue-42"])
+        .current_dir(tmp.path().join("origin.git")).output().unwrap();
+    assert!(String::from_utf8_lossy(&refs.stdout).trim().is_empty());
+}
+
+#[test]
+fn once_qa_inconclusivo_termina_blocked_e_sem_desfecho_falha() {
+    let tmp = TempDir::new().unwrap();
+    let (cfg, path, workdir) = setup_qa(&tmp, r#"{"outcome":"blocked"}"#);
+    let out = once(&tmp, &cfg, &path, &workdir).env("SPECWAVE_KIND", "qa").output().unwrap();
+    assert_eq!(events(&out.stdout).last().unwrap()["state"], "blocked");
+
+    let tmp = TempDir::new().unwrap();
+    let (cfg, path, workdir) = setup_qa(&tmp, "não é json");
+    let out = once(&tmp, &cfg, &path, &workdir).env("SPECWAVE_KIND", "qa").output().unwrap();
+    let last = events(&out.stdout).last().unwrap().clone();
+    assert_eq!(last["state"], "failed");
+    assert!(last["reason"].as_str().unwrap().contains("sem desfecho"), "{last:?}");
+}
