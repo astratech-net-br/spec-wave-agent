@@ -19,7 +19,9 @@ env:
 
 jobs:
   create:
-    runs-on: ubuntu-latest
+    # RUNS_ON (variável do repo) manda o job para o runner self-hosted da org
+    # enquanto os hospedados estão bloqueados por cobrança.
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '"ubuntu-latest"') }}
     steps:
       - uses: actions/checkout@v4
       - name: Cria a release (idempotente)
@@ -47,15 +49,30 @@ jobs:
           # Mac Intel (x86_64-apple-darwin) fora: runners macos-13 estão em
           # desativação e ficam presos na fila. Quem usar Mac Intel compila do
           # fonte (make build) — ou reative cross-compilando no macos-15.
-    runs-on: ${{ matrix.os }}
+    # Com RUNS_ON, só a perna Linux vai para o self-hosted; macOS e Windows
+    # continuam nos hospedados (sem runner próprio para eles).
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && fromJSON(vars.RUNS_ON || '"ubuntu-latest"') || matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Toolchain Rust
+        if: ${{ !(vars.RUNS_ON && matrix.os == 'ubuntu-latest') }}
         run: rustup target add ${{ matrix.target }}
 
       - name: Build release
+        if: ${{ !(vars.RUNS_ON && matrix.os == 'ubuntu-latest') }}
         run: cargo build --release --target ${{ matrix.target }}
+
+      # No self-hosted o build Linux roda num container bookworm (glibc 2.36):
+      # compilado direto no host sairia preso à glibc dele, mais nova que a da
+      # imagem do Fleet Job (trixie, 2.41) e que a das máquinas dos usuários.
+      - name: Build release (container, self-hosted)
+        if: ${{ vars.RUNS_ON && matrix.os == 'ubuntu-latest' }}
+        run: |
+          docker run --rm -u "$(id -u):$(id -g)" \
+            -e CARGO_HOME=/tmp/cargo -v "$PWD:/src" -w /src \
+            rust:1-bookworm \
+            cargo build --release --target ${{ matrix.target }}
 
       - name: Empacota (binário cru + sha256)
         shell: bash
