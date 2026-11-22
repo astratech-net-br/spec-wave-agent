@@ -29,7 +29,10 @@ jobs:
     # PR de documento (`spec-wave/*`) não é PR de implementação, e aprovar o
     # PR da spec moveria a Feature para QA. A última linha aceita os dois
     # eventos: review aprovada, ou PR fechado COM merge (sem merge não conta).
+    # SPEC_WAVE_FLEET_STEPS (variável do repositório, espelho da configuração do
+    # produto no spec-wave): etapas que rodam na FROTA de agentes — aqui o job é PULADO.
     if: >
+      !contains(format(',{0},', vars.SPEC_WAVE_FLEET_STEPS), ',pr-events,') &&
       !startsWith(github.event.pull_request.head.ref, 'spec-wave/') &&
       (github.event.review.state == 'approved' || github.event.pull_request.merged == true)
     runs-on: ubuntu-latest
@@ -45,7 +48,7 @@ jobs:
           owner="$(jq -r '.hub.owner // ""' .spec-wave.json)"
           name="$(jq -r '.hub.repo // ""' .spec-wave.json)"
           if [ -z "$owner" ] || [ -z "$name" ]; then
-            echo "::error::.spec-wave.json sem hub {owner, repo}. Rode: npx @spec-wave/cli@1.10.0 init --role code --repo ${{ github.repository }} --hub <owner/repo>"
+            echo "::error::.spec-wave.json sem hub {owner, repo}. Rode: npx @spec-wave/cli@1.13.0 init --role code --repo ${{ github.repository }} --hub <owner/repo>"
             exit 1
           fi
           echo "owner=$owner" >> "$GITHUB_OUTPUT"
