@@ -347,6 +347,17 @@ fn d_feature_prompt() -> String {
      independentes; ao final, relate o que falhou.\n\
      \n\
      Regras OBRIGATÓRIAS:\n\
+     - ESCOPO: implemente só o que a Feature #{issue} e as stories dela \
+     pedem. Se uma story pressupõe código que pertence a OUTRA Feature \
+     (módulo, serviço, rota, tipo, tabela, tela — ex.: \"o módulo de X da \
+     FEAT-001\", \"a tela Y\" ou uma Feature listada em `Depende de:` ou no \
+     aviso \"Dependências pendentes\" do contexto) e esse código NÃO existe \
+     no branch, NÃO o crie, nem numa versão mínima: outra Feature vai \
+     entregá-lo e duas versões do mesmo módulo colidem no merge. Trate a \
+     story como BLOQUEADA: não commite nada dela, pule as que dependem \
+     dela e continue as independentes. No marker, use \"partial\" com o \
+     detalhe \"bloqueada: depende de <o que falta> da Feature #<N>, ausente \
+     na base\" para cada story bloqueada.\n\
      - Você roda em RODADAS: se o seu turno terminar sem o marker de \
      conclusão (abaixo), você será REINVOCADO para continuar. Ao iniciar, \
      verifique o que já foi feito (`git log --oneline -20` e \
