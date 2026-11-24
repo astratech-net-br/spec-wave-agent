@@ -49,7 +49,15 @@ pub enum Outcome {
     Failed(String),
     /// O agente desistiu: o card vai para Blocked com o motivo.
     Blocked(String),
+    /// A Story seguinte espera código de outra Feature que ainda não está na
+    /// base (`spec-wave implement` saiu com o registro de bloqueio). Vai como
+    /// `blocked` com `blockedReason: waiting_dependency` e `waitingOn`: quem
+    /// entende retoma sozinho no merge; servidor antigo vê só o Blocked.
+    Waiting { reason: String, waiting_on: Vec<u64> },
 }
+
+/// Motivo estruturado de `Outcome::Waiting` (o mesmo texto do registro da CLI).
+pub const WAITING_DEPENDENCY: &str = "waiting_dependency";
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -60,6 +68,10 @@ struct OutcomeBody<'a> {
     reason: Option<&'a str>,
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     pr_urls: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocked_reason: Option<&'a str>,
+    #[serde(skip_serializing_if = "<[u64]>::is_empty")]
+    waiting_on: &'a [u64],
 }
 
 #[derive(Serialize)]
@@ -87,10 +99,17 @@ pub fn queue_item_of(w: &WorkItem) -> Option<QueueItem> {
 }
 
 fn outcome_body<'a>(run_id: &'a str, outcome: &'a Outcome) -> OutcomeBody<'a> {
+    let base = |outcome, reason, pr_urls| OutcomeBody {
+        run_id, outcome, reason, pr_urls, blocked_reason: None, waiting_on: &[],
+    };
     match outcome {
-        Outcome::Succeeded(prs) => OutcomeBody { run_id, outcome: "succeeded", reason: None, pr_urls: prs },
-        Outcome::Failed(r) => OutcomeBody { run_id, outcome: "failed", reason: Some(r), pr_urls: &[] },
-        Outcome::Blocked(r) => OutcomeBody { run_id, outcome: "blocked", reason: Some(r), pr_urls: &[] },
+        Outcome::Succeeded(prs) => base("succeeded", None, prs),
+        Outcome::Failed(r) => base("failed", Some(r), &[]),
+        Outcome::Blocked(r) => base("blocked", Some(r), &[]),
+        Outcome::Waiting { reason, waiting_on } => OutcomeBody {
+            blocked_reason: Some(WAITING_DEPENDENCY), waiting_on,
+            ..base("blocked", Some(reason), &[])
+        },
     }
 }
 
@@ -234,6 +253,11 @@ mod tests {
                                            "prUrls": ["https://github.com/acme/hub/pull/9"] }));
         let bl = serde_json::to_value(outcome_body("R1", &Outcome::Blocked("3 falhas".into()))).unwrap();
         assert_eq!(bl, serde_json::json!({ "runId": "R1", "outcome": "blocked", "reason": "3 falhas" }));
+        let w = serde_json::to_value(outcome_body("R1", &Outcome::Waiting {
+            reason: "aguarda #12".into(), waiting_on: vec![12, 15] })).unwrap();
+        assert_eq!(w, serde_json::json!({
+            "runId": "R1", "outcome": "blocked", "reason": "aguarda #12",
+            "blockedReason": "waiting_dependency", "waitingOn": [12, 15] }));
     }
 
     #[test]

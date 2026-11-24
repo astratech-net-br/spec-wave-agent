@@ -528,7 +528,97 @@ pub async fn checkpoint(ws: &Path, issue: u64, label: &str) {
 }
 
 #[derive(Debug)]
-pub enum RunEnd { Success(Option<ExecResult>), Failed(String), LeaseLost, Interrupted }
+pub enum RunEnd {
+    Success(Option<ExecResult>),
+    Failed(String),
+    /// O `spec-wave implement` recusou começar uma Story cuja dependência ainda
+    /// não tem código na base (registro `blocked.json`). NÃO é falha: o
+    /// trabalho espera o merge de outra Feature e retoma depois.
+    Blocked(BlockedRecord),
+    LeaseLost,
+    Interrupted,
+}
+
+/// Registro que o `spec-wave implement` (≥ 1.15) grava em
+/// `<git-dir>/spec-wave/blocked.json` quando uma Story espera dependência.
+///
+/// Fica dentro do `.git` (fora da árvore): um `git add -A` do executor não o
+/// commita, e o agente o lê sem depender do que o modelo escreveu no marker.
+pub const BLOCKED_RECORD_REL: &str = "spec-wave/blocked.json";
+/// Única versão do formato que este agente entende.
+pub const BLOCKED_RECORD_VERSION: u64 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockedStory {
+    pub story: u64,
+    #[serde(default)]
+    pub waiting_on: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockedRecord {
+    pub version: u64,
+    #[serde(default)]
+    pub issue: Option<u64>,
+    /// Hoje só `waiting_dependency`.
+    pub reason: String,
+    #[serde(default)]
+    pub waiting_on: Vec<u64>,
+    #[serde(default)]
+    pub blocked: Vec<BlockedStory>,
+    /// Quantas Stories ainda puderam rodar antes do corte.
+    #[serde(default)]
+    pub runnable: u64,
+}
+
+impl BlockedRecord {
+    /// Motivo legível para o desfecho (issue, tela, log).
+    pub fn describe(&self) -> String {
+        let deps = |v: &[u64]| v.iter().map(|n| format!("#{n}")).collect::<Vec<_>>().join(", ");
+        let stories: Vec<String> = self.blocked.iter()
+            .map(|b| format!("Story #{} aguarda {}", b.story, deps(&b.waiting_on)))
+            .collect();
+        let base = if stories.is_empty() {
+            format!("aguardando {}", deps(&self.waiting_on))
+        } else {
+            stories.join("; ")
+        };
+        format!("bloqueada por dependência: {base} — o código ainda não está na base")
+    }
+}
+
+/// Interpreta o conteúdo de `blocked.json` (função PURA). Versão desconhecida
+/// ou JSON inválido = `None`: um registro que o agente não entende não pode
+/// virar bloqueio (o run seguiria preso sem motivo verificável).
+pub fn parse_blocked_record(raw: &str) -> Option<BlockedRecord> {
+    let r: BlockedRecord = serde_json::from_str(raw.trim()).ok()?;
+    (r.version == BLOCKED_RECORD_VERSION && !r.reason.trim().is_empty()).then_some(r)
+}
+
+/// Caminho do registro no clone (respeita worktree, onde `.git` é arquivo).
+async fn blocked_record_path(ws: &Path) -> Option<PathBuf> {
+    let git_dir = run(ws, "git", &["rev-parse", "--absolute-git-dir"]).await.ok()
+        .map(|o| o.stdout.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| Some(ws.join(".git")).filter(|d| d.is_dir()))?;
+    Some(git_dir.join(BLOCKED_RECORD_REL))
+}
+
+/// Lê e REMOVE o registro de bloqueio (um registro velho faria a próxima
+/// rodada reportar um bloqueio que já destravou).
+async fn take_blocked_record(ws: &Path) -> Option<BlockedRecord> {
+    let path = blocked_record_path(ws).await?;
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    let rec = parse_blocked_record(&raw);
+    if rec.is_none() {
+        warn!(target: "agent", "registro de bloqueio ignorado: formato desconhecido em {}", path.display());
+    }
+    rec
+}
 
 /// Marker que o executor escreve ao final (ver feature_prompt): exit 0 sem
 /// marker "ok" NÃO é sucesso — pega orquestrador que encerrou prematuramente
@@ -817,7 +907,10 @@ async fn kill_tree(child: &mut tokio::process::Child, tree: &ProcessTree) {
 enum RoundRaw { Success, Failed(String), LeaseLost, Interrupted }
 
 /// Desfecho de UMA rodada do executor, já com o marker aplicado.
-enum RoundEnd { Success(Option<ExecResult>), Incomplete, Failed(String), LeaseLost, Interrupted }
+enum RoundEnd {
+    Success(Option<ExecResult>), Incomplete, Failed(String), Blocked(BlockedRecord),
+    LeaseLost, Interrupted,
+}
 
 /// Roda UMA rodada do executor da feature (Claude Code orquestrador): o
 /// comando vem de `cfg.feature_command` e o prompt entra via STDIN.
@@ -857,6 +950,11 @@ async fn executor_round(
             argv.extend(["--only".to_string(), only.trim().to_string()]);
         }
         let _ = std::fs::remove_file(ws.join(crate::config::QA_OUTCOME_FILE));
+    }
+    // Feature/Bug: o registro de bloqueio desta rodada é o único que vale.
+    let reads_blocked = matches!(item.kind, QueueKind::Feature | QueueKind::Bug);
+    if reads_blocked {
+        let _ = take_blocked_record(ws).await;
     }
     let mut prompt = if matches!(item.kind, QueueKind::Qa | QueueKind::Flow) {
         String::new()
@@ -959,6 +1057,17 @@ async fn executor_round(
         });
     }
 
+    // Bloqueio por dependência vence o marker e o exit code: o executor pode
+    // ter escrito "partial" (ou nada, ou saído com erro ao ver o exit 3 do
+    // implement) — o registro da CLI é a fonte determinística.
+    if reads_blocked && matches!(end, RoundRaw::Success | RoundRaw::Failed(_)) {
+        if let Some(rec) = take_blocked_record(ws).await {
+            let _ = take_result_marker(ws);
+            info!(target: "agent", "#{issue}: {}", rec.describe());
+            return Ok(RoundEnd::Blocked(rec));
+        }
+    }
+
     // Exit 0 só vale como sucesso com o marker "ok" do executor; sem
     // marker é "rodada incompleta" (o run_feature relança para continuar).
     let end = match end {
@@ -1036,6 +1145,7 @@ async fn run_rounds(
         match end {
             RoundEnd::Success(r) => return Ok(RunEnd::Success(r)),
             RoundEnd::Failed(r) => return Ok(RunEnd::Failed(r)),
+            RoundEnd::Blocked(b) => return Ok(RunEnd::Blocked(b)),
             RoundEnd::LeaseLost => return Ok(RunEnd::LeaseLost),
             RoundEnd::Interrupted => return Ok(RunEnd::Interrupted),
             RoundEnd::Incomplete => {
@@ -1171,6 +1281,12 @@ pub async fn run_item_gated(
                              live.clone(), extra.as_deref()).await?;
         match end {
             RunEnd::Success(r) => if kept.is_none() { kept = r; },
+            RunEnd::Blocked(b) => {
+                // O que já foi feito fica no branch para a retomada; PR NÃO:
+                // abrir PR leva a Feature para Code Review pela metade.
+                checkpoint_all(workspace, issue, "blocked").await;
+                return Ok(Gated { end: RunEnd::Blocked(b), prs: urls });
+            }
             other => return Ok(Gated { end: other, prs: urls }),
         }
         // Cinto de segurança: garante push de qualquer resto que o executor
@@ -1288,6 +1404,28 @@ mod tests {
         assert!(st(super::RoundRaw::Failed("exit code 2".into())).starts_with("ok:etapa concluída com recusa"));
         assert_eq!(st(super::RoundRaw::Failed("exit code 1".into())), "failed:exit code 1");
         assert_eq!(st(super::RoundRaw::Failed("timeout de 60s".into())), "failed:timeout de 60s");
+    }
+
+    #[test]
+    fn registro_de_bloqueio_v1_e_lido_e_descrito() {
+        let r = parse_blocked_record(r#"{"version":1,"issue":40,"reason":"waiting_dependency",
+            "waitingOn":[12,15],"blocked":[{"story":41,"waitingOn":[12,15]}],"runnable":2,
+            "at":"2026-11-24T00:00:00Z"}"#).expect("v1 válido");
+        assert_eq!(r.waiting_on, vec![12, 15]);
+        assert_eq!(r.runnable, 2);
+        assert_eq!(r.blocked, vec![BlockedStory { story: 41, waiting_on: vec![12, 15] }]);
+        assert_eq!(r.describe(),
+            "bloqueada por dependência: Story #41 aguarda #12, #15 — o código ainda não está na base");
+    }
+
+    #[test]
+    fn registro_de_bloqueio_desconhecido_nao_bloqueia() {
+        assert!(parse_blocked_record(r#"{"version":2,"reason":"waiting_dependency"}"#).is_none());
+        assert!(parse_blocked_record(r#"{"version":1,"reason":" "}"#).is_none());
+        assert!(parse_blocked_record("não é json").is_none());
+        // Campos opcionais ausentes: ainda é bloqueio, com descrição genérica.
+        let r = parse_blocked_record(r#"{"version":1,"reason":"waiting_dependency","waitingOn":[9]}"#).unwrap();
+        assert_eq!(r.describe(), "bloqueada por dependência: aguardando #9 — o código ainda não está na base");
     }
 
     #[test]

@@ -344,6 +344,25 @@ async fn process_issue(
             failed = true;
             warn!(target: "agent", "{que} #{issue} falhou: {reason}");
         }
+        RunEnd::Blocked(rec) => {
+            // Espera por outra Feature NÃO é falha: não entra na contagem de
+            // `max_failures_per_issue` (desistir de quem só espera um merge
+            // tiraria da fila trabalho que vai destravar sozinho). O branch já
+            // tem o checkpoint do que rodou (run_item_gated).
+            let motivo = rec.describe();
+            if api.is_some() {
+                report(api, Outcome::Waiting { reason: motivo.clone(), waiting_on: rec.waiting_on.clone() }).await;
+            } else {
+                let _ = run(ws, "gh",
+                    &["issue", "comment", &issue.to_string(), "--repo", &cfg.repo,
+                      "--body",
+                      &format!("⏸️ Agente `{me}` parou: {motivo}. O que já rodou está \
+                                pushado no branch; a issue continua na fila e é \
+                                retomada depois do merge da dependência.")]).await;
+            }
+            leases.release(issue).await?;
+            info!(target: "agent", "{que} #{issue} {motivo}");
+        }
         RunEnd::Interrupted => {
             // Dev desligando a máquina: checkpoint + release imediato para
             // takeover instantâneo (sem esperar TTL).
@@ -780,6 +799,8 @@ async fn run_api_loop(cfg: &Config, me: &str, sd_rx: watch::Receiver<bool>) -> R
 //       {"event":"line","origin":null|"story:N","line":"<stream-json>"}
 //       {"event":"outcome","state":"succeeded|failed|blocked|canceled|skipped",
 //        "reason":"...","pr_urls":[...]}
+//     `blocked` por dependência (registro do `spec-wave implement`) traz ainda
+//       "blocked_reason":"waiting_dependency","waiting_on":[N,...]
 
 /// Execução recebida do sandbox (env do Fleet Job).
 struct FleetRun {
@@ -1031,6 +1052,16 @@ async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
             // Com o gate o PR pode existir numa execução que falhou (CI
             // vermelho): o desfecho diz qual.
             events.outcome("failed", Some(&reason), &prs);
+        }
+        RunEnd::Blocked(rec) => {
+            // Checkpoint já pushado pelo gate; sem PR (a Feature não vai para
+            // Code Review pela metade). O sandbox repassa motivo e dependências.
+            leases.release(issue).await?;
+            events.emit(serde_json::json!({
+                "event": "outcome", "state": "blocked", "reason": rec.describe(), "pr_urls": prs,
+                "blocked_reason": spec_wave_agent::api::WAITING_DEPENDENCY,
+                "waiting_on": rec.waiting_on,
+            }));
         }
         RunEnd::Interrupted => {
             if item.kind == QueueKind::Review {
