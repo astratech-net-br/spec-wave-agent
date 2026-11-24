@@ -253,9 +253,14 @@ fn d_qa_executor() -> String {
     // A CLI renderiza {contextFile} e roda pelo shell: o prompt vai como
     // argumento. Bash inteiro — o QA sobe a aplicação (qa.setup) e roda
     // Playwright; Edit/Write para os scripts descartáveis e o resultado.
-    "claude -p --permission-mode acceptEdits --allowedTools \"Bash,Edit,Write,Read,Glob,Grep\" \
-     \"Execute o QA descrito em {contextFile}: siga as instruções do arquivo e grave o \
-     resultado exatamente onde e como ele pede.\""
+    //
+    // O prompt vem LOGO depois do `-p`: `--allowedTools` aceita vários
+    // valores, e um prompt depois dele seria lido como mais uma ferramenta
+    // ("was read as a value of --allowedTools, not as a prompt") — o executor
+    // saía com erro sem gravar o resultado e todo QA da frota morria assim.
+    "claude -p \"Execute o QA descrito em {contextFile}: siga as instruções do arquivo e \
+     grave o resultado exatamente onde e como ele pede.\" \
+     --permission-mode acceptEdits --allowedTools \"Bash,Edit,Write,Read,Glob,Grep\""
         .into()
 }
 // Mesmo comando do executor: com `Bash` inteiro, o `gh` de que a revisão
@@ -970,6 +975,18 @@ mod tests {
         assert!(cfg.render(&cfg.feature_prompt, 7).contains("`npx @spec-wave/cli@1.9.0 order 7`"));
         assert!(!cfg.render(&cfg.feature_prompt, 7).contains("{cli}"));
         assert!(!cfg.render(&cfg.bug_prompt, 7).contains("{cli}"));
+    }
+
+    #[test]
+    fn executor_de_qa_passa_o_prompt_antes_das_opcoes_variadicas() {
+        // `--allowedTools` é variádico no `claude`: um prompt depois dele vira
+        // mais uma "ferramenta" e o executor sai sem rodar nada.
+        let cfg = parse(r#"repo = "org/repo""#);
+        let argv = split_command(&cfg.qa_executor).unwrap();
+        assert_eq!(argv[..2], ["claude", "-p"]);
+        assert!(argv[2].starts_with("Execute o QA descrito em {contextFile}"), "{argv:?}");
+        let at = argv.iter().position(|a| a == "--allowedTools").unwrap();
+        assert_eq!(at + 2, argv.len(), "nada depois da lista de ferramentas: {argv:?}");
     }
 
     #[test]
