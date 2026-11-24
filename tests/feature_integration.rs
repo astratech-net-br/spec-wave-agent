@@ -265,3 +265,45 @@ async fn checkpoint_nao_leva_arquivos_de_trabalho_do_cli() {
     assert!(!files.contains(".spec-wave/cache/"), "cache do CLI foi para o branch: {files}");
     assert!(!files.contains("implement-7.md"), "contexto do implement foi para o branch: {files}");
 }
+
+// O `spec-wave implement` grava `.git/spec-wave/blocked.json` e sai com 3
+// quando a Story espera código de outra Feature: a rodada vira Blocked (não
+// Failed), qualquer que seja o exit code ou o marker que o executor deixou.
+#[tokio::test]
+async fn registro_de_bloqueio_vira_blocked_e_nao_falha() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = setup(&tmp, r#"
+        cat > /dev/null
+        mkdir -p "$(git rev-parse --absolute-git-dir)/spec-wave"
+        printf '{"version":1,"issue":41,"reason":"waiting_dependency","waitingOn":[12],"blocked":[{"story":41,"waitingOn":[12]}],"runnable":0}' \
+          > "$(git rev-parse --absolute-git-dir)/spec-wave/blocked.json"
+        printf '{"status": "blocked", "detalhe": "BLOQUEADA"}' > .spec-wave-agent-result.json
+        exit 3
+    "#, 60);
+    let (_lt, lr, _st, sr) = channels();
+    let ws = ensure_workspace(&cfg, 7).await.unwrap();
+    let end = run_item(&cfg, &ws.hub, QueueItem { kind: QueueKind::Feature, number: 7 }, lr, sr).await.unwrap();
+    let RunEnd::Blocked(rec) = end else { panic!("esperava Blocked, veio {end:?}") };
+    assert_eq!(rec.waiting_on, vec![12]);
+    // Registro e marker consumidos: nada sobra para o checkpoint nem para a próxima rodada.
+    assert!(!ws.hub.join(".git/spec-wave/blocked.json").exists());
+    assert!(!ws.hub.join(".spec-wave-agent-result.json").exists());
+}
+
+// Registro velho (de um run anterior no mesmo clone) não bloqueia: a rodada
+// apaga antes de começar e só vale o que o implement desta rodada gravar.
+#[tokio::test]
+async fn registro_de_bloqueio_velho_e_descartado() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = setup(&tmp, r#"
+        cat > /dev/null
+        printf '{"status": "ok"}' > .spec-wave-agent-result.json
+    "#, 60);
+    let (_lt, lr, _st, sr) = channels();
+    let ws = ensure_workspace(&cfg, 7).await.unwrap();
+    std::fs::create_dir_all(ws.hub.join(".git/spec-wave")).unwrap();
+    std::fs::write(ws.hub.join(".git/spec-wave/blocked.json"),
+        r#"{"version":1,"reason":"waiting_dependency","waitingOn":[12]}"#).unwrap();
+    let end = run_item(&cfg, &ws.hub, QueueItem { kind: QueueKind::Feature, number: 7 }, lr, sr).await.unwrap();
+    assert!(matches!(end, RunEnd::Success(_)), "esperava Success, veio {end:?}");
+}

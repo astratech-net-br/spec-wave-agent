@@ -350,6 +350,15 @@ fn d_feature_prompt() -> String {
      e faça push.\n\
      5. Se uma story falhar, pule as que dependem dela e continue as \
      independentes; ao final, relate o que falhou.\n\
+     6. Se `{cli} implement <número>` sair com código 3 e a linha \
+     \"BLOQUEADA: Story #X aguarda #N\", a dependência dela ainda NÃO tem \
+     código na base (outra Feature vai entregá-lo). PARE a Feature ali: não \
+     implemente essa story nem as seguintes da ordem, mesmo as \
+     independentes, e não crie o código que falta. Commite e pushe o que já \
+     estava pronto e escreva o marker {\"status\": \"blocked\", \
+     \"detalhe\": \"<a linha BLOQUEADA>\"}. O agente reporta a espera e a \
+     Feature é retomada depois do merge da dependência — NÃO use \
+     `--ignore-deps`.\n\
      \n\
      Regras OBRIGATÓRIAS:\n\
      - ESCOPO: implemente só o que a Feature #{issue} e as stories dela \
@@ -362,7 +371,8 @@ fn d_feature_prompt() -> String {
      story como BLOQUEADA: não commite nada dela, pule as que dependem \
      dela e continue as independentes. No marker, use \"partial\" com o \
      detalhe \"bloqueada: depende de <o que falta> da Feature #<N>, ausente \
-     na base\" para cada story bloqueada.\n\
+     na base\" para cada story bloqueada. (Quando o próprio \
+     `{cli} implement` acusa o bloqueio — código 3 —, vale o passo 6: pare.)\n\
      - Você roda em RODADAS: se o seu turno terminar sem o marker de \
      conclusão (abaixo), você será REINVOCADO para continuar. Ao iniciar, \
      verifique o que já foi feito (`git log --oneline -20` e \
