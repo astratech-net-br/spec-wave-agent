@@ -309,8 +309,15 @@ fn d_review_prompt() -> String {
      - NUNCA use `git push --force` nem reescreva o histórico da branch do PR.\n\
      - Não mexa em nada fora do diff do PR além do necessário para corrigir um \
      achado. Nada de refatoração de oportunidade.\n\
-     - PR que já tem um comentário começando por `<!-- spec-wave:auto-review -->` \
-     já foi revisado: não revise de novo, só o inclua em `prs`.\n\
+     - PR já revisado é o que tem um comentário começando por \
+     `<!-- spec-wave:auto-review -->` criado DEPOIS do último commit da branch \
+     (compare o `createdAt` do comentário mais novo com o `committedDate` do \
+     último commit: `gh pr view <n> --json comments,commits`): não revise de \
+     novo, só o inclua em `prs`. Se houver commit depois do último \
+     comentário de revisão, o PR mudou e PRECISA de nova revisão: revise os \
+     commits novos (`git diff <sha revisado>..HEAD`; na dúvida, o diff inteiro) \
+     e feche com um NOVO comentário `<!-- spec-wave:auto-review -->` — nunca \
+     edite o antigo.\n\
      - Você roda em RODADAS: se o seu turno terminar sem o marker de \
      conclusão, você será REINVOCADO. Ao iniciar, verifique o que já foi feito \
      (`git log --oneline -20` e os comentários do PR) e continue de onde parou.\n\
@@ -1136,6 +1143,20 @@ mod tests {
         // A CLI que conduz o fluxo é a da máquina (`{cli}`), como nos outros prompts.
         assert!(cfg.review_prompt.contains("{cli} order {issue}"));
         assert!(!cfg.render(&cfg.review_prompt, 7).contains("{cli}"));
+    }
+
+    #[test]
+    fn review_revisa_de_novo_pr_com_commit_depois_da_revisao() {
+        // O codeMerge do SaaS só faz o merge quando a revisão é mais nova que o
+        // último commit; commit novo → pede outra revisão. Se o prompt tratasse
+        // qualquer marker antigo como "já revisado", a nova rodada saía sem
+        // revisar e o PR travava (spec-wave-test#529).
+        let cfg = parse("repo = \"a/b\"");
+        let p = &cfg.review_prompt;
+        assert!(p.contains("DEPOIS do último commit"));
+        assert!(p.contains("PRECISA de nova revisão"));
+        assert!(p.contains("NOVO comentário"));
+        assert!(!p.contains("já foi revisado: não revise de novo"));
     }
 
     #[test]
