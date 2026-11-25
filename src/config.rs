@@ -283,22 +283,34 @@ fn d_review_prompt() -> String {
      NÃO são elegíveis: rascunho (draft), \
      branch `spec-wave/...` (PR de documento) e PR de fork. Se não houver \
      nenhum PR elegível, escreva o marker com `\"prs\": []` e PARE.\n\
-     2. ENTENDER — leia a spec e o plan da Feature (`docs/features/<slug>/`) e \
+     2. CONFLITO COM A BASE — para cada PR elegível, veja \
+     `gh pr view <n> --json mergeable,baseRefName`. Se `mergeable` for \
+     `CONFLICTING`, ANTES de revisar: `gh pr checkout <n>`, `git fetch origin` \
+     e `git merge origin/<baseRefName>` (merge, NUNCA rebase). Resolva cada \
+     conflito preservando as duas intenções: o que já está na base foi \
+     mergeado e vale; o PR aplica a mudança dele por cima. Se a base já traz \
+     a mesma correção do PR, fique com a versão da base. Rode a suíte de \
+     testes, commite o merge (\"merge: resolve conflito com <baseRefName> \
+     (#{issue}) [spec-wave-agent]\") e dê push. Esse commit PEDE revisão: no \
+     passo 4 revise o diff do PR contra a base depois do merge. Conflito que \
+     você não conseguir resolver com segurança: `git merge --abort`, diga no \
+     comentário do passo 6 o que conflita e por quê, e não force.\n\
+     3. ENTENDER — leia a spec e o plan da Feature (`docs/features/<slug>/`) e \
      o diff de cada PR (`gh pr diff <n>`). A régua da revisão é: o código faz \
      o que a spec e o plan pedem, sem defeito e sem quebrar o que existia.\n\
-     3. REVISAR — procure defeitos reais: erro de lógica, requisito da spec não \
+     4. REVISAR — procure defeitos reais: erro de lógica, requisito da spec não \
      atendido ou atendido errado, caso de borda sem tratamento, falha de \
      segurança, teste que não testa o que diz. Não aponte gosto pessoal nem \
      estilo que o projeto já aceita. Publique UM review por PR com os achados: \
      `gh pr review <n> --comment --body \"...\"` — cada achado com arquivo, \
      linha e o porquê. Se não houver achado, o review diz isso em uma linha.\n\
-     4. CORRIGIR — para cada achado que você mesmo apontou, faça a correção na \
+     5. CORRIGIR — para cada achado que você mesmo apontou, faça a correção na \
      branch do PR (`gh pr checkout <n>` no clone daquele repositório). UM \
      commit por correção: \"fix: <o que estava errado> (#{issue}) \
      [spec-wave-agent]\". Rode a suíte de testes do repositório antes de dar \
      push. Achado que você não conseguir corrigir com segurança fica no review \
      como pendente — não force uma correção duvidosa.\n\
-     5. FECHAR — comente em cada PR o resumo final, começando EXATAMENTE por \
+     6. FECHAR — comente em cada PR o resumo final, começando EXATAMENTE por \
      `<!-- spec-wave:auto-review -->` na primeira linha e, na segunda, \
      `head revisado: <sha>` com o sha COMPLETO do HEAD da branch do PR depois \
      das suas correções (`git rev-parse HEAD` após o push); depois, o que foi \
@@ -315,8 +327,9 @@ fn d_review_prompt() -> String {
      - PR já revisado é o que tem um comentário `<!-- spec-wave:auto-review -->` \
      cujo `head revisado:` é o sha atual do HEAD da branch \
      (`gh pr view <n> --json headRefOid,comments`; comentário antigo sem essa \
-     linha: vale se for mais novo que o `committedDate` do último commit): não \
-     revise de novo, só o inclua em `prs`. Se o HEAD mudou desde o último \
+     linha: vale se for mais novo que o `committedDate` do último commit) e \
+     sem conflito com a base: não revise de novo, só o inclua em `prs`. PR \
+     revisado mas em conflito passa pelo passo 2 e ganha nova revisão. Se o HEAD mudou desde o último \
      comentário de revisão, o PR PRECISA de nova revisão: revise só o que \
      entrou depois (`git diff <head revisado>..HEAD`; sem a linha, o diff \
      inteiro) e feche com um NOVO comentário `<!-- spec-wave:auto-review -->` \
@@ -326,7 +339,7 @@ fn d_review_prompt() -> String {
      (`git log --oneline -20` e os comentários do PR) e continue de onde parou. \
      Os seus próprios commits de correção (`[spec-wave-agent]`, desta Feature) \
      e o review que você já publicou nesta execução NÃO pedem nova revisão: \
-     se eles já estão lá, siga para o passo 5 em vez de revisar de novo.\n\
+     se eles já estão lá, siga para o passo 6 em vez de revisar de novo.\n\
      - Processos em background que você deixar ao encerrar o turno são \
      MORTOS. Execute em foreground e aguarde.\n\
      - Ao terminar, volte o clone do hub para a branch em que ele estava e \
@@ -1168,6 +1181,22 @@ mod tests {
         // Retomada em rodadas: as próprias correções não reabrem a revisão.
         assert!(p.contains("NÃO pedem nova revisão"));
         assert!(!p.contains("já foi revisado: não revise de novo"));
+    }
+
+    #[test]
+    fn review_resolve_conflito_com_a_base_antes_de_revisar() {
+        // O codeMerge do SaaS não mergeia PR em conflito (`dirty`) e pede uma
+        // revisão para resolvê-lo (spec-wave-ui#684: PRs de Bug que outro PR
+        // mergeado antes deixou em conflito). Sem este passo a revisão via o PR
+        // "já revisado" e saía sem tocar nele.
+        let cfg = parse("repo = \"a/b\"");
+        let p = &cfg.review_prompt;
+        assert!(p.contains("CONFLICTING"));
+        assert!(p.contains("git merge origin/<baseRefName>"));
+        assert!(p.contains("NUNCA rebase"));
+        assert!(p.contains("git merge --abort"));
+        assert!(p.contains("revisado mas em conflito passa pelo passo 2"));
+        assert!(p.contains("NUNCA use `git push --force`"));
     }
 
     #[test]
