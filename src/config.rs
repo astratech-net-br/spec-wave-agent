@@ -299,9 +299,12 @@ fn d_review_prompt() -> String {
      push. Achado que você não conseguir corrigir com segurança fica no review \
      como pendente — não force uma correção duvidosa.\n\
      5. FECHAR — comente em cada PR o resumo final, começando EXATAMENTE por \
-     `<!-- spec-wave:auto-review -->` na primeira linha: o que foi revisado, \
-     quantos achados, quais foram corrigidos (com o hash do commit) e quais \
-     ficaram pendentes para o humano. Use `gh pr comment <n> --body-file`.\n\
+     `<!-- spec-wave:auto-review -->` na primeira linha e, na segunda, \
+     `head revisado: <sha>` com o sha COMPLETO do HEAD da branch do PR depois \
+     das suas correções (`git rev-parse HEAD` após o push); depois, o que foi \
+     revisado, quantos achados, quais foram corrigidos (com o hash do commit) \
+     e quais ficaram pendentes para o humano. Use \
+     `gh pr comment <n> --body-file`.\n\
      \n\
      Regras OBRIGATÓRIAS:\n\
      - NUNCA aprove (`gh pr review --approve`), NUNCA mergeie, NUNCA feche e \
@@ -309,18 +312,21 @@ fn d_review_prompt() -> String {
      - NUNCA use `git push --force` nem reescreva o histórico da branch do PR.\n\
      - Não mexa em nada fora do diff do PR além do necessário para corrigir um \
      achado. Nada de refatoração de oportunidade.\n\
-     - PR já revisado é o que tem um comentário começando por \
-     `<!-- spec-wave:auto-review -->` criado DEPOIS do último commit da branch \
-     (compare o `createdAt` do comentário mais novo com o `committedDate` do \
-     último commit: `gh pr view <n> --json comments,commits`): não revise de \
-     novo, só o inclua em `prs`. Se houver commit depois do último \
-     comentário de revisão, o PR mudou e PRECISA de nova revisão: revise os \
-     commits novos (`git diff <sha revisado>..HEAD`; na dúvida, o diff inteiro) \
-     e feche com um NOVO comentário `<!-- spec-wave:auto-review -->` — nunca \
-     edite o antigo.\n\
+     - PR já revisado é o que tem um comentário `<!-- spec-wave:auto-review -->` \
+     cujo `head revisado:` é o sha atual do HEAD da branch \
+     (`gh pr view <n> --json headRefOid,comments`; comentário antigo sem essa \
+     linha: vale se for mais novo que o `committedDate` do último commit): não \
+     revise de novo, só o inclua em `prs`. Se o HEAD mudou desde o último \
+     comentário de revisão, o PR PRECISA de nova revisão: revise só o que \
+     entrou depois (`git diff <head revisado>..HEAD`; sem a linha, o diff \
+     inteiro) e feche com um NOVO comentário `<!-- spec-wave:auto-review -->` \
+     — nunca edite o antigo.\n\
      - Você roda em RODADAS: se o seu turno terminar sem o marker de \
      conclusão, você será REINVOCADO. Ao iniciar, verifique o que já foi feito \
-     (`git log --oneline -20` e os comentários do PR) e continue de onde parou.\n\
+     (`git log --oneline -20` e os comentários do PR) e continue de onde parou. \
+     Os seus próprios commits de correção (`[spec-wave-agent]`, desta Feature) \
+     e o review que você já publicou nesta execução NÃO pedem nova revisão: \
+     se eles já estão lá, siga para o passo 5 em vez de revisar de novo.\n\
      - Processos em background que você deixar ao encerrar o turno são \
      MORTOS. Execute em foreground e aguarde.\n\
      - Ao terminar, volte o clone do hub para a branch em que ele estava e \
@@ -1153,9 +1159,14 @@ mod tests {
         // revisar e o PR travava (spec-wave-test#529).
         let cfg = parse("repo = \"a/b\"");
         let p = &cfg.review_prompt;
-        assert!(p.contains("DEPOIS do último commit"));
         assert!(p.contains("PRECISA de nova revisão"));
         assert!(p.contains("NOVO comentário"));
+        // O SaaS compara o sha declarado com o head (spec-wave-ui#1297): a data
+        // do commit vem do relógio de quem commitou.
+        assert!(p.contains("`head revisado: <sha>`"));
+        assert!(p.contains("git rev-parse HEAD"));
+        // Retomada em rodadas: as próprias correções não reabrem a revisão.
+        assert!(p.contains("NÃO pedem nova revisão"));
         assert!(!p.contains("já foi revisado: não revise de novo"));
     }
 
