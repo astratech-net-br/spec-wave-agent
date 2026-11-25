@@ -275,9 +275,12 @@ fn d_review_prompt() -> String {
      1. ACHAR OS PRs — em cada repositório (o hub e cada um em \
      `.spec-wave/repos/`), liste os PRs abertos com \
      `gh pr list --state open --json number,url,headRefName,isDraft,body,isCrossRepository`. \
-     É elegível o PR cuja branch é `agent/issue-{issue}` ou cujo corpo fecha a \
-     Feature #{issue} ou uma Story dela (`Closes <hub>#N` — confira as Stories \
-     com `{cli} order {issue}`). NÃO são elegíveis: rascunho (draft), \
+     Os itens da Feature são ela mesma, as Stories dela (`{cli} order {issue}`) \
+     e os filhos de cada Story — Bug aberto pelo QA, Spike — \
+     (`gh api repos/{owner}/{repo}/issues/<story>/sub_issues --jq '.[].number'`, \
+     no clone do hub). É elegível o PR cuja branch é `agent/issue-N` ou cujo \
+     corpo fecha o item #N (`Closes <hub>#N`), para N um desses itens. \
+     NÃO são elegíveis: rascunho (draft), \
      branch `spec-wave/...` (PR de documento) e PR de fork. Se não houver \
      nenhum PR elegível, escreva o marker com `\"prs\": []` e PARE.\n\
      2. ENTENDER — leia a spec e o plan da Feature (`docs/features/<slug>/`) e \
@@ -1133,6 +1136,20 @@ mod tests {
         // A CLI que conduz o fluxo é a da máquina (`{cli}`), como nos outros prompts.
         assert!(cfg.review_prompt.contains("{cli} order {issue}"));
         assert!(!cfg.render(&cfg.review_prompt, 7).contains("{cli}"));
+    }
+
+    #[test]
+    fn review_acha_o_pr_do_bug_filho_de_uma_story() {
+        // O prReview do SaaS dispara para PR de QUALQUER item da Feature — o
+        // Bug do QA é filho de uma Story. Se o prompt só olhasse Feature e
+        // Stories, a revisão terminaria "nenhum PR elegível" (spec-wave-test#474).
+        let cfg = parse("repo = \"a/b\"");
+        let p = cfg.render(&cfg.review_prompt, 388);
+        assert!(p.contains("sub_issues"), "o prompt precisa listar os filhos das Stories");
+        assert!(p.contains("Bug"));
+        assert!(p.contains("agent/issue-N"), "branch do dev do próprio item, não só da Feature");
+        // `{owner}/{repo}` é do gh api (resolvido no clone), não da render.
+        assert!(p.contains("repos/{owner}/{repo}/issues/<story>/sub_issues"));
     }
 
     #[test]
