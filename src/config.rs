@@ -309,8 +309,14 @@ fn d_review_prompt() -> String {
      - NUNCA use `git push --force` nem reescreva o histórico da branch do PR.\n\
      - Não mexa em nada fora do diff do PR além do necessário para corrigir um \
      achado. Nada de refatoração de oportunidade.\n\
-     - PR que já tem um comentário começando por `<!-- spec-wave:auto-review -->` \
-     já foi revisado: não revise de novo, só o inclua em `prs`.\n\
+     - PR já revisado é o que tem um comentário começando por \
+     `<!-- spec-wave:auto-review -->` MAIS NOVO que o último commit dele \
+     (compare o `createdAt` do comentário com o `committedDate` do último \
+     commit: `gh pr view <n> --json comments,commits`). Esse você não revisa \
+     de novo: só o inclua em `prs`. Se o comentário é mais antigo que o último \
+     commit (merge da base, correção posterior), revise de novo o que mudou \
+     desde a revisão anterior e feche com um comentário novo — o merge \
+     automático só aceita o commit que a revisão viu.\n\
      - Você roda em RODADAS: se o seu turno terminar sem o marker de \
      conclusão, você será REINVOCADO. Ao iniciar, verifique o que já foi feito \
      (`git log --oneline -20` e os comentários do PR) e continue de onde parou.\n\
@@ -1150,6 +1156,20 @@ mod tests {
         assert!(p.contains("agent/issue-N"), "branch do dev do próprio item, não só da Feature");
         // `{owner}/{repo}` é do gh api (resolvido no clone), não da render.
         assert!(p.contains("repos/{owner}/{repo}/issues/<story>/sub_issues"));
+    }
+
+    #[test]
+    fn review_revisa_de_novo_quando_ha_commit_depois_da_revisao() {
+        // O codeMerge do SaaS só faz merge do head que a revisão viu e, com
+        // commit novo, despacha uma nova revisão. Se o prompt pulasse todo PR
+        // com o marker, a revisão terminava sem comentar e o merge esperava
+        // para sempre (spec-wave-ui#1221/#1224/#1227, merge da main na branch).
+        let cfg = parse("repo = \"a/b\"");
+        let p = cfg.render(&cfg.review_prompt, 676);
+        assert!(p.contains("MAIS NOVO que o último commit"));
+        assert!(p.contains("committedDate"));
+        assert!(p.contains("revise de novo o que mudou"));
+        assert!(!p.contains("já foi revisado: não revise de novo"));
     }
 
     #[test]
