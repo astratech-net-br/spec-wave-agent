@@ -290,7 +290,7 @@ fn d_review_prompt() -> String {
      conflito preservando as duas intenções: o que já está na base foi \
      mergeado e vale; o PR aplica a mudança dele por cima. Se a base já traz \
      a mesma correção do PR, fique com a versão da base. Rode a suíte de \
-     testes, commite o merge (\"merge: resolve conflito com <baseRefName> \
+     testes (com as dependências do projeto instaladas), commite o merge (\"merge: resolve conflito com <baseRefName> \
      (#{issue}) [spec-wave-agent]\") e dê push. Esse commit PEDE revisão: no \
      passo 4 revise o diff do PR contra a base depois do merge. Conflito que \
      você não conseguir resolver com segurança: `git merge --abort`, diga no \
@@ -308,8 +308,10 @@ fn d_review_prompt() -> String {
      branch do PR (`gh pr checkout <n>` no clone daquele repositório). UM \
      commit por correção: \"fix: <o que estava errado> (#{issue}) \
      [spec-wave-agent]\". Rode a suíte de testes do repositório antes de dar \
-     push. Achado que você não conseguir corrigir com segurança fica no review \
-     como pendente — não force uma correção duvidosa.\n\
+     push (o clone é novo: instale antes as dependências do projeto, pelo \
+     comando que ele documenta ou o do lockfile — ex.: `npm ci` com \
+     package-lock.json). Achado que você não conseguir corrigir com \
+     segurança fica no review como pendente — não force uma correção duvidosa.\n\
      6. FECHAR — comente em cada PR o resumo final, começando EXATAMENTE por \
      `<!-- spec-wave:auto-review -->` na primeira linha e, na segunda, \
      `head revisado: <sha>` com o sha COMPLETO do HEAD da branch do PR depois \
@@ -371,7 +373,9 @@ fn d_feature_prompt() -> String {
      com sub-agentes.\n\
      4. Ao concluir cada story: rode a suíte de testes COMPLETA do projeto \
      (o comando que o repositório documenta — não só os testes novos da \
-     story) e só commite com ela verde. Teste que falha é trabalho \
+     story; o clone é novo: instale antes as dependências do projeto, pelo \
+     comando que ele documenta ou o do lockfile — ex.: `npm ci` com \
+     package-lock.json) e só commite com ela verde. Teste que falha é trabalho \
      pendente: corrija antes do commit. Commite neste branch (assunto \
      livre; inclua no RODAPÉ os `git trailer` que o contexto de \
      `{cli} implement <número>` pedir — \
@@ -466,7 +470,9 @@ fn d_bug_prompt() -> String {
      problemas no caminho, anote-os no marker em vez de corrigi-los.\n\
      4. TESTE DE REGRESSÃO — o teste da fase 1 agora passa. Garanta que ele \
      fica no repositório e que falharia de novo se o fix fosse revertido. \
-     Rode a suíte inteira: um fix que quebra outro teste não está pronto.\n\
+     Rode a suíte inteira (o clone é novo: instale antes as dependências do \
+     projeto, pelo comando que ele documenta ou o do lockfile — ex.: `npm ci` \
+     com package-lock.json): um fix que quebra outro teste não está pronto.\n\
      \n\
      Regras OBRIGATÓRIAS:\n\
      - Você roda em RODADAS: se o seu turno terminar sem o marker de \
@@ -1221,6 +1227,11 @@ mod tests {
         }
         assert!(cfg.feature_prompt.contains("suíte de testes COMPLETA"));
         assert!(cfg.feature_prompt.contains("Commit NÃO prova que os testes passam"));
+        // O clone do Fleet Job é novo: sem instalar as dependências, a suíte
+        // falha por pacote ausente e o agente culpa o ambiente.
+        for p in [&cfg.feature_prompt, &cfg.bug_prompt, &cfg.review_prompt] {
+            assert!(p.contains("instale antes as dependências"), "prompt sem instalar deps: {p}");
+        }
     }
 
     #[test]
