@@ -290,6 +290,24 @@ async fn registro_de_bloqueio_vira_blocked_e_nao_falha() {
     assert!(!ws.hub.join(".spec-wave-agent-result.json").exists());
 }
 
+// Sem registro da CLI, o marker "blocked" é a parada DELIBERADA do executor
+// (a spec mandou parar diante de um impedimento): vira Stopped com o motivo,
+// não Failed — que a frota repetia 3 vezes antes do portão humano (#450).
+#[tokio::test]
+async fn marker_blocked_vira_parada_deliberada_e_nao_falha() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = setup(&tmp, r#"
+        cat > /dev/null
+        printf '{"status": "blocked", "detalhe": "falta streamPalette.ts da #449"}' > .spec-wave-agent-result.json
+    "#, 60);
+    let (_lt, lr, _st, sr) = channels();
+    let ws = ensure_workspace(&cfg, 7).await.unwrap();
+    let end = run_item(&cfg, &ws.hub, QueueItem { kind: QueueKind::Feature, number: 7 }, lr, sr).await.unwrap();
+    let RunEnd::Stopped(motivo) = end else { panic!("esperava Stopped, veio {end:?}") };
+    assert_eq!(motivo, "falta streamPalette.ts da #449");
+    assert!(!ws.hub.join(".spec-wave-agent-result.json").exists());
+}
+
 // Registro velho (de um run anterior no mesmo clone) não bloqueia: a rodada
 // apaga antes de começar e só vale o que o implement desta rodada gravar.
 #[tokio::test]

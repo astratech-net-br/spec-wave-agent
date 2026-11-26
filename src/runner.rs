@@ -535,6 +535,12 @@ pub enum RunEnd {
     /// não tem código na base (registro `blocked.json`). NÃO é falha: o
     /// trabalho espera o merge de outra Feature e retoma depois.
     Blocked(BlockedRecord),
+    /// O executor parou DE PROPÓSITO (marker `{"status": "blocked"}`): achou
+    /// um impedimento que só uma pessoa resolve — a spec manda parar e
+    /// reportar, falta um insumo fora do repositório. Não é falha (repetir dá
+    /// o mesmo resultado e gasta uma execução inteira) nem espera por
+    /// dependência (nada destrava sozinho): vai direto para o portão humano.
+    Stopped(String),
     LeaseLost,
     Interrupted,
 }
@@ -909,7 +915,7 @@ enum RoundRaw { Success, Failed(String), LeaseLost, Interrupted }
 /// Desfecho de UMA rodada do executor, já com o marker aplicado.
 enum RoundEnd {
     Success(Option<ExecResult>), Incomplete, Failed(String), Blocked(BlockedRecord),
-    LeaseLost, Interrupted,
+    Stopped(String), LeaseLost, Interrupted,
 }
 
 /// Roda UMA rodada do executor da feature (Claude Code orquestrador): o
@@ -1073,6 +1079,9 @@ async fn executor_round(
     let end = match end {
         RoundRaw::Success => match take_result_marker(ws) {
             Some(r) if r.status == "ok" => RoundEnd::Success(Some(r)),
+            Some(r) if r.status == "blocked" => RoundEnd::Stopped(
+                r.detalhe.filter(|d| !d.trim().is_empty())
+                    .unwrap_or_else(|| "o executor parou sem dizer o impedimento".into())),
             Some(r) => RoundEnd::Failed(format!(
                 "executor terminou sem concluir tudo (status {:?}{})",
                 r.status,
@@ -1146,6 +1155,7 @@ async fn run_rounds(
             RoundEnd::Success(r) => return Ok(RunEnd::Success(r)),
             RoundEnd::Failed(r) => return Ok(RunEnd::Failed(r)),
             RoundEnd::Blocked(b) => return Ok(RunEnd::Blocked(b)),
+            RoundEnd::Stopped(r) => return Ok(RunEnd::Stopped(r)),
             RoundEnd::LeaseLost => return Ok(RunEnd::LeaseLost),
             RoundEnd::Interrupted => return Ok(RunEnd::Interrupted),
             RoundEnd::Incomplete => {
@@ -1286,6 +1296,11 @@ pub async fn run_item_gated(
                 // abrir PR leva a Feature para Code Review pela metade.
                 checkpoint_all(workspace, issue, "blocked").await;
                 return Ok(Gated { end: RunEnd::Blocked(b), prs: urls });
+            }
+            RunEnd::Stopped(r) => {
+                // Idem: o que rodou fica no branch, sem PR pela metade.
+                checkpoint_all(workspace, issue, "stopped").await;
+                return Ok(Gated { end: RunEnd::Stopped(r), prs: urls });
             }
             other => return Ok(Gated { end: other, prs: urls }),
         }
