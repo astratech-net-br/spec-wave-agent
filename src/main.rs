@@ -363,6 +363,28 @@ async fn process_issue(
             leases.release(issue).await?;
             info!(target: "agent", "{que} #{issue} {motivo}");
         }
+        RunEnd::Stopped(motivo) => {
+            // Parada deliberada do executor: portão humano já, sem contar
+            // falha (o checkpoint saiu pelo gate). Repetir daria o mesmo
+            // impedimento e gastaria uma execução inteira por tentativa.
+            if api.is_some() {
+                report(api, Outcome::Blocked(format!("o agente parou: {motivo}"))).await;
+            } else {
+                let _ = run(ws, "gh",
+                    &["issue", "comment", &issue.to_string(), "--repo", &cfg.repo,
+                      "--body",
+                      &format!("🛑 Agente `{me}` parou de propósito: {motivo}. O que já \
+                                rodou está pushado no branch. A label `{}` foi REMOVIDA: \
+                                o impedimento precisa de uma pessoa, e repetir daria o \
+                                mesmo resultado. Resolva-o e reaplique a label.",
+                               cfg.queue_label)]).await;
+                let _ = run(ws, "gh",
+                    &["issue", "edit", &issue.to_string(), "--repo", &cfg.repo,
+                      "--remove-label", &cfg.queue_label]).await;
+            }
+            leases.release(issue).await?;
+            warn!(target: "agent", "{que} #{issue} parou: {motivo}");
+        }
         RunEnd::Interrupted => {
             // Dev desligando a máquina: checkpoint + release imediato para
             // takeover instantâneo (sem esperar TTL).
@@ -1062,6 +1084,12 @@ async fn run_once_inner(config: Option<&str>, events: &Events) -> Result<()> {
                 "blocked_reason": spec_wave_agent::api::WAITING_DEPENDENCY,
                 "waiting_on": rec.waiting_on,
             }));
+        }
+        RunEnd::Stopped(motivo) => {
+            // Checkpoint já pushado pelo gate; sem PR. Sem `waiting_on`: o
+            // SaaS leva direto ao portão humano, sem nova tentativa.
+            leases.release(issue).await?;
+            events.outcome("blocked", Some(&format!("o agente parou: {motivo}")), &prs);
         }
         RunEnd::Interrupted => {
             if item.kind == QueueKind::Review {

@@ -443,7 +443,13 @@ fn d_feature_prompt() -> String {
      se tudo foi implementado mas você não conseguiu rodar a suíte; ou\n\
      {\"status\": \"partial\", \"detalhe\": \"<o que falhou>\"} se alguma \
      story falhou definitivamente ou sobrou teste falhando que você não \
-     conseguiu corrigir.\n\
+     conseguiu corrigir ou\n\
+     {\"status\": \"blocked\", \"detalhe\": \"<o impedimento>\"} se a spec, o \
+     plano ou a story mandam PARAR diante de um impedimento que só uma \
+     pessoa resolve (insumo ausente fora do repositório, decisão que não é \
+     sua) — não implemente contornos nem crie trabalho para \"reportar\": \
+     pare e diga o impedimento. Esperar o merge de outra Feature NÃO é \
+     isto: o `implement` já registra esse caso sozinho..\n\
      - NÃO escreva o marker se ainda houver stories pendentes que você \
      pretende continuar na próxima rodada.\n"
         .into()
@@ -499,7 +505,14 @@ fn d_bug_prompt() -> String {
      \"fix\": \"<o que mudou>\", \"teste_regressao\": \"<o teste que prova>\", \
      \"arquivos\": [\"<caminhos tocados>\"]} se corrigiu e provou; ou\n\
      {\"status\": \"partial\", \"detalhe\": \"<o que faltou e por quê>\"} se não \
-     conseguiu reproduzir, não achou a causa, ou o fix não passou nos testes.\n\
+     conseguiu reproduzir, não achou a causa, ou o fix não passou nos \
+     testes ou\n\
+     {\"status\": \"blocked\", \"detalhe\": \"<o impedimento>\"} se a spec, o \
+     plano ou a story mandam PARAR diante de um impedimento que só uma \
+     pessoa resolve (insumo ausente fora do repositório, decisão que não é \
+     sua) — não implemente contornos nem crie trabalho para \"reportar\": \
+     pare e diga o impedimento. Esperar o merge de outra Feature NÃO é \
+     isto: o `implement` já registra esse caso sozinho..\n\
      - NÃO escreva o marker se pretende continuar na próxima rodada.\n"
         .into()
 }
@@ -1231,6 +1244,11 @@ mod tests {
         // falha por pacote ausente e o agente culpa o ambiente.
         for p in [&cfg.feature_prompt, &cfg.bug_prompt, &cfg.review_prompt] {
             assert!(p.contains("instale antes as dependências"), "prompt sem instalar deps: {p}");
+        }
+        // Parada deliberada tem marker próprio: sem ele o executor escrevia
+        // um "blocked" que o agente lia como falha e a frota repetia 3 vezes.
+        for p in [&cfg.feature_prompt, &cfg.bug_prompt] {
+            assert!(p.contains("\"status\": \"blocked\""), "prompt sem o marker blocked: {p}");
         }
     }
 
