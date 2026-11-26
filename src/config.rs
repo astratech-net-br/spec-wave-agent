@@ -290,7 +290,7 @@ fn d_review_prompt() -> String {
      conflito preservando as duas intenções: o que já está na base foi \
      mergeado e vale; o PR aplica a mudança dele por cima. Se a base já traz \
      a mesma correção do PR, fique com a versão da base. Rode a suíte de \
-     testes, commite o merge (\"merge: resolve conflito com <baseRefName> \
+     testes (com as dependências do projeto instaladas), commite o merge (\"merge: resolve conflito com <baseRefName> \
      (#{issue}) [spec-wave-agent]\") e dê push. Esse commit PEDE revisão: no \
      passo 4 revise o diff do PR contra a base depois do merge. Conflito que \
      você não conseguir resolver com segurança: `git merge --abort`, diga no \
