@@ -402,10 +402,14 @@ fn d_feature_prompt() -> String {
      no branch, NÃO o crie, nem numa versão mínima: outra Feature vai \
      entregá-lo e duas versões do mesmo módulo colidem no merge. Trate a \
      story como BLOQUEADA: não commite nada dela, pule as que dependem \
-     dela e continue as independentes. No marker, use \"partial\" com o \
-     detalhe \"bloqueada: depende de <o que falta> da Feature #<N>, ausente \
-     na base\" para cada story bloqueada. (Quando o próprio \
-     `{cli} implement` acusa o bloqueio — código 3 —, vale o passo 6: pare.)\n\
+     dela e continue as independentes. Ao final, commite e pushe o que \
+     ficou pronto e escreva o marker {\"status\": \"blocked\", \
+     \"detalhe\": \"Story #<X> aguarda <o que falta> da Feature #<N>, \
+     ausente na base\", \"aguarda\": [<N>, ...]} — `aguarda` com o número \
+     de cada Feature (ou Story de outra Feature) que entrega o código que \
+     falta. O agente reporta a espera e a Feature é retomada sozinha depois \
+     do merge. (Quando o próprio `{cli} implement` acusa o bloqueio — \
+     código 3 —, vale o passo 6: pare.)\n\
      - Você roda em RODADAS: se o seu turno terminar sem o marker de \
      conclusão (abaixo), você será REINVOCADO para continuar. Ao iniciar, \
      verifique o que já foi feito (`git log --oneline -20` e \
@@ -1216,6 +1220,17 @@ mod tests {
         assert!(p.contains("git merge --abort"));
         assert!(p.contains("revisado mas em conflito passa pelo passo 2"));
         assert!(p.contains("NUNCA use `git push --force`"));
+    }
+
+    #[test]
+    fn feature_informa_a_feature_que_falta_em_aguarda() {
+        // Dependência escrita só no texto da Story (spec-wave-test#450): o
+        // executor não pode marcar "partial" (falha, 3 tentativas) — para com
+        // `aguarda`, e a esteira espera o merge e mostra a pill no card.
+        let cfg = parse("repo = \"a/b\"");
+        let p = &cfg.feature_prompt;
+        assert!(p.contains("\"aguarda\": [<N>, ...]"));
+        assert!(!p.contains("use \"partial\" com o detalhe"));
     }
 
     #[test]
