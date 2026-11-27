@@ -308,6 +308,43 @@ async fn marker_blocked_vira_parada_deliberada_e_nao_falha() {
     assert!(!ws.hub.join(".spec-wave-agent-result.json").exists());
 }
 
+// Dependência que o `spec-wave implement` não enxerga (a Story pressupõe código
+// de OUTRA Feature, escrito só no texto): o executor para com `aguarda` no
+// marker e a rodada vira Blocked com `waiting_on` — espera o merge e retoma
+// sozinha, em vez de ir ao portão humano (spec-wave-test#450 esperando a #449).
+#[tokio::test]
+async fn marker_blocked_com_aguarda_vira_espera_por_dependencia() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = setup(&tmp, r#"
+        cat > /dev/null
+        printf '{"status": "blocked", "detalhe": "Story #479 aguarda streamPalette.ts da Feature #449, ausente na base", "aguarda": [449, 7, 449, 0]}' > .spec-wave-agent-result.json
+    "#, 60);
+    let (_lt, lr, _st, sr) = channels();
+    let ws = ensure_workspace(&cfg, 7).await.unwrap();
+    let end = run_item(&cfg, &ws.hub, QueueItem { kind: QueueKind::Feature, number: 7 }, lr, sr).await.unwrap();
+    let RunEnd::Blocked(rec) = end else { panic!("esperava Blocked, veio {end:?}") };
+    // A própria issue e o zero não contam; repetidos saem.
+    assert_eq!(rec.waiting_on, vec![449]);
+    assert_eq!(rec.reason, "waiting_dependency");
+    assert!(!ws.hub.join(".spec-wave-agent-result.json").exists());
+}
+
+// `aguarda` sem número válido (vazio, só a própria issue) não é espera: segue
+// como parada deliberada, para o humano.
+#[tokio::test]
+async fn marker_blocked_com_aguarda_invalido_continua_parada_deliberada() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = setup(&tmp, r#"
+        cat > /dev/null
+        printf '{"status": "blocked", "detalhe": "falta insumo", "aguarda": [7]}' > .spec-wave-agent-result.json
+    "#, 60);
+    let (_lt, lr, _st, sr) = channels();
+    let ws = ensure_workspace(&cfg, 7).await.unwrap();
+    let end = run_item(&cfg, &ws.hub, QueueItem { kind: QueueKind::Feature, number: 7 }, lr, sr).await.unwrap();
+    let RunEnd::Stopped(motivo) = end else { panic!("esperava Stopped, veio {end:?}") };
+    assert_eq!(motivo, "falta insumo");
+}
+
 // Registro velho (de um run anterior no mesmo clone) não bloqueia: a rodada
 // apaga antes de começar e só vale o que o implement desta rodada gravar.
 #[tokio::test]

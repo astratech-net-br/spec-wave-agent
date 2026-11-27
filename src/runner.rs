@@ -172,7 +172,7 @@ fn qa_round_end(raw: Option<&str>, process: &str) -> RoundEnd {
     };
     let result = |status: &str, detalhe: String| RoundEnd::Success(Some(ExecResult {
         status: status.into(), detalhe: Some(detalhe), causa_raiz: None, fix: None,
-        teste_regressao: None, arquivos: None, prs: None,
+        teste_regressao: None, arquivos: None, prs: None, aguarda: None,
     }));
     match outcome {
         "pass" => {
@@ -204,7 +204,7 @@ fn qa_round_end(raw: Option<&str>, process: &str) -> RoundEnd {
 fn flow_round_end(raw: RoundRaw) -> RoundEnd {
     let ok = |detalhe: &str| RoundEnd::Success(Some(ExecResult {
         status: "ok".into(), detalhe: Some(detalhe.into()), causa_raiz: None, fix: None,
-        teste_regressao: None, arquivos: None, prs: None,
+        teste_regressao: None, arquivos: None, prs: None, aguarda: None,
     }));
     match raw {
         RoundRaw::Success => ok("etapa concluída"),
@@ -595,6 +595,26 @@ impl BlockedRecord {
     }
 }
 
+/// Registro de espera a partir do marker `blocked` com `aguarda` (função
+/// PURA): mesmo formato do `blocked.json` da CLI, para o resto do caminho
+/// (desfecho `waiting_dependency`, retomada depois do merge) ser um só.
+pub fn marker_waiting_record(issue: u64, r: &ExecResult) -> BlockedRecord {
+    let mut waiting_on: Vec<u64> = Vec::new();
+    for &n in r.aguarda.as_deref().unwrap_or(&[]) {
+        if n > 0 && n != issue && !waiting_on.contains(&n) {
+            waiting_on.push(n);
+        }
+    }
+    BlockedRecord {
+        version: BLOCKED_RECORD_VERSION,
+        issue: Some(issue),
+        reason: "waiting_dependency".into(),
+        waiting_on,
+        blocked: Vec::new(),
+        runnable: 0,
+    }
+}
+
 /// Interpreta o conteúdo de `blocked.json` (função PURA). Versão desconhecida
 /// ou JSON inválido = `None`: um registro que o agente não entende não pode
 /// virar bloqueio (o run seguiria preso sem motivo verificável).
@@ -653,6 +673,12 @@ pub struct ExecResult {
     /// Revisão de PR: URL de cada PR revisado. Vazio = nenhum PR elegível.
     #[serde(default)]
     pub prs: Option<Vec<String>>,
+    /// `blocked` por dependência que o `spec-wave implement` não enxerga (a
+    /// Story pressupõe código que OUTRA Feature entrega, escrito só no texto):
+    /// os números dos itens esperados. Vira espera por merge (`waitingOn`),
+    /// não portão humano — a esteira retoma sozinha.
+    #[serde(default)]
+    pub aguarda: Option<Vec<u64>>,
 }
 
 /// Lê e REMOVE o marker (não pode sobrar para o checkpoint commitar).
@@ -1079,6 +1105,13 @@ async fn executor_round(
     let end = match end {
         RoundRaw::Success => match take_result_marker(ws) {
             Some(r) if r.status == "ok" => RoundEnd::Success(Some(r)),
+            Some(r) if r.status == "blocked" && reads_blocked
+                && r.aguarda.as_ref().is_some_and(|a| a.iter().any(|&n| n > 0 && n != issue)) =>
+            {
+                let rec = marker_waiting_record(issue, &r);
+                info!(target: "agent", "#{issue}: {}", rec.describe());
+                RoundEnd::Blocked(rec)
+            }
             Some(r) if r.status == "blocked" => RoundEnd::Stopped(
                 r.detalhe.filter(|d| !d.trim().is_empty())
                     .unwrap_or_else(|| "o executor parou sem dizer o impedimento".into())),
