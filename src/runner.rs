@@ -191,11 +191,41 @@ fn qa_round_end(raw: Option<&str>, process: &str) -> RoundEnd {
             result("ok", if bugs.is_empty() { "QA reprovou".into() }
                          else { format!("QA reprovou: Bug(s) {}", bugs.join(", ")) })
         }
-        "blocked" => result("blocked", "QA inconclusivo: cenário(s) bloqueado(s), nada foi movido".into()),
+        "blocked" => result("blocked", qa_blocked_detail(&v)),
         "not-configured" | "refused" =>
             result("blocked", reason.unwrap_or_else(|| format!("QA recusado ({outcome})"))),
         _ => RoundEnd::Failed(reason.unwrap_or_else(|| format!("QA terminou em erro ({outcome})"))),
     }
+}
+
+/// Motivo do inconclusivo para o despacho (PURA). O Fleet Job some ao
+/// terminar: sem isto, o SaaS só repetia um texto fixo e ninguém sabia QUAIS
+/// cenários bloquearam (#1359). Lê `blocked` e `report` do outcome file
+/// (CLI ≥ 1.15.5); outcome antigo cai no texto de antes.
+fn qa_blocked_detail(v: &serde_json::Value) -> String {
+    const MAX: usize = 900;
+    let cenarios: Vec<String> = v.get("blocked").and_then(|a| a.as_array()).map(|a| a.iter()
+        .filter_map(|b| {
+            let n = b.get("cenario")?.as_u64()?;
+            let motivo = b.get("blockedReason").and_then(|r| r.as_str()).unwrap_or("sem motivo");
+            let ev = b.get("evidencia").and_then(|e| e.as_str()).map(str::trim).unwrap_or("");
+            Some(if ev.is_empty() { format!("{n} ({motivo})") }
+                 else { format!("{n} ({motivo}: {})", ev.chars().take(120).collect::<String>()) })
+        }).collect()).unwrap_or_default();
+    let mut out = if cenarios.is_empty() {
+        "QA inconclusivo: cenário(s) bloqueado(s), nada foi movido".to_string()
+    } else {
+        format!("QA inconclusivo, nada foi movido. Bloqueado(s): {}", cenarios.join("; "))
+    };
+    let report = v.get("report");
+    if report.and_then(|r| r.get("posted")).and_then(|p| p.as_bool()) == Some(false) {
+        let err = report.and_then(|r| r.get("error")).and_then(|e| e.as_str()).unwrap_or("erro desconhecido");
+        out.push_str(&format!(" — relatório NÃO publicado na issue ({err})"));
+    }
+    if out.chars().count() > MAX {
+        out = format!("{}…", out.chars().take(MAX).collect::<String>());
+    }
+    out
 }
 
 /// Desfecho de uma etapa do fluxo pelo exit code do `spec-wave step` (PURA):
@@ -1439,6 +1469,27 @@ mod tests {
         assert_eq!(s, "failed");
         assert!(r.contains("sem desfecho"), "{r}");
         assert_eq!(qa(Some("não é json")).0, "failed");
+    }
+
+    #[test]
+    fn qa_inconclusivo_leva_os_cenarios_bloqueados() {
+        let (s, r) = qa(Some(r#"{"outcome":"blocked","blocked":[
+            {"cenario":3,"blockedReason":"massa-de-dados","evidencia":"seed ausente"},
+            {"cenario":5,"blockedReason":"ambiente","evidencia":""}],
+            "report":{"posted":true,"compact":false}}"#));
+        assert_eq!(s, "blocked");
+        assert_eq!(r, "QA inconclusivo, nada foi movido. Bloqueado(s): 3 (massa-de-dados: seed ausente); 5 (ambiente)");
+        let (_, r) = qa(Some(r#"{"outcome":"blocked","blocked":[{"cenario":1,"blockedReason":"outro"}],
+            "report":{"posted":false,"error":"HTTP 502"}}"#));
+        assert!(r.ends_with("— relatório NÃO publicado na issue (HTTP 502)"), "{r}");
+        // Outcome da CLI antiga: o texto de antes.
+        assert_eq!(qa(Some(r#"{"outcome":"blocked"}"#)).1,
+                   "QA inconclusivo: cenário(s) bloqueado(s), nada foi movido");
+        // Teto: o motivo vai para o despacho e para o comentário do SaaS.
+        let muitos: Vec<String> = (1..60).map(|n| format!(
+            r#"{{"cenario":{n},"blockedReason":"ambiente","evidencia":"{}"}}"#, "x".repeat(150))).collect();
+        let (_, r) = qa(Some(&format!(r#"{{"outcome":"blocked","blocked":[{}]}}"#, muitos.join(","))));
+        assert!(r.chars().count() <= 901, "{}", r.chars().count());
     }
 
     #[test]
